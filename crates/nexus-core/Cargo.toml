@@ -1,0 +1,27 @@
+# nexus-core: the portable broker spine.
+#
+# Hard rule for this crate — it must compile for BOTH the native target and
+# wasm32-unknown-unknown, because nexus-wasm re-exports the *same* scheduling
+# state machine to Node. Therefore:
+#   * no tokio (no IO driver / no time driver on wasm32-unknown-unknown),
+#   * no threads, no SystemTime (all clocks are injected as u64 millis),
+#   * no filesystem, no sockets,
+#   * BTreeMap/BTreeSet for anything whose order is observable (determinism).
+[package]
+name = "nexus-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Nexus inference broker core: protocol, pool actor, queue, relay, store."
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+sha2.workspace = true
+
+[lints]
+workspace = true

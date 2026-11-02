@@ -1,0 +1,43 @@
+# The native runtime: axum + tokio. This crate is deliberately **not** compiled
+# for wasm — tokio's IO and time drivers do not exist on wasm32-unknown-unknown,
+# and there is no listener inside a WASM module. All scheduling lives in
+# nexus-core, which both this crate and nexus-wasm link.
+[package]
+name = "nexus-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Nexus inference broker: axum + tokio runtime around the nexus-core pool actors."
+
+[[bin]]
+name = "nexus-hub"
+path = "src/main.rs"
+
+[dependencies]
+nexus-core = { path = "../nexus-core" }
+tokio.workspace = true
+axum.workspace = true
+tower-http.workspace = true
+tokio-stream.workspace = true
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+# E2E tests dial the real listener with a real WebSocket client and read real SSE
+# bytes; nothing is stubbed.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
+# Reads the artifact response frame-by-frame, which is how the download tests tell
+# "streamed in bounded chunks" from "one whole-object buffer".
+http-body-util.workspace = true
+
+[lints]
+workspace = true
