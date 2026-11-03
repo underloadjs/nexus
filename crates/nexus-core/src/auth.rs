@@ -26,7 +26,9 @@ pub fn bearer(header: Option<&str>) -> Option<&str> {
     if value.is_empty() {
         return None;
     }
-    let (scheme, rest) = value.split_once(' ').map_or((None, value), |(s, r)| (Some(s), r));
+    let (scheme, rest) = value
+        .split_once(' ')
+        .map_or((None, value), |(s, r)| (Some(s), r));
     match scheme {
         // `Bearer` is the documented scheme; a bare value is accepted only
         // because some notebook clients cannot set a scheme.
@@ -46,14 +48,14 @@ impl PoolTokenRegistry {
     /// Build from config, hashing every token immediately.
     #[must_use]
     pub fn from_config(config: &AuthConfig) -> Self {
-        Self::new(config.worker_tokens.iter().map(String::as_str), config.allow_anonymous)
+        Self::new(
+            config.worker_tokens.iter().map(String::as_str),
+            config.allow_anonymous,
+        )
     }
 
     /// Build from `(token, label)` pairs.
-    pub fn new<'a>(
-        tokens: impl Iterator<Item = &'a str>,
-        allow_anonymous: bool,
-    ) -> Self {
+    pub fn new<'a>(tokens: impl Iterator<Item = &'a str>, allow_anonymous: bool) -> Self {
         let mut digests = BTreeMap::new();
         for (index, token) in tokens.enumerate() {
             let token = token.trim();
@@ -62,7 +64,10 @@ impl PoolTokenRegistry {
             }
             digests.insert(sha256_hex(token.as_bytes()), format!("pool-token-{index}"));
         }
-        Self { digests, allow_anonymous }
+        Self {
+            digests,
+            allow_anonymous,
+        }
     }
 
     /// Accepted token count, for a startup log line (never logs the secrets).
@@ -124,9 +129,15 @@ impl ApiKeyRegistry {
             if key.is_empty() {
                 continue;
             }
-            digests.insert(sha256_hex(key.as_bytes()), TenantId::new_unchecked(entry.tenant.clone()));
+            digests.insert(
+                sha256_hex(key.as_bytes()),
+                TenantId::new_unchecked(entry.tenant.clone()),
+            );
         }
-        Self { digests, allow_anonymous: config.allow_anonymous }
+        Self {
+            digests,
+            allow_anonymous: config.allow_anonymous,
+        }
     }
 
     /// Accepted key count.
@@ -184,7 +195,10 @@ impl AttestationAllowlist {
     /// Build from config.
     #[must_use]
     pub fn from_config(config: &AuthConfig) -> Self {
-        Self::new(config.model_shas.iter().map(String::as_str), config.attestation_required())
+        Self::new(
+            config.model_shas.iter().map(String::as_str),
+            config.attestation_required(),
+        )
     }
 
     /// Build from raw digests; entries that are not 64 hex chars are dropped
@@ -200,7 +214,11 @@ impl AttestationAllowlist {
                 bad += 1;
             }
         }
-        Self { shas: allow, required, rejected_config: bad }
+        Self {
+            shas: allow,
+            required,
+            rejected_config: bad,
+        }
     }
 
     /// How many config entries were malformed (a silent drop here would let an
@@ -250,7 +268,9 @@ impl AttestationAllowlist {
         for sha in &attestation.model_shas {
             let normalized = normalize_hex(sha);
             if !is_sha256_hex(&normalized) {
-                return Err(CoreError::Attestation(format!("{sha:?} is not 64 hex chars")));
+                return Err(CoreError::Attestation(format!(
+                    "{sha:?} is not 64 hex chars"
+                )));
             }
             if !self.shas.contains(&normalized) {
                 return Err(CoreError::Attestation(format!(
@@ -302,14 +322,19 @@ mod tests {
         assert_eq!(reg.len(), 2);
         assert_eq!(reg.verify(Some("tok-a")).expect("ok"), "pool-token-0");
         assert_eq!(reg.verify(Some("tok-b")).expect("ok"), "pool-token-1");
-        assert!(matches!(reg.verify(Some("nope")), Err(CoreError::Unauthorized(_))));
+        assert!(matches!(
+            reg.verify(Some("nope")),
+            Err(CoreError::Unauthorized(_))
+        ));
         // Fail closed: no header at all is a denial unless configured otherwise.
         assert!(matches!(reg.verify(None), Err(CoreError::Unauthorized(_))));
 
         let mut anon = auth.clone();
         anon.allow_anonymous = true;
         assert_eq!(
-            PoolTokenRegistry::from_config(&anon).verify(None).expect("anonymous mode accepts a missing token"),
+            PoolTokenRegistry::from_config(&anon)
+                .verify(None)
+                .expect("anonymous mode accepts a missing token"),
             "anonymous-token"
         );
     }
@@ -319,20 +344,40 @@ mod tests {
         use crate::config::ApiKeyConfig;
         let mut auth = AuthConfig::default();
         auth.api_keys = vec![
-            ApiKeyConfig { key: "sk-1".to_string(), tenant: "acme".to_string() },
-            ApiKeyConfig { key: "sk-2".to_string(), tenant: "default".to_string() },
+            ApiKeyConfig {
+                key: "sk-1".to_string(),
+                tenant: "acme".to_string(),
+            },
+            ApiKeyConfig {
+                key: "sk-2".to_string(),
+                tenant: "default".to_string(),
+            },
         ];
         let reg = ApiKeyRegistry::from_config(&auth);
-        assert_eq!(reg.verify(Some("sk-1")).expect("ok"), TenantId::new_unchecked("acme"));
-        assert_eq!(reg.verify(Some("sk-2")).expect("ok"), TenantId::new_unchecked("default"));
-        assert!(matches!(reg.verify(Some("sk-3")), Err(CoreError::Unauthorized(_))));
-        assert!(matches!(reg.verify(Some("")), Err(CoreError::Unauthorized(_))));
+        assert_eq!(
+            reg.verify(Some("sk-1")).expect("ok"),
+            TenantId::new_unchecked("acme")
+        );
+        assert_eq!(
+            reg.verify(Some("sk-2")).expect("ok"),
+            TenantId::new_unchecked("default")
+        );
+        assert!(matches!(
+            reg.verify(Some("sk-3")),
+            Err(CoreError::Unauthorized(_))
+        ));
+        assert!(matches!(
+            reg.verify(Some("")),
+            Err(CoreError::Unauthorized(_))
+        ));
         let missing = reg.verify(None).expect_err("fail closed without a key");
         assert_eq!(missing.code(), "unauthorized", "{missing}");
         let mut anon = auth;
         anon.allow_anonymous = true;
         assert_eq!(
-            ApiKeyRegistry::from_config(&anon).verify(None).expect("anonymous mode accepts a missing key"),
+            ApiKeyRegistry::from_config(&anon)
+                .verify(None)
+                .expect("anonymous mode accepts a missing key"),
             TenantId::new_unchecked(ANONYMOUS_TENANT)
         );
     }
@@ -342,13 +387,18 @@ mod tests {
         let allow = AttestationAllowlist::new([SHARD_1, SHARD_2].into_iter(), true);
         assert_eq!(allow.len(), 2);
 
-        let good = Attestation { model_shas: BTreeSet::from([SHARD_1.to_string()]), weight_bytes: None };
+        let good = Attestation {
+            model_shas: BTreeSet::from([SHARD_1.to_string()]),
+            weight_bytes: None,
+        };
         assert!(allow.verify(&good).is_ok());
 
         // A self-declared model name is not identity: an off-allowlist digest
         // cannot join the pool (acceptance test 13).
         let rogue = Attestation {
-            model_shas: BTreeSet::from(["0000000000000000000000000000000000000000000000000000000000000000".to_string()]),
+            model_shas: BTreeSet::from([
+                "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            ]),
             weight_bytes: None,
         };
         let err = allow.verify(&rogue).expect_err("must reject");
@@ -356,9 +406,12 @@ mod tests {
 
         // One trusted shard plus one untrusted shard is still a rejection.
         let mixed = Attestation {
-            model_shas: [SHARD_1.to_string(), rogue.model_shas.iter().next().expect("one").clone()]
-                .into_iter()
-                .collect(),
+            model_shas: [
+                SHARD_1.to_string(),
+                rogue.model_shas.iter().next().expect("one").clone(),
+            ]
+            .into_iter()
+            .collect(),
             weight_bytes: None,
         };
         assert!(allow.verify(&mixed).is_err());
@@ -368,7 +421,12 @@ mod tests {
         let lenient = AttestationAllowlist::new([SHARD_1].into_iter(), false);
         assert!(lenient.verify(&Attestation::default()).is_ok());
         // Case-insensitive match, because hex arrives in both cases.
-        assert!(allow.verify(&Attestation { model_shas: [SHARD_1.to_uppercase()].into_iter().collect(), weight_bytes: None }).is_ok());
+        assert!(allow
+            .verify(&Attestation {
+                model_shas: [SHARD_1.to_uppercase()].into_iter().collect(),
+                weight_bytes: None
+            })
+            .is_ok());
     }
 
     #[test]

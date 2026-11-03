@@ -39,11 +39,21 @@
 //! are dropped as stale. That is what makes the "re-ran the notebook cell" race
 //! (task §11) safe: the evicted socket cannot resurrect itself, renew a lease,
 //! or close the new socket's state.
+//!
+//! A `Hello` for a worker id that already has a record is a **socket swap, not a
+//! death**, and is applied by updating that record in place: `in_flight` (the
+//! actor's own slot accounting), the held leases' `epoch`, and — when the previous
+//! socket was still live — the engine state all survive, while the replaced
+//! socket's unfulfilled `Claim` authority is voided. A reconnect after the socket
+//! died keeps the `Degraded` demotion `orphan_worker` applied, so readiness must be
+//! re-declared by a `Ready` heartbeat before anything is dispatched to it (§8).
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::VecDeque;
 
+// `Effect`/`LogLevel` derive `Serialize` for the WASM effect boundary.
+use serde::Serialize;
 use serde_json::Value;
 
 use crate::auth::AttestationAllowlist;
@@ -78,13 +88,16 @@ use crate::protocol::FinishKind;
 use crate::protocol::FrameKind;
 use crate::protocol::HubFrame;
 use crate::protocol::JobPayload;
-use crate::protocol::ResumedJob;
 use crate::protocol::Requires;
+use crate::protocol::ResumedJob;
 use crate::protocol::WorkerFrame;
 use crate::queue::InMemoryQueue;
 use crate::queue::QueueBackend;
 use crate::queue::QueueError;
 use crate::relay::ConsumerEvent;
+// Module-level import (not the function) so the call site reads `scheduler::..`;
+// the actor is the only caller of the ranking helpers.
+use crate::scheduler;
 use crate::seq::SeqVerdict;
 use crate::store::sha256_hex;
 use crate::store::ArtifactBook;
@@ -102,7 +115,7 @@ pub const MAX_DECLARED_CAPACITY: u32 = 64;
 const QUEUE_SCAN_LIMIT: usize = 64;
 
 /// Access-log severity for [`Effect::Log`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum LogLevel {
     /// Routine state change.
     Info,
@@ -143,7 +156,17 @@ impl HelloInput {
     /// Extract from a decoded `Hello` frame, or `None` for any other frame.
     #[must_use]
     pub fn from_frame(frame: &WorkerFrame) -> Option<Self> {
-        let WorkerFrame::Hello { protocol, pools, capacity, requires, attestation, tier, engine, .. } = frame else {
+        let WorkerFrame::Hello {
+            protocol,
+            pools,
+            capacity,
+            requires,
+            attestation,
+            tier,
+            engine,
+            ..
+        } = frame
+        else {
             return None;
         };
         Some(Self {
@@ -292,7 +315,13 @@ pub enum ActorMsg {
 ///
 /// `PartialEq` (not `Eq`) because payloads and usage are `serde_json::Value`,
 /// which is only partially equal — floats. Tests rely on this comparison.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `Serialize` is load-bearing for the WASM boundary: `nexus-wasm` hands a JS host
+/// the effect list as JSON (`to_json` in `crates/nexus-wasm/src/lib.rs`), so the
+/// JS host and the native dispatcher consume one contract. Encoding is serde's
+/// default **external** tagging — an accept is `{"Accepted": {"job": …}}` — which
+/// is what `examples/node-smoke.mjs` reads.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum Effect {
     /// Submission accepted, or attached to an existing execution (§5.2).
     Accepted {
@@ -442,10 +471,19 @@ impl PoolActor {
         let limits = cfg.limits.clone();
         let depth = cfg.queue_depth_for(&pool);
         Self {
-            artifacts: ArtifactBook::new(artifact_root, limits.max_artifact_bytes, limits.artifact_chunk_bytes, limits.artifact_ttl_ms),
+            artifacts: ArtifactBook::new(
+                artifact_root,
+                limits.max_artifact_bytes,
+                limits.artifact_chunk_bytes,
+                limits.artifact_ttl_ms,
+            ),
             allowlist: AttestationAllowlist::from_config(&cfg.auth),
             queue: Box::new(InMemoryQueue::new(depth)),
-            payloads: PayloadBook::new(limits.max_spilled_payloads, limits.max_spill_bytes, limits.payload_ttl_ms),
+            payloads: PayloadBook::new(
+                limits.max_spilled_payloads,
+                limits.max_spill_bytes,
+                limits.payload_ttl_ms,
+            ),
             pool,
             cfg,
             now_ms: 0,
@@ -570,7 +608,11 @@ impl PoolActor {
     pub fn ready_workers(&self) -> usize {
         self.workers
             .values()
-            .filter(|w| w.engine == EngineState::Ready && w.link == LinkState::Live && w.pools.contains(&self.pool))
+            .filter(|w| {
+                w.engine == EngineState::Ready
+                    && w.link == LinkState::Live
+                    && w.pools.contains(&self.pool)
+            })
             .count()
     }
 
@@ -579,7 +621,11 @@ impl PoolActor {
     pub fn loading_workers(&self) -> usize {
         self.workers
             .values()
-            .filter(|w| w.link == LinkState::Live && w.engine != EngineState::Ready && w.pools.contains(&self.pool))
+            .filter(|w| {
+                w.link == LinkState::Live
+                    && w.engine != EngineState::Ready
+                    && w.pools.contains(&self.pool)
+            })
             .count()
     }
 
@@ -589,7 +635,11 @@ impl PoolActor {
     pub fn warm_models(&self) -> BTreeSet<String> {
         self.workers
             .values()
-            .filter(|w| w.engine == EngineState::Ready && w.link == LinkState::Live && w.pools.contains(&self.pool))
+            .filter(|w| {
+                w.engine == EngineState::Ready
+                    && w.link == LinkState::Live
+                    && w.pools.contains(&self.pool)
+            })
             .filter_map(|w| w.requires.model.clone())
             .collect()
     }
@@ -598,9 +648,11 @@ impl PoolActor {
     /// capability pre-check of §8; drives the immediate `400`).
     #[must_use]
     pub fn can_satisfy(&self, requires: &Requires) -> bool {
-        self.workers
-            .values()
-            .any(|w| w.link == LinkState::Live && w.pools.contains(&self.pool) && requires.satisfied_by(&w.requires))
+        self.workers.values().any(|w| {
+            w.link == LinkState::Live
+                && w.pools.contains(&self.pool)
+                && requires.satisfied_by(&w.requires)
+        })
     }
 
     /// Derived consumer-facing view of one job.
@@ -658,21 +710,71 @@ impl PoolActor {
     pub fn handle(&mut self, now_ms: Timestamp, msg: ActorMsg) -> Vec<Effect> {
         self.now_ms = now_ms;
         match msg {
-            ActorMsg::Submit { job, submission, consumer } => self.on_submit(job, submission, consumer, now_ms),
-            ActorMsg::Attach { job, consumer, from_seq } => self.on_attach(job, consumer, from_seq),
+            ActorMsg::Submit {
+                job,
+                submission,
+                consumer,
+            } => self.on_submit(job, submission, consumer, now_ms),
+            ActorMsg::Attach {
+                job,
+                consumer,
+                from_seq,
+            } => self.on_attach(job, consumer, from_seq),
             ActorMsg::Detach { job, consumer } => self.on_detach(job, consumer, now_ms),
             ActorMsg::Cancel { job, reason } => self.on_cancel(job, reason, now_ms),
-            ActorMsg::Hello { worker, conn, hello } => self.on_hello(worker, conn, hello, now_ms),
+            ActorMsg::Hello {
+                worker,
+                conn,
+                hello,
+            } => self.on_hello(worker, conn, hello, now_ms),
             ActorMsg::WorkerGone { worker, conn } => self.on_worker_gone(worker, conn, now_ms),
-            ActorMsg::ArtifactStored { job, artifact, worker, conn, attempt, chunk_index, chunk_bytes, complete, stored_sha256, declared, content_type } => {
-                self.on_artifact_stored(job, artifact, worker, conn, attempt, chunk_index, chunk_bytes, complete, stored_sha256, declared, content_type, now_ms)
-            }
-            ActorMsg::WorkerFrame { worker, conn, frame } => self.on_worker_frame(worker, conn, frame, now_ms),
-            ActorMsg::FetchPayload { reference, token, worker, attempt } => {
+            ActorMsg::ArtifactStored {
+                job,
+                artifact,
+                worker,
+                conn,
+                attempt,
+                chunk_index,
+                chunk_bytes,
+                complete,
+                stored_sha256,
+                declared,
+                content_type,
+            } => self.on_artifact_stored(
+                job,
+                artifact,
+                worker,
+                conn,
+                attempt,
+                chunk_index,
+                chunk_bytes,
+                complete,
+                stored_sha256,
+                declared,
+                content_type,
+                now_ms,
+            ),
+            ActorMsg::WorkerFrame {
+                worker,
+                conn,
+                frame,
+            } => self.on_worker_frame(worker, conn, frame, now_ms),
+            ActorMsg::FetchPayload {
+                reference,
+                token,
+                worker,
+                attempt,
+            } => {
                 // Authorization and the fetch count both happen here, inside the
                 // single owner: no torn read, and no second place that decides
                 // whether a token is still good.
-                match self.payloads.authorize_fetch(&reference, &token, &worker, attempt, self.now_ms) {
+                match self.payloads.authorize_fetch(
+                    &reference,
+                    &token,
+                    &worker,
+                    attempt,
+                    self.now_ms,
+                ) {
                     Ok(entry) => {
                         let entry = entry.clone();
                         self.payloads.record_fetch(&reference);
@@ -695,25 +797,68 @@ impl PoolActor {
                     }],
                 }
             }
-            ActorMsg::Query { job } => vec![Effect::Snapshot { view: self.job_view(&job), job }],
+            ActorMsg::Query { job } => vec![Effect::Snapshot {
+                view: self.job_view(&job),
+                job,
+            }],
             ActorMsg::Tick { .. } => self.on_tick(now_ms),
             ActorMsg::Shutdown { .. } => self.on_shutdown(now_ms),
         }
     }
 
-    fn on_worker_frame(&mut self, worker: WorkerId, conn: u64, frame: WorkerFrame, now_ms: Timestamp) -> Vec<Effect> {
+    fn on_worker_frame(
+        &mut self,
+        worker: WorkerId,
+        conn: u64,
+        frame: WorkerFrame,
+        now_ms: Timestamp,
+    ) -> Vec<Effect> {
         match frame {
-            WorkerFrame::Ready { free_slots, free_kv_tokens, engine_ready, telemetry } => {
-                self.on_ready(worker, conn, free_slots, free_kv_tokens, engine_ready, telemetry, now_ms)
-            }
+            WorkerFrame::Ready {
+                free_slots,
+                free_kv_tokens,
+                engine_ready,
+                telemetry,
+            } => self.on_ready(
+                worker,
+                conn,
+                free_slots,
+                free_kv_tokens,
+                engine_ready,
+                telemetry,
+                now_ms,
+            ),
             WorkerFrame::Claim { jobs } => self.on_claim(worker, conn, jobs, now_ms),
-            WorkerFrame::Frame { job, seq, kind, content_type, text, artifact } => {
-                self.on_frame(worker, conn, job, seq, kind, content_type, text, artifact, now_ms)
-            }
-            WorkerFrame::Done { job, seq, finish, usage, error } => {
-                self.on_done(worker, conn, job, seq, finish, usage, error, now_ms)
-            }
-            WorkerFrame::Resume { job, attempt, acked_seq } => self.on_resume(worker, conn, job, attempt, acked_seq, now_ms),
+            WorkerFrame::Frame {
+                job,
+                seq,
+                kind,
+                content_type,
+                text,
+                artifact,
+            } => self.on_frame(
+                worker,
+                conn,
+                job,
+                seq,
+                kind,
+                content_type,
+                text,
+                artifact,
+                now_ms,
+            ),
+            WorkerFrame::Done {
+                job,
+                seq,
+                finish,
+                usage,
+                error,
+            } => self.on_done(worker, conn, job, seq, finish, usage, error, now_ms),
+            WorkerFrame::Resume {
+                job,
+                attempt,
+                acked_seq,
+            } => self.on_resume(worker, conn, job, attempt, acked_seq, now_ms),
             WorkerFrame::CancelAck { job } => self.on_cancel_ack(worker, conn, job, now_ms),
             WorkerFrame::Hello { .. } => {
                 // A second `Hello` on a live socket is a re-handshake (a cell
@@ -729,26 +874,57 @@ impl PoolActor {
 
     // --------------------------------------------------------------------- submit
 
-    fn on_submit(&mut self, job: JobId, sub: Submission, consumer: ConsumerId, now_ms: Timestamp) -> Vec<Effect> {
+    fn on_submit(
+        &mut self,
+        job: JobId,
+        sub: Submission,
+        consumer: ConsumerId,
+        now_ms: Timestamp,
+    ) -> Vec<Effect> {
         if self.closed {
-            return vec![reject(None, 503, "hub_shutdown", "hub is draining, retry", Some(1_000))];
+            return vec![reject(
+                None,
+                503,
+                "hub_shutdown",
+                "hub is draining, retry",
+                Some(1_000),
+            )];
         }
         let Some(kind) = self.cfg.kind(&sub.kind).cloned() else {
-            self.metrics.incr_label(names::JOBS_REJECTED, "reason", "unknown_kind", 1);
-            return vec![reject(Some(job), 400, "unknown_kind", &format!("kind {:?} is not registered", sub.kind), None)];
+            self.metrics
+                .incr_label(names::JOBS_REJECTED, "reason", "unknown_kind", 1);
+            return vec![reject(
+                Some(job),
+                400,
+                "unknown_kind",
+                &format!("kind {:?} is not registered", sub.kind),
+                None,
+            )];
         };
         if sub.pool != self.pool {
             return vec![reject(
                 Some(job),
                 400,
                 "wrong_pool",
-                &format!("kind {:?} belongs to pool {sub_pool}, this actor owns {pool}", sub.kind, sub_pool = sub.pool, pool = self.pool),
+                &format!(
+                    "kind {:?} belongs to pool {sub_pool}, this actor owns {pool}",
+                    sub.kind,
+                    sub_pool = sub.pool,
+                    pool = self.pool
+                ),
                 None,
             )];
         }
         if !self.cfg.tenant_allows_pool(&sub.tenant, &self.pool) {
-            self.metrics.incr_label(names::JOBS_REJECTED, "reason", "tenant_pool_forbidden", 1);
-            return vec![reject(Some(job), 403, "tenant_pool_forbidden", "this tenant may not submit to this pool", None)];
+            self.metrics
+                .incr_label(names::JOBS_REJECTED, "reason", "tenant_pool_forbidden", 1);
+            return vec![reject(
+                Some(job),
+                403,
+                "tenant_pool_forbidden",
+                "this tenant may not submit to this pool",
+                None,
+            )];
         }
 
         // Payload budget: the cheap prompt-size mitigation of task §8 plus the
@@ -758,13 +934,31 @@ impl PoolActor {
         let payload_sha = sha256_hex(&body);
         let max_body = self.cfg.tenant_payload_bytes_for(&sub.tenant);
         if body_len > max_body {
-            self.metrics.incr_label(names::JOBS_REJECTED, "reason", "payload_too_large", 1);
-            return vec![reject(Some(job), 413, "payload_too_large", &format!("body is {body_len} bytes, the limit is {max_body}"), None)];
+            self.metrics
+                .incr_label(names::JOBS_REJECTED, "reason", "payload_too_large", 1);
+            return vec![reject(
+                Some(job),
+                413,
+                "payload_too_large",
+                &format!("body is {body_len} bytes, the limit is {max_body}"),
+                None,
+            )];
         }
         let max_tokens = self.limits().tenant_max_prompt_tokens;
-        if sub.requires.kv_estimate_tokens.is_some_and(|estimate| estimate > max_tokens) {
-            self.metrics.incr_label(names::JOBS_REJECTED, "reason", "prompt_too_large", 1);
-            return vec![reject(Some(job), 413, "prompt_too_large", &format!("prompt estimate exceeds the {max_tokens} token limit"), None)];
+        if sub
+            .requires
+            .kv_estimate_tokens
+            .is_some_and(|estimate| estimate > max_tokens)
+        {
+            self.metrics
+                .incr_label(names::JOBS_REJECTED, "reason", "prompt_too_large", 1);
+            return vec![reject(
+                Some(job),
+                413,
+                "prompt_too_large",
+                &format!("prompt estimate exceeds the {max_tokens} token limit"),
+                None,
+            )];
         }
 
         // Idempotency attach runs **before** the capability pre-check and the
@@ -777,7 +971,11 @@ impl PoolActor {
                     record.consumers.insert(consumer);
                 }
                 self.metrics.incr(names::IDEMPOTENT_ATTACH, 1);
-                return vec![Effect::Accepted { job: existing, attached: true, replayed }];
+                return vec![Effect::Accepted {
+                    job: existing,
+                    attached: true,
+                    replayed,
+                }];
             }
             self.forget_idempotency(&sub.idempotency_key);
         }
@@ -785,15 +983,29 @@ impl PoolActor {
         // Tenant concurrency cap (task §8 fairness).
         let cap = self.cfg.tenant_concurrency_for(&sub.tenant);
         if self.tenant_active.get(&sub.tenant).copied().unwrap_or(0) >= cap {
-            self.metrics.incr_label(names::JOBS_REJECTED, "reason", "tenant_limit", 1);
-            return vec![reject(Some(job), 429, "tenant_limit", &format!("tenant already has {cap} jobs in flight"), Some(1_000))];
+            self.metrics
+                .incr_label(names::JOBS_REJECTED, "reason", "tenant_limit", 1);
+            return vec![reject(
+                Some(job),
+                429,
+                "tenant_limit",
+                &format!("tenant already has {cap} jobs in flight"),
+                Some(1_000),
+            )];
         }
 
         // Capability pre-check → immediate 400, never a 60 s timeout behind a
         // model that had to load 50 GB (task §8, acceptance test 10).
         if !self.can_satisfy(&sub.requires) {
-            self.metrics.incr_label(names::JOBS_REJECTED, "reason", "capability_unsatisfied", 1);
-            return vec![reject(Some(job), 400, "capability_unsatisfied", &unsatisfiable_reason(&sub.requires), None)];
+            self.metrics
+                .incr_label(names::JOBS_REJECTED, "reason", "capability_unsatisfied", 1);
+            return vec![reject(
+                Some(job),
+                400,
+                "capability_unsatisfied",
+                &unsatisfiable_reason(&sub.requires),
+                None,
+            )];
         }
 
         // Nothing warm yet: hold the response open for the §7.2 grace window,
@@ -828,27 +1040,55 @@ impl PoolActor {
         // let the worker fetch them by reference after the claim (§10, test 16).
         if PayloadBook::needs_spill(body.len(), limits.inline_payload_cap_bytes) {
             let token = format!("ptok-{}", job.as_ref());
-            match self.payloads.register(&job, &token, payload_sha, body, sub.content_type.clone(), now_ms) {
+            match self.payloads.register(
+                &job,
+                &token,
+                payload_sha,
+                body,
+                sub.content_type.clone(),
+                now_ms,
+            ) {
                 Ok(descriptor) => {
                     record.payload_ref = Some(descriptor.id);
                     record.payload_inline = None;
                     self.metrics.incr(names::SPILL_BYTES, descriptor.size_bytes);
                 }
                 Err(err) => {
-                    self.metrics.incr_label(names::JOBS_REJECTED, "reason", "spill_budget", 1);
-                    return vec![reject(Some(job), 429, "spill_budget", &err.to_string(), Some(1_000))];
+                    self.metrics
+                        .incr_label(names::JOBS_REJECTED, "reason", "spill_budget", 1);
+                    return vec![reject(
+                        Some(job),
+                        429,
+                        "spill_budget",
+                        &err.to_string(),
+                        Some(1_000),
+                    )];
                 }
             }
         }
 
-        record.phase = if ready_now { JobPhase::Queued } else { JobPhase::Pending };
+        record.phase = if ready_now {
+            JobPhase::Queued
+        } else {
+            JobPhase::Pending
+        };
         let seq = record.queue_seq.unwrap_or(arrival);
-        if let Err(QueueError::Full { limit }) = self.queue.enqueue(&job, record.priority, seq, record.dispatch_deadline_ms) {
-            self.metrics.incr_label(names::JOBS_REJECTED, "reason", "queue_full", 1);
+        if let Err(QueueError::Full { limit }) =
+            self.queue
+                .enqueue(&job, record.priority, seq, record.dispatch_deadline_ms)
+        {
+            self.metrics
+                .incr_label(names::JOBS_REJECTED, "reason", "queue_full", 1);
             if let Some(id) = &record.payload_ref {
                 self.payloads.release(id);
             }
-            return vec![reject(Some(job), 429, "queue_full", &format!("pool queue is saturated at {limit} jobs"), Some(1_000))];
+            return vec![reject(
+                Some(job),
+                429,
+                "queue_full",
+                &format!("pool queue is saturated at {limit} jobs"),
+                Some(1_000),
+            )];
         }
 
         self.jobs.insert(job.clone(), record);
@@ -857,7 +1097,11 @@ impl PoolActor {
         self.metrics.incr(names::JOBS_ACCEPTED, 1);
         self.refresh_gauges();
 
-        let mut effects = vec![Effect::Accepted { job, attached: false, replayed: Vec::new() }];
+        let mut effects = vec![Effect::Accepted {
+            job,
+            attached: false,
+            replayed: Vec::new(),
+        }];
         effects.extend(self.fulfil_claims(now_ms));
         effects
     }
@@ -870,17 +1114,23 @@ impl PoolActor {
     fn remember_idempotency(&mut self, key: &str, job: &JobId, now_ms: Timestamp) {
         // Bound the map by evicting the entry that expires first, so a long-lived
         // key is never dropped ahead of a stale one.
-        if self.idempotency.len() >= self.limits().max_idempotency_entries && !self.idempotency.contains_key(key) {
-            if let Some((expiry, oldest)) = self.idempotency_timer.iter().next().copied() {
+        if self.idempotency.len() >= self.limits().max_idempotency_entries
+            && !self.idempotency.contains_key(key)
+        {
+            // `(expiry, key)` is not `Copy` (the key is a String), so the timer entry
+            // has to be cloned out of the BTreeSet before it can be removed.
+            if let Some((expiry, oldest)) = self.idempotency_timer.iter().next().cloned() {
                 self.idempotency_timer.remove(&(expiry, oldest.clone()));
                 self.idempotency.remove(&oldest);
             }
         }
-        if let Some((_, old_expiry)) = self.idempotency.get(key).copied() {
-            self.idempotency_timer.remove(&(old_expiry, key.to_string()));
+        if let Some((_, old_expiry)) = self.idempotency.get(key).cloned() {
+            self.idempotency_timer
+                .remove(&(old_expiry, key.to_string()));
         }
         let expires = now_ms.saturating_add(self.limits().idempotency_ttl_ms);
-        self.idempotency.insert(key.to_string(), (job.clone(), expires));
+        self.idempotency
+            .insert(key.to_string(), (job.clone(), expires));
         self.idempotency_timer.insert((expires, key.to_string()));
     }
 
@@ -892,7 +1142,13 @@ impl PoolActor {
 
     fn on_attach(&mut self, job: JobId, consumer: ConsumerId, from_seq: u64) -> Vec<Effect> {
         let Some(record) = self.jobs.get_mut(&job) else {
-            return vec![reject(Some(job), 404, "unknown_job", "no such job, or its retention window has passed", None)];
+            return vec![reject(
+                Some(job),
+                404,
+                "unknown_job",
+                "no such job, or its retention window has passed",
+                None,
+            )];
         };
         record.consumers.insert(consumer.clone());
         // A re-attached consumer restarts the keepalive cadence immediately.
@@ -907,7 +1163,12 @@ impl PoolActor {
                 through_seq: None,
             });
         }
-        vec![Effect::ReplayTo { job, consumer, events, lossy }]
+        vec![Effect::ReplayTo {
+            job,
+            consumer,
+            events,
+            lossy,
+        }]
     }
 
     /// Replay a job's buffered events, flagging when the ring already evicted
@@ -915,9 +1176,20 @@ impl PoolActor {
     fn collect_replay(&self, job: &JobId, from_seq: u64) -> Option<(Vec<ConsumerEvent>, bool)> {
         let record = self.jobs.get(job)?;
         let lossy = record.replay.replay_is_lossy(from_seq);
-        let mut events: Vec<ConsumerEvent> = record.replay.since(from_seq).iter().map(frame_event).collect();
+        // `since` yields `Vec<&BufferedFrame>`, so `into_iter` (not `iter`) is what
+        // hands `frame_event` the `&BufferedFrame` its signature asks for.
+        let mut events: Vec<ConsumerEvent> = record
+            .replay
+            .since(from_seq)
+            .into_iter()
+            .map(frame_event)
+            .collect();
         if let Some(finish) = record.finish {
-            events.push(ConsumerEvent::Finish { seq: record.seq.acked_through(), finish, usage: record.usage.clone() });
+            events.push(ConsumerEvent::Finish {
+                seq: record.seq.acked_through(),
+                finish,
+                usage: record.usage.clone(),
+            });
         }
         if let Some(reason) = record.terminal {
             if reason != TerminalReason::Completed {
@@ -934,9 +1206,15 @@ impl PoolActor {
 
     fn on_detach(&mut self, job: JobId, consumer: ConsumerId, now_ms: Timestamp) -> Vec<Effect> {
         let (empty, terminal, cancel_on_gone) = {
-            let Some(record) = self.jobs.get_mut(&job) else { return Vec::new() };
+            let Some(record) = self.jobs.get_mut(&job) else {
+                return Vec::new();
+            };
             record.consumers.remove(&consumer);
-            (record.consumers.is_empty(), record.phase.is_terminal(), record.cancel_on_consumer_gone)
+            (
+                record.consumers.is_empty(),
+                record.phase.is_terminal(),
+                record.cancel_on_consumer_gone,
+            )
         };
         if !empty || terminal {
             return Vec::new();
@@ -962,12 +1240,21 @@ impl PoolActor {
         let mut effects = Vec::new();
         // Tell the owner first: GPU time is the scarce resource (§6).
         if let Some(lease) = self.leases.get(&job).cloned() {
-            effects.push(Effect::SendWorker { worker: lease.worker, frame: HubFrame::Cancel { job: job.clone(), reason } });
+            effects.push(Effect::SendWorker {
+                worker: lease.worker,
+                frame: HubFrame::Cancel {
+                    job: job.clone(),
+                    reason,
+                },
+            });
         }
         if self.queue.remove(&job) {
             // Cancelled before anyone claimed it: no worker was ever involved, so
             // the GPU cost of this job is exactly zero.
-            effects.push(Effect::Log { level: LogLevel::Info, message: format!("{job} was cancelled while queued") });
+            effects.push(Effect::Log {
+                level: LogLevel::Info,
+                message: format!("{job} was cancelled while queued"),
+            });
         }
         // The consumer's view ends now. The worker keeps its in-flight slot until
         // it acks (or the lease lapses), which bounds GPU waste without pretending
@@ -976,7 +1263,13 @@ impl PoolActor {
         effects
     }
 
-    fn on_cancel_ack(&mut self, worker: WorkerId, conn: u64, job: JobId, now_ms: Timestamp) -> Vec<Effect> {
+    fn on_cancel_ack(
+        &mut self,
+        worker: WorkerId,
+        conn: u64,
+        job: JobId,
+        now_ms: Timestamp,
+    ) -> Vec<Effect> {
         if self.is_stale(&worker, conn) {
             self.metrics.incr(names::STALE_FRAMES, 1);
             return Vec::new();
@@ -990,13 +1283,31 @@ impl PoolActor {
 
     // ---------------------------------------------------------------------- hello
 
-    fn on_hello(&mut self, worker: WorkerId, conn: u64, hello: HelloInput, now_ms: Timestamp) -> Vec<Effect> {
+    fn on_hello(
+        &mut self,
+        worker: WorkerId,
+        conn: u64,
+        hello: HelloInput,
+        now_ms: Timestamp,
+    ) -> Vec<Effect> {
         // Protocol negotiation before anything else: mismatch is a clean reject.
         if let Err(err) = crate::protocol::negotiate(hello.protocol) {
-            self.metrics.incr_label(names::JOBS_REJECTED, "reason", "protocol_mismatch", 1);
+            self.metrics
+                .incr_label(names::JOBS_REJECTED, "reason", "protocol_mismatch", 1);
             return vec![
-                Effect::SendWorker { worker: worker.clone(), frame: HubFrame::Reject { code: err.code().to_string(), message: err.to_string() } },
-                Effect::SendWorker { worker, frame: HubFrame::Bye { reason: ByeReason::VersionMismatch } },
+                Effect::SendWorker {
+                    worker: worker.clone(),
+                    frame: HubFrame::Reject {
+                        code: err.code().to_string(),
+                        message: err.to_string(),
+                    },
+                },
+                Effect::SendWorker {
+                    worker,
+                    frame: HubFrame::Bye {
+                        reason: ByeReason::VersionMismatch,
+                    },
+                },
             ];
         }
 
@@ -1004,8 +1315,19 @@ impl PoolActor {
         // allowlist (task §9, acceptance test 13).
         if let Err(err) = self.allowlist.verify(&hello.attestation) {
             return vec![
-                Effect::SendWorker { worker: worker.clone(), frame: HubFrame::Reject { code: "attestation_rejected".to_string(), message: err.to_string() } },
-                Effect::SendWorker { worker, frame: HubFrame::Bye { reason: ByeReason::AttestationRejected } },
+                Effect::SendWorker {
+                    worker: worker.clone(),
+                    frame: HubFrame::Reject {
+                        code: "attestation_rejected".to_string(),
+                        message: err.to_string(),
+                    },
+                },
+                Effect::SendWorker {
+                    worker,
+                    frame: HubFrame::Bye {
+                        reason: ByeReason::AttestationRejected,
+                    },
+                },
             ];
         }
 
@@ -1016,48 +1338,151 @@ impl PoolActor {
             Err(reason) => (BTreeSet::new(), Some(reason)),
         };
         if joined.is_empty() {
-            let message = why_empty.unwrap_or_else(|| "worker joined no pool this hub serves".to_string());
+            let message =
+                why_empty.unwrap_or_else(|| "worker joined no pool this hub serves".to_string());
             return vec![
                 Effect::SendWorker {
                     worker: worker.clone(),
-                    frame: HubFrame::Reject { code: "pool_unavailable".to_string(), message: message.clone() },
+                    frame: HubFrame::Reject {
+                        code: "pool_unavailable".to_string(),
+                        message: message.clone(),
+                    },
                 },
-                Effect::SendWorker { worker, frame: HubFrame::Bye { reason: ByeReason::AuthRejected } },
-                Effect::Log { level: LogLevel::Warn, message },
+                Effect::SendWorker {
+                    worker,
+                    frame: HubFrame::Bye {
+                        reason: ByeReason::AuthRejected,
+                    },
+                },
+                Effect::Log {
+                    level: LogLevel::Warn,
+                    message,
+                },
             ];
         }
 
         // Capacity is declared, never assumed, and clamped against nonsense.
         let capacity = hello.capacity.min(MAX_DECLARED_CAPACITY).max(1);
-        if !self.workers.contains_key(&worker) && self.workers.len() >= self.limits().max_workers_per_pool {
+        if !self.workers.contains_key(&worker)
+            && self.workers.len() >= self.limits().max_workers_per_pool
+        {
             let limit = self.limits().max_workers_per_pool;
             return vec![
-                Effect::SendWorker { worker: worker.clone(), frame: HubFrame::Reject { code: "pool_full".to_string(), message: format!("this hub holds {limit} workers for this pool") } },
-                Effect::SendWorker { worker, frame: HubFrame::Bye { reason: ByeReason::Evicted } },
+                Effect::SendWorker {
+                    worker: worker.clone(),
+                    frame: HubFrame::Reject {
+                        code: "pool_full".to_string(),
+                        message: format!("this hub holds {limit} workers for this pool"),
+                    },
+                },
+                Effect::SendWorker {
+                    worker,
+                    frame: HubFrame::Bye {
+                        reason: ByeReason::Evicted,
+                    },
+                },
             ];
         }
 
         let mut effects = Vec::new();
+        // Which socket (if any) this `Hello` replaces: drives the reconnect log line.
+        let mut evicted_previous: Option<u64> = None;
         // Dedupe by stable id: evict the stale socket instead of double-dispatching
         // to the same GPU (task §11).
         if let Some(previous) = self.live_conn.get(&worker).copied() {
             if previous != conn {
                 self.metrics.incr(names::WORKER_EVCTIONS, 1);
-                effects.push(Effect::SendWorker { worker: worker.clone(), frame: HubFrame::Bye { reason: ByeReason::Evicted } });
-                effects.extend(self.orphan_worker(&worker, now_ms));
+                effects.push(Effect::SendWorker {
+                    worker: worker.clone(),
+                    frame: HubFrame::Bye {
+                        reason: ByeReason::Evicted,
+                    },
+                });
+                // Only the *authority* dies with the old socket. This is a socket
+                // swap, not a death: `orphan_worker` here used to demote the engine,
+                // zero the slots and schedule a resume-grace expiry that then deleted
+                // a perfectly live worker (§11's cell re-run lost its leases that way).
+                self.void_claim_authority(&worker);
+                evicted_previous = Some(previous);
             }
         }
 
-        self.workers.insert(worker.clone(), WorkerRecord::new(
-            worker.clone(),
-            conn,
-            capacity,
-            hello.requires.clone(),
-            hello.attestation.clone(),
-            joined.clone(),
-            hello.tier.unwrap_or(WorkerTier::Ephemeral),
-            now_ms,
-        ));
+        // A worker id that already has a record is **re-attaching**, not joining for
+        // the first time. Updating the record in place is what keeps the held leases
+        // true: `in_flight` is the actor's own slot accounting (clearing it lets a
+        // reconnecting 4-slot worker be handed 4 *more* jobs, §4/test 12) and it is
+        // the set `Ready` heartbeats renew, so wiping it silently stops lease
+        // renewal for a worker that is still streaming.
+        let re_attach = self.workers.contains_key(&worker);
+        let was_orphaned = self
+            .workers
+            .get(&worker)
+            .is_some_and(|w| w.link == LinkState::Orphaned);
+        if let Some(w) = self.workers.get_mut(&worker) {
+            w.epoch = conn;
+            w.link = LinkState::Live;
+            w.resume_deadline_ms = None;
+            w.last_seen_ms = now_ms;
+            // The declaration is re-read: a re-run cell may report a different
+            // capacity, capability floor, attestation or tier.
+            w.capacity = capacity;
+            w.requires = hello.requires.clone();
+            w.attestation = hello.attestation.clone();
+            w.pools = joined.clone();
+            w.tier = hello.tier.unwrap_or(WorkerTier::Ephemeral);
+            // Engine state deliberately differs by how the previous socket ended.
+            // Eviction leaves the hub with continuous liveness information, so
+            // readiness carries over. After a death, `orphan_worker` demoted the
+            // engine and only a fresh `Ready` heartbeat may make this worker
+            // dispatchable again (§8's "never dispatch to a non-`ready` worker").
+        } else {
+            self.workers.insert(
+                worker.clone(),
+                WorkerRecord::new(
+                    worker.clone(),
+                    conn,
+                    capacity,
+                    hello.requires.clone(),
+                    hello.attestation.clone(),
+                    joined.clone(),
+                    hello.tier.unwrap_or(WorkerTier::Ephemeral),
+                    now_ms,
+                ),
+            );
+        }
+        if re_attach {
+            // A resume-grace timer left over from the dead socket must not fire for a
+            // worker that is live again: it would expire the leases and delete the
+            // record of a healthy pool member.
+            self.orphan_timer.retain(|(_, w)| w != &worker);
+            // The leases this worker still holds move to the new generation, which is
+            // what `Lease::epoch` exists to identify (stale generation, §11).
+            let held: Vec<JobId> = self
+                .leases
+                .values()
+                .filter(|lease| lease.worker == worker)
+                .map(|lease| lease.job.clone())
+                .collect();
+            for job in held {
+                if let Some(lease) = self.leases.get_mut(&job) {
+                    lease.epoch = conn;
+                }
+            }
+            effects.push(Effect::Log {
+                level: LogLevel::Info,
+                message: format!(
+                    "worker {worker} re-attached on conn {conn} ({}); {} lease(s) now point at the new generation",
+                    match (evicted_previous, was_orphaned) {
+                        (Some(previous), _) =>
+                            format!("conn {previous} was evicted, engine state carried over"),
+                        (None, true) =>
+                            "the previous socket died, so a fresh Ready heartbeat is required before dispatch".to_string(),
+                        (None, false) => "record re-declared".to_string(),
+                    },
+                    self.jobs_for_worker(&worker).len()
+                ),
+            });
+        }
         self.live_conn.insert(worker.clone(), conn);
 
         // Anything still leased and resumable is offered back in `Welcome`, so a
@@ -1069,7 +1494,10 @@ impl PoolActor {
             .map(|lease| ResumedJob {
                 job: lease.job.clone(),
                 attempt: lease.attempt,
-                resume_from_seq: self.jobs.get(&lease.job).map_or(0, |j| j.seq.acked_through()),
+                resume_from_seq: self
+                    .jobs
+                    .get(&lease.job)
+                    .map_or(0, |j| j.seq.acked_through()),
                 lease_expires_ms: lease.deadline_ms,
             })
             .collect();
@@ -1125,7 +1553,11 @@ impl PoolActor {
             joined.insert(id);
         }
         if joined.is_empty() {
-            Err(if reason.is_empty() { "worker asked for no pool".to_string() } else { reason })
+            Err(if reason.is_empty() {
+                "worker asked for no pool".to_string()
+            } else {
+                reason
+            })
         } else {
             Ok(joined)
         }
@@ -1149,7 +1581,10 @@ impl PoolActor {
             return Vec::new();
         }
         let Some(w) = self.workers.get_mut(&worker) else {
-            return vec![Effect::Log { level: LogLevel::Warn, message: format!("Ready from unknown worker {worker}") }];
+            return vec![Effect::Log {
+                level: LogLevel::Warn,
+                message: format!("Ready from unknown worker {worker}"),
+            }];
         };
         let was_ready = w.engine == EngineState::Ready;
         let was_orphaned = w.link == LinkState::Orphaned;
@@ -1183,7 +1618,7 @@ impl PoolActor {
                 self.lease_timer.insert((deadline, job.clone()));
             }
         }
-        drop(w);
+        let _ = w; // ends the &mut borrow of self.workers (NLL; `drop(w)` was a no-op)
         if was_orphaned {
             self.orphan_timer.retain(|(_, wid)| wid != &worker);
         }
@@ -1193,7 +1628,10 @@ impl PoolActor {
         if !was_ready && engine_ready {
             effects.push(Effect::Log {
                 level: LogLevel::Info,
-                message: format!("worker {worker} became ready: capacity {}, model {:?}", self.workers[&worker].capacity, self.workers[&worker].requires.model),
+                message: format!(
+                    "worker {worker} became ready: capacity {}, model {:?}",
+                    self.workers[&worker].capacity, self.workers[&worker].requires.model
+                ),
             });
             effects.extend(self.fulfil_claims(now_ms));
         }
@@ -1202,19 +1640,34 @@ impl PoolActor {
 
     // ---------------------------------------------------------------------- claim
 
-    fn on_claim(&mut self, worker: WorkerId, conn: u64, jobs: Option<u32>, now_ms: Timestamp) -> Vec<Effect> {
+    fn on_claim(
+        &mut self,
+        worker: WorkerId,
+        conn: u64,
+        jobs: Option<u32>,
+        now_ms: Timestamp,
+    ) -> Vec<Effect> {
         if self.is_stale(&worker, conn) {
             self.metrics.incr(names::STALE_FRAMES, 1);
             return Vec::new();
         }
         let Some(w) = self.workers.get_mut(&worker) else {
-            return vec![Effect::Log { level: LogLevel::Warn, message: format!("Claim from unknown worker {worker}") }];
+            return vec![Effect::Log {
+                level: LogLevel::Warn,
+                message: format!("Claim from unknown worker {worker}"),
+            }];
         };
         w.last_seen_ms = now_ms;
-        let asked = jobs.unwrap_or(1).min(self.limits().max_claim_batch);
+        // Field access, not `self.limits()`: the method borrows all of `self` while
+        // `w` already holds a mutable borrow of `self.workers`. Reading
+        // `self.cfg.limits` is a disjoint field borrow, so both can be live.
+        let asked = jobs.unwrap_or(1).min(self.cfg.limits.max_claim_batch);
         // Authority is capped by declared capacity, so a buggy client cannot
         // hoard claims and starve its peers (task §4).
-        let grant = asked.min(w.capacity.saturating_sub(w.in_flight.len() as u32 + w.outstanding_claims));
+        let grant = asked.min(
+            w.capacity
+                .saturating_sub(w.in_flight.len() as u32 + w.outstanding_claims),
+        );
         if grant == 0 {
             return Vec::new();
         }
@@ -1241,14 +1694,16 @@ impl PoolActor {
         // Hard bound: no more dispatches than there is work plus authority.
         let budget = self.queue.depth() + self.claims.len() + 1;
         for _ in 0..budget {
-            let Some((worker, slots)) = self.claims.pop_front() else { break };
+            let Some((worker, slots)) = self.claims.pop_front() else {
+                break;
+            };
             let Some(w) = self.workers.get(&worker) else {
                 continue; // unknown worker: authority is void
             };
             let live = self.live_conn.contains_key(&worker);
             if !live || w.link != LinkState::Live {
                 // Gone or evicted: void the authority (module docs, stale sockets).
-                drop(w);
+                let _ = w; // ends the immutable borrow before the get_mut below
                 if let Some(w) = self.workers.get_mut(&worker) {
                     w.outstanding_claims = w.outstanding_claims.saturating_sub(slots);
                 }
@@ -1258,18 +1713,26 @@ impl PoolActor {
             // non-ready worker" (test 11) and §4 "cap in-flight to declared
             // capacity" (test 12).
             if !w.dispatchable() {
-                drop(w);
+                let _ = w; // borrow ends here; the row goes back on the deferred queue
                 deferred.push_back((worker, slots));
                 continue;
             }
             match self.pick_job_for(&worker) {
                 Some(job) => {
-                    drop(w);
+                    let _ = w; // borrow of self.workers ends before self.dispatch
                     match self.dispatch(job.clone(), worker.clone(), now_ms) {
                         Ok(mut made) => effects.append(&mut made),
                         Err(err) => {
-                            self.metrics.incr_label(names::JOBS_REJECTED, "reason", "dispatch_failed", 1);
-                            effects.push(Effect::Log { level: LogLevel::Error, message: format!("dispatch of {job} to {worker} failed: {err}") });
+                            self.metrics.incr_label(
+                                names::JOBS_REJECTED,
+                                "reason",
+                                "dispatch_failed",
+                                1,
+                            );
+                            effects.push(Effect::Log {
+                                level: LogLevel::Error,
+                                message: format!("dispatch of {job} to {worker} failed: {err}"),
+                            });
                             self.queue.remove(&job);
                             // The job was already `Accepted`, so its consumer's
                             // body is open: end it in band rather than leaving
@@ -1291,21 +1754,34 @@ impl PoolActor {
                                 }
                             });
                             if let Some(event) = in_band {
-                                effects.push(Effect::Relay { job: job.clone(), events: vec![event] });
+                                effects.push(Effect::Relay {
+                                    job: job.clone(),
+                                    events: vec![event],
+                                });
                             }
-                            effects.extend(self.finish_job(&job, TerminalReason::QueueTimeout, now_ms));
+                            effects.extend(self.finish_job(
+                                &job,
+                                TerminalReason::QueueTimeout,
+                                now_ms,
+                            ));
                         }
                     }
                     if let Some(w) = self.workers.get_mut(&worker) {
                         w.outstanding_claims = w.outstanding_claims.saturating_sub(1);
-                        // Keep the remaining slots, but behind everyone else.
+                        // Keep the remaining slots, but behind everyone else. This
+                        // re-queues into the *live* mailbox rather than the deferred
+                        // side list: a row parked until after the loop is what made a
+                        // multi-slot `Claim` dispatch exactly one job per pass (the
+                        // next `pop_front` saw an empty mailbox and broke), so a 4-slot
+                        // worker with four queued jobs stayed at one lease (§4's
+                        // declared capacity, acceptance test 12).
                         if slots > 1 {
-                            deferred.push_back((worker.clone(), slots - 1));
+                            self.claims.push_back((worker.clone(), slots - 1));
                         }
                     }
                 }
                 None => {
-                    drop(w);
+                    let _ = w; // borrow ends; this worker stays deferred with its authority
                     deferred.push_back((worker, slots));
                 }
             }
@@ -1344,7 +1820,9 @@ impl PoolActor {
 
     /// Whether `worker` may take a job whose session hashes elsewhere.
     fn affinity_allows(&self, worker: &WorkerId, record: &JobRecord) -> bool {
-        let Some(session) = record.session_hint.as_deref() else { return true };
+        let Some(session) = record.session_hint.as_deref() else {
+            return true;
+        };
         match scheduler::affinity_target(session, &self.workers) {
             // The affinity owner is connected and able: only it may take this job.
             Some(target) => &target == worker,
@@ -1354,11 +1832,21 @@ impl PoolActor {
     }
 
     /// Lease a job to a worker and build its `Assigned` frame.
-    fn dispatch(&mut self, job: JobId, worker: WorkerId, now_ms: Timestamp) -> Result<Vec<Effect>, CoreError> {
+    fn dispatch(
+        &mut self,
+        job: JobId,
+        worker: WorkerId,
+        now_ms: Timestamp,
+    ) -> Result<Vec<Effect>, CoreError> {
         let limits = self.limits().clone();
-        let record = self.jobs.get_mut(&job).ok_or_else(|| CoreError::Queue(format!("{job} vanished")))?;
+        let record = self
+            .jobs
+            .get_mut(&job)
+            .ok_or_else(|| CoreError::Queue(format!("{job} vanished")))?;
         if record.phase.is_terminal() {
-            return Err(CoreError::Protocol { reason: format!("{job} is already terminal") });
+            return Err(CoreError::Protocol {
+                reason: format!("{job} is already terminal"),
+            });
         }
         record.attempt += 1;
         let attempt = record.attempt;
@@ -1380,9 +1868,15 @@ impl PoolActor {
             // reference to bytes that already left would be a silent truncation,
             // so the attempt is refused and the client is told to retry (the
             // prompt itself is the thing that expired).
-            let bytes = self.payloads.payload_bytes(&reference).map(<[u8]>::to_vec).ok_or_else(|| {
-                CoreError::Queue(format!("{job}'s prompt left memory before dispatch (payload TTL); re-submit"))
-            })?;
+            let bytes = self
+                .payloads
+                .payload_bytes(&reference)
+                .map(<[u8]>::to_vec)
+                .ok_or_else(|| {
+                    CoreError::Queue(format!(
+                        "{job}'s prompt left memory before dispatch (payload TTL); re-submit"
+                    ))
+                })?;
             let token = format!("ptok-{job}-{attempt}");
             let descriptor = self.payloads.register(
                 &job,
@@ -1402,7 +1896,10 @@ impl PoolActor {
                 content_type: record.content_type.clone(),
             }
         } else {
-            JobPayload::Inline { content_type: record.content_type.clone(), body: record.payload_inline.clone().unwrap_or(Value::Null) }
+            JobPayload::Inline {
+                content_type: record.content_type.clone(),
+                body: record.payload_inline.clone().unwrap_or(Value::Null),
+            }
         };
 
         // Non-streaming kinds get a pre-signed upload slot: bulk bytes travel over
@@ -1412,10 +1909,18 @@ impl PoolActor {
             None
         } else {
             let artifact = ArtifactId::new_unchecked(format!("art-{}", job.as_ref()));
-            self.artifacts.register(&job, artifact.clone(), now_ms);
+            // Allocation only: the actor needs the slot to exist and be owned, and
+            // the returned entry would duplicate what `assign_owner`/`upload_hint`
+            // read back out of the book.
+            let _ = self.artifacts.register(&job, artifact.clone(), now_ms);
             self.artifacts.assign_owner(&artifact, &worker, attempt);
             let token = format!("atok-{job}-{attempt}");
-            self.artifacts.upload_hint(&artifact, &token, now_ms.saturating_add(limits.job_hard_cap_ms), limits.artifact_chunk_bytes)
+            self.artifacts.upload_hint(
+                &artifact,
+                &token,
+                now_ms.saturating_add(limits.job_hard_cap_ms),
+                limits.artifact_chunk_bytes,
+            )
         };
 
         // Resume-by-continuation: hand the partial text to the next attempt so the
@@ -1433,14 +1938,17 @@ impl PoolActor {
             w.in_flight.insert(job.clone());
         }
         let conn = self.live_conn.get(&worker).copied().unwrap_or(0);
-        self.leases.insert(job.clone(), Lease {
-            job: job.clone(),
-            worker: worker.clone(),
-            epoch: conn,
-            attempt,
-            deadline_ms: lease_deadline,
-            streamed_bytes: 0,
-        });
+        self.leases.insert(
+            job.clone(),
+            Lease {
+                job: job.clone(),
+                worker: worker.clone(),
+                epoch: conn,
+                attempt,
+                deadline_ms: lease_deadline,
+                streamed_bytes: 0,
+            },
+        );
         self.lease_timer.insert((lease_deadline, job.clone()));
         self.queue.remove(&job);
         self.metrics.observe(names::DISPATCH_LATENCY, latency);
@@ -1495,7 +2003,11 @@ impl PoolActor {
             return self.refuse_foreign_frame(&worker, &job, "unknown job");
         };
         if lease.worker != worker || lease.attempt != record.attempt {
-            return self.refuse_foreign_frame(&worker, &job, "lease belongs to another worker or attempt");
+            return self.refuse_foreign_frame(
+                &worker,
+                &job,
+                "lease belongs to another worker or attempt",
+            );
         }
         if record.phase.is_terminal() || record.cancel_sent_ms.is_some() {
             // The worker kept producing briefly after Cancel: relay nothing, but
@@ -1509,7 +2021,13 @@ impl PoolActor {
             // Acceptance test 8: a reconnecting worker replaying its tail must
             // not produce duplicate deltas.
             self.metrics.incr(names::FRAMES_DUPLICATE, 1);
-            return vec![Effect::SendWorker { worker, frame: HubFrame::Ack { job, seq: record.seq.acked_through() } }];
+            return vec![Effect::SendWorker {
+                worker,
+                frame: HubFrame::Ack {
+                    job,
+                    seq: record.seq.acked_through(),
+                },
+            }];
         }
 
         let mut events = Vec::new();
@@ -1517,8 +2035,21 @@ impl PoolActor {
             self.metrics.incr(names::SEQ_GAPS, 1);
             events.push(ConsumerEvent::Gap { expected, got });
         }
-        let relayed = relay_into(record, self.limits(), seq, kind, &text, artifact.as_ref(), content_type.as_deref(), now_ms);
-        self.metrics.incr_label(names::FRAMES, "kind", frame_kind_name(kind), 1);
+        // `&self.cfg.limits` rather than `self.limits()`: `record` holds a mutable
+        // borrow of `self.jobs`, and a disjoint field borrow can coexist with it
+        // while a whole-`self` method borrow cannot.
+        let relayed = relay_into(
+            record,
+            &self.cfg.limits,
+            seq,
+            kind,
+            &text,
+            artifact.as_ref(),
+            content_type.as_deref(),
+            now_ms,
+        );
+        self.metrics
+            .incr_label(names::FRAMES, "kind", frame_kind_name(kind), 1);
         let bytes = relayed.iter().map(ConsumerEvent::size_bytes).sum::<usize>();
         self.metrics.incr(names::RELAY_BYTES, bytes as u64);
         if bytes > 0 {
@@ -1533,23 +2064,39 @@ impl PoolActor {
 
         let mut effects = Vec::new();
         if !events.is_empty() {
-            effects.push(Effect::Relay { job: job.clone(), events });
+            effects.push(Effect::Relay {
+                job: job.clone(),
+                events,
+            });
         }
         // Flow control: ack the contiguous prefix, which is also the number a
         // reconnecting worker resumes from.
-        effects.push(Effect::SendWorker { worker, frame: HubFrame::Ack { job: job.clone(), seq: record.seq.acked_through() } });
+        effects.push(Effect::SendWorker {
+            worker,
+            frame: HubFrame::Ack {
+                job: job.clone(),
+                seq: record.seq.acked_through(),
+            },
+        });
         effects
     }
 
     /// Emit everything the flush gate is still holding. Used before a terminal
     /// event so no delta is stranded behind a finish (task §7.2).
     fn pending_batch(&mut self, job: &JobId) -> Vec<ConsumerEvent> {
-        let Some(record) = self.jobs.get_mut(job) else { return Vec::new() };
+        let Some(record) = self.jobs.get_mut(job) else {
+            return Vec::new();
+        };
         if record.flush.pending_frames == 0 {
             return Vec::new();
         }
         let through = record.seq.acked_through();
-        let events: Vec<ConsumerEvent> = record.replay.since(record.flush.last_flushed_seq).iter().map(frame_event).collect();
+        let events: Vec<ConsumerEvent> = record
+            .replay
+            .since(record.flush.last_flushed_seq)
+            .into_iter()
+            .map(frame_event)
+            .collect();
         record.flush.commit_flush();
         record.flush.seal_through(through);
         record.bytes_delivered = true;
@@ -1559,8 +2106,17 @@ impl PoolActor {
     fn refuse_foreign_frame(&mut self, worker: &WorkerId, job: &JobId, why: &str) -> Vec<Effect> {
         self.metrics.incr(names::INBAND_ERRORS, 1);
         vec![
-            Effect::Log { level: LogLevel::Warn, message: format!("worker {worker} sent a frame for {job} that was refused: {why}") },
-            Effect::SendWorker { worker: worker.clone(), frame: HubFrame::Cancel { job: job.clone(), reason: CancelReason::LeaseExpired } },
+            Effect::Log {
+                level: LogLevel::Warn,
+                message: format!("worker {worker} sent a frame for {job} that was refused: {why}"),
+            },
+            Effect::SendWorker {
+                worker: worker.clone(),
+                frame: HubFrame::Cancel {
+                    job: job.clone(),
+                    reason: CancelReason::LeaseExpired,
+                },
+            },
         ]
     }
 
@@ -1581,7 +2137,11 @@ impl PoolActor {
             return Vec::new();
         }
         let Some(lease) = self.leases.get(&job).cloned() else {
-            return self.refuse_foreign_frame(&worker, &job, "Done for a job this worker does not own");
+            return self.refuse_foreign_frame(
+                &worker,
+                &job,
+                "Done for a job this worker does not own",
+            );
         };
         let outcome = {
             let Some(record) = self.jobs.get_mut(&job) else {
@@ -1589,14 +2149,27 @@ impl PoolActor {
             };
             if record.phase.is_terminal() {
                 // Acceptance test 4: never two finish_reasons.
-                self.metrics.incr_label(names::JOBS_TERMINAL, "reason", TerminalReason::DuplicateDone.as_str(), 1);
+                self.metrics.incr_label(
+                    names::JOBS_TERMINAL,
+                    "reason",
+                    TerminalReason::DuplicateDone.as_str(),
+                    1,
+                );
                 return Vec::new();
             }
             if lease.worker != worker || lease.attempt != record.attempt {
-                return self.refuse_foreign_frame(&worker, &job, "Done from a stale owner or attempt");
+                return self.refuse_foreign_frame(
+                    &worker,
+                    &job,
+                    "Done from a stale owner or attempt",
+                );
             }
             if !record.seq.done_is_current(seq) {
-                return self.refuse_foreign_frame(&worker, &job, "Done is older than the last accepted frame");
+                return self.refuse_foreign_frame(
+                    &worker,
+                    &job,
+                    "Done is older than the last accepted frame",
+                );
             }
             record.finish = Some(finish);
             record.usage = usage.clone();
@@ -1615,13 +2188,24 @@ impl PoolActor {
         let mut events = self.pending_batch(&job);
         if finish == FinishKind::Error {
             self.metrics.incr(names::INBAND_ERRORS, 1);
-            let message = error.map_or_else(|| "worker reported an error".to_string(), |e| format!("{}: {}", e.code, e.message));
-            events.push(ConsumerEvent::Error { code: "worker_error".to_string(), message, retryable: false, through_seq: Some(seq) });
+            let message = error.map_or_else(
+                || "worker reported an error".to_string(),
+                |e| format!("{}: {}", e.code, e.message),
+            );
+            events.push(ConsumerEvent::Error {
+                code: "worker_error".to_string(),
+                message,
+                retryable: false,
+                through_seq: Some(seq),
+            });
         } else {
             events.push(ConsumerEvent::Finish { seq, finish, usage });
         }
 
-        let mut effects = vec![Effect::Relay { job: job.clone(), events }];
+        let mut effects = vec![Effect::Relay {
+            job: job.clone(),
+            events,
+        }];
         effects.extend(self.finish_job(&job, TerminalReason::Completed, now_ms));
         effects.extend(self.fulfil_claims(now_ms));
         effects
@@ -1629,23 +2213,51 @@ impl PoolActor {
 
     // --------------------------------------------------------------------- resume
 
-    fn on_resume(&mut self, worker: WorkerId, conn: u64, job: JobId, attempt: u32, acked_seq: u64, now_ms: Timestamp) -> Vec<Effect> {
+    fn on_resume(
+        &mut self,
+        worker: WorkerId,
+        conn: u64,
+        job: JobId,
+        attempt: u32,
+        acked_seq: u64,
+        now_ms: Timestamp,
+    ) -> Vec<Effect> {
         if self.is_stale(&worker, conn) {
             self.metrics.incr(names::STALE_FRAMES, 1);
             return Vec::new();
         }
         let nack = |reason: String, metrics: &mut Metrics| -> Vec<Effect> {
             metrics.incr(names::RESUME_REJECTED, 1);
-            vec![Effect::SendWorker { worker: worker.clone(), frame: HubFrame::ResumeNack { job: job.clone(), attempt, reason } }]
+            vec![Effect::SendWorker {
+                worker: worker.clone(),
+                frame: HubFrame::ResumeNack {
+                    job: job.clone(),
+                    attempt,
+                    reason,
+                },
+            }]
         };
         let Some(lease) = self.leases.get(&job).cloned() else {
-            return nack("the job is no longer leased: it was requeued or finished while you were away".to_string(), &mut self.metrics);
+            return nack(
+                "the job is no longer leased: it was requeued or finished while you were away"
+                    .to_string(),
+                &mut self.metrics,
+            );
         };
         if lease.worker != worker {
-            return nack("another worker owns that job now".to_string(), &mut self.metrics);
+            return nack(
+                "another worker owns that job now".to_string(),
+                &mut self.metrics,
+            );
         }
         if lease.attempt != attempt {
-            return nack(format!("attempt {attempt} is stale; the current attempt is {}", lease.attempt), &mut self.metrics);
+            return nack(
+                format!(
+                    "attempt {attempt} is stale; the current attempt is {}",
+                    lease.attempt
+                ),
+                &mut self.metrics,
+            );
         }
         let Some(record) = self.jobs.get_mut(&job) else {
             return nack("the job no longer exists".to_string(), &mut self.metrics);
@@ -1676,9 +2288,24 @@ impl PoolActor {
         self.refresh_gauges();
 
         let resume_from = through.max(acked_seq);
+        // Build the log line first: `worker` moves into the `Ack` effect below, and
+        // the same vec! element list is evaluated in order.
+        let message = format!(
+            "worker {worker} resumed job attempt {attempt} from seq {}",
+            resume_from + 1
+        );
         vec![
-            Effect::SendWorker { worker, frame: HubFrame::Ack { job, seq: resume_from } },
-            Effect::Log { level: LogLevel::Info, message: format!("worker {worker} resumed job attempt {attempt} from seq {}", resume_from + 1) },
+            Effect::SendWorker {
+                worker,
+                frame: HubFrame::Ack {
+                    job,
+                    seq: resume_from,
+                },
+            },
+            Effect::Log {
+                level: LogLevel::Info,
+                message,
+            },
         ]
     }
 
@@ -1702,13 +2329,35 @@ impl PoolActor {
     ) -> Vec<Effect> {
         if self.is_stale(&worker, conn) {
             self.metrics.incr(names::STALE_FRAMES, 1);
-            return vec![reject(Some(job), 401, "stale_connection", "this worker's connection was replaced", None)];
+            return vec![reject(
+                Some(job),
+                401,
+                "stale_connection",
+                "this worker's connection was replaced",
+                None,
+            )];
         }
-        let owns_it = self.leases.get(&job).is_some_and(|l| l.worker == worker && l.attempt == attempt);
+        let owns_it = self
+            .leases
+            .get(&job)
+            .is_some_and(|l| l.worker == worker && l.attempt == attempt);
         if !owns_it {
-            return vec![reject(Some(job), 409, "stale_attempt", "this upload does not belong to the current attempt", None)];
+            return vec![reject(
+                Some(job),
+                409,
+                "stale_attempt",
+                "this upload does not belong to the current attempt",
+                None,
+            )];
         }
-        if let Err(err) = self.artifacts.record_chunk(&artifact, &worker, attempt, chunk_index, chunk_bytes, now_ms) {
+        if let Err(err) = self.artifacts.record_chunk(
+            &artifact,
+            &worker,
+            attempt,
+            chunk_index,
+            chunk_bytes,
+            now_ms,
+        ) {
             return vec![reject(Some(job), 413, err.code(), &err.to_string(), None)];
         }
         self.metrics.incr(names::ARTIFACT_BYTES, chunk_bytes);
@@ -1716,7 +2365,10 @@ impl PoolActor {
             return Vec::new();
         }
 
-        let recorded = self.artifacts.get(&artifact).map_or(0, |r| r.recorded_bytes());
+        let recorded = self
+            .artifacts
+            .get(&artifact)
+            .map_or(0, |r| r.recorded_bytes());
         let stored = stored_sha256.unwrap_or_default();
         let outcome = self.artifacts.complete(
             &artifact,
@@ -1754,7 +2406,12 @@ impl PoolActor {
                 self.metrics.incr(names::INBAND_ERRORS, 1);
                 vec![Effect::Relay {
                     job,
-                    events: vec![ConsumerEvent::Error { code: "artifact_mismatch".to_string(), message: err.to_string(), retryable: false, through_seq: None }],
+                    events: vec![ConsumerEvent::Error {
+                        code: "artifact_mismatch".to_string(),
+                        message: err.to_string(),
+                        retryable: false,
+                        through_seq: None,
+                    }],
                 }]
             }
         }
@@ -1781,20 +2438,11 @@ impl PoolActor {
         self.orphan_worker(&worker, now_ms)
     }
 
-    /// Mark a worker's connection dead, then either start the resume grace or,
-    /// with `resume_grace_ms == 0`, apply the expiry table immediately.
-    fn orphan_worker(&mut self, worker: &WorkerId, now_ms: Timestamp) -> Vec<Effect> {
-        self.live_conn.remove(worker);
-        let grace = self.limits().resume_grace_ms;
-        let mut effects = Vec::new();
-        if let Some(w) = self.workers.get_mut(worker) {
-            w.link = LinkState::Orphaned;
-            // Immediate loss of capacity accounting (module rule 1).
-            w.free_slots = 0;
-            w.engine = if w.engine == EngineState::Ready { EngineState::Degraded } else { w.engine };
-            w.resume_deadline_ms = Some(now_ms.saturating_add(grace));
-        }
-        // Claims held by a dead socket are void.
+    /// Drops every unfulfilled `Claim` held by `worker` and returns the slot count
+    /// that was cleared, keeping `WorkerRecord::outstanding_claims` in step with the
+    /// mailbox. Both a dead socket and a replaced socket void authority (§4: a client
+    /// that reconnects must ask for work again), but only the dead one orphans leases.
+    fn void_claim_authority(&mut self, worker: &WorkerId) -> u32 {
         let mut freed = 0u32;
         self.claims.retain(|(w, slots)| {
             if w == worker {
@@ -1807,13 +2455,39 @@ impl PoolActor {
         if let Some(w) = self.workers.get_mut(worker) {
             w.outstanding_claims = w.outstanding_claims.saturating_sub(freed);
         }
+        freed
+    }
+
+    /// Mark a worker's connection dead, then either start the resume grace or,
+    /// with `resume_grace_ms == 0`, apply the expiry table immediately.
+    fn orphan_worker(&mut self, worker: &WorkerId, now_ms: Timestamp) -> Vec<Effect> {
+        self.live_conn.remove(worker);
+        let grace = self.limits().resume_grace_ms;
+        let mut effects = Vec::new();
+        if let Some(w) = self.workers.get_mut(worker) {
+            w.link = LinkState::Orphaned;
+            // Immediate loss of capacity accounting (module rule 1).
+            w.free_slots = 0;
+            w.engine = if w.engine == EngineState::Ready {
+                EngineState::Degraded
+            } else {
+                w.engine
+            };
+            w.resume_deadline_ms = Some(now_ms.saturating_add(grace));
+        }
+        // Claims held by a dead socket are void. `in_flight` is deliberately **not**
+        // cleared: the leases still name this worker, and a reconnecting client that
+        // resumes must not be able to take a second set of slots while the
+        // mid-stream attempt is still owned (task §4's capacity cap, §7.5's resume).
+        self.void_claim_authority(worker);
 
         let held = self.jobs_for_worker(worker).len();
         if grace == 0 {
             effects.extend(self.expire_worker_leases(worker, now_ms));
             self.workers.remove(worker);
         } else {
-            self.orphan_timer.insert((now_ms.saturating_add(grace), worker.clone()));
+            self.orphan_timer
+                .insert((now_ms.saturating_add(grace), worker.clone()));
             effects.push(Effect::Log {
                 level: LogLevel::Warn,
                 message: format!("worker {worker} disconnected; holding {held} lease(s) for {grace} ms of resume grace"),
@@ -1824,7 +2498,11 @@ impl PoolActor {
     }
 
     fn jobs_for_worker(&self, worker: &WorkerId) -> Vec<JobId> {
-        self.leases.values().filter(|l| &l.worker == worker).map(|l| l.job.clone()).collect()
+        self.leases
+            .values()
+            .filter(|l| &l.worker == worker)
+            .map(|l| l.job.clone())
+            .collect()
     }
 
     fn expire_worker_leases(&mut self, worker: &WorkerId, now_ms: Timestamp) -> Vec<Effect> {
@@ -1837,19 +2515,26 @@ impl PoolActor {
     }
 
     /// The §5.1/§5.3 decision table for a job whose owner died or lapsed.
-    fn resolve_lost_job(&mut self, job: &JobId, worker: &WorkerId, now_ms: Timestamp) -> Vec<Effect> {
+    fn resolve_lost_job(
+        &mut self,
+        job: &JobId,
+        worker: &WorkerId,
+        now_ms: Timestamp,
+    ) -> Vec<Effect> {
         let Some(record) = self.jobs.get_mut(job) else {
             self.leases.remove(job);
             return Vec::new();
         };
         if record.phase.is_terminal() {
-            drop(record);
+            let _ = record; // ends the &mut borrow of self.jobs before drop_lease
             self.drop_lease(job, worker);
             return Vec::new();
         }
         // Snapshot the budget once: `record` is a mutable borrow out of `self.jobs`,
-        // and every read below happens while that borrow is live.
-        let limits = self.limits().clone();
+        // and every read below happens while that borrow is live. Field access
+        // (`&self.cfg.limits`) keeps it a disjoint borrow instead of a whole-`self`
+        // method borrow, and avoids cloning the budget on a hot path.
+        let limits = &self.cfg.limits;
         let delivered = record.bytes_delivered;
         let idempotent = record.idempotent;
         let opaque = record.output_opaque;
@@ -1873,21 +2558,35 @@ impl PoolActor {
             && opaque
             && !limits.continuation_allows_opaque_output;
         let acked = record.seq.acked_through();
-        drop(record);
+        let _ = record; // last read of the job record; the borrow ends here
 
         self.drop_lease(job, worker);
         let mut effects = Vec::new();
 
         if !delivered {
             if idempotent && attempts_left {
-                self.metrics.incr_label(names::LEASE_EXPIRIES, "kind", "no_output", 1);
+                self.metrics
+                    .incr_label(names::LEASE_EXPIRIES, "kind", "no_output", 1);
                 effects.extend(self.requeue(job, worker, now_ms));
                 effects.extend(self.fulfil_claims(now_ms));
                 return effects;
             }
             // Non-idempotent: never auto-requeue once assigned (§5.3).
-            let reason = if idempotent { TerminalReason::WorkerGoneNoOutput } else { TerminalReason::NonIdempotentAmbiguous };
-            self.metrics.incr_label(names::LEASE_EXPIRIES, "kind", if idempotent { "no_output" } else { "non_idempotent" }, 1);
+            let reason = if idempotent {
+                TerminalReason::WorkerGoneNoOutput
+            } else {
+                TerminalReason::NonIdempotentAmbiguous
+            };
+            self.metrics.incr_label(
+                names::LEASE_EXPIRIES,
+                "kind",
+                if idempotent {
+                    "no_output"
+                } else {
+                    "non_idempotent"
+                },
+                1,
+            );
             effects.push(Effect::Relay {
                 job: job.clone(),
                 events: vec![ConsumerEvent::Error {
@@ -1912,11 +2611,14 @@ impl PoolActor {
             if let Some(r) = self.jobs.get_mut(job) {
                 r.continuations += 1;
             }
-            self.metrics.incr_label(names::LEASE_EXPIRIES, "kind", "continuation", 1);
+            self.metrics
+                .incr_label(names::LEASE_EXPIRIES, "kind", "continuation", 1);
             effects.extend(self.requeue(job, worker, now_ms));
             effects.push(Effect::Log {
                 level: LogLevel::Warn,
-                message: format!("{job} is being re-run as a continuation after {worker} died mid-stream"),
+                message: format!(
+                    "{job} is being re-run as a continuation after {worker} died mid-stream"
+                ),
             });
             effects.extend(self.fulfil_claims(now_ms));
             return effects;
@@ -1929,7 +2631,8 @@ impl PoolActor {
             });
         }
 
-        self.metrics.incr_label(names::LEASE_EXPIRIES, "kind", "partial", 1);
+        self.metrics
+            .incr_label(names::LEASE_EXPIRIES, "kind", "partial", 1);
         self.metrics.incr(names::INBAND_ERRORS, 1);
         let mut events = self.pending_batch(job);
         events.push(ConsumerEvent::Error {
@@ -1938,7 +2641,10 @@ impl PoolActor {
             retryable: false,
             through_seq: Some(acked),
         });
-        effects.push(Effect::Relay { job: job.clone(), events });
+        effects.push(Effect::Relay {
+            job: job.clone(),
+            events,
+        });
         effects.extend(self.finish_job(job, TerminalReason::WorkerGonePartial, now_ms));
         effects.extend(self.fulfil_claims(now_ms));
         effects
@@ -1947,12 +2653,21 @@ impl PoolActor {
     /// Put a job back in the queue: `attempt` already counts the failed try, and
     /// `last_worker` makes the next dispatch prefer a different worker (§5.1).
     fn requeue(&mut self, job: &JobId, failed_worker: &WorkerId, now_ms: Timestamp) -> Vec<Effect> {
-        let ready = self.ready_workers() > 0;
         let deadline_len = kind_claim_deadline(&self.cfg, &self.jobs[job].kind);
         let arrival = self.next_arrival_seq();
-        let Some(record) = self.jobs.get_mut(job) else { return Vec::new() };
+        let Some(record) = self.jobs.get_mut(job) else {
+            return Vec::new();
+        };
         record.last_worker = Some(failed_worker.clone());
-        record.phase = if ready { JobPhase::Queued } else { JobPhase::Pending };
+        // Always `Queued`, never `Pending`, however thin the pool looks right now.
+        // `Pending` is the pre-answer phase: it is what makes §7.2's `503 +
+        // Retry-After` still legal, and `PoolActor::on_tick` only emits that
+        // response for a `Pending` job. A requeue has already been dispatched once,
+        // so the actor already emitted `Accepted` and the consumer's body is open:
+        // a `503` arriving there would be resolved against a gate that is spent and
+        // the stream would end with no explanation, so §7.2's in-band error is the
+        // only honest answer (and `on_tick`'s non-`Pending` arm is exactly that).
+        record.phase = JobPhase::Queued;
         record.queue_seq = Some(arrival);
         record.dispatch_deadline_ms = now_ms.saturating_add(deadline_len);
         record.cancel_sent_ms = None;
@@ -1973,7 +2688,10 @@ impl PoolActor {
             effects.extend(self.finish_job(job, TerminalReason::QueueFull, now_ms));
             return effects;
         }
-        vec![Effect::Log { level: LogLevel::Info, message: format!("{job} requeued for attempt {}", record.attempt + 1) }]
+        vec![Effect::Log {
+            level: LogLevel::Info,
+            message: format!("{job} requeued for attempt {}", record.attempt + 1),
+        }]
     }
 
     fn drop_lease(&mut self, job: &JobId, worker: &WorkerId) {
@@ -1986,7 +2704,12 @@ impl PoolActor {
     }
 
     /// Move a job to a terminal phase, free its resources, and report it.
-    fn finish_job(&mut self, job: &JobId, reason: TerminalReason, now_ms: Timestamp) -> Vec<Effect> {
+    fn finish_job(
+        &mut self,
+        job: &JobId,
+        reason: TerminalReason,
+        now_ms: Timestamp,
+    ) -> Vec<Effect> {
         let mut effects = Vec::new();
         if let Some(record) = self.jobs.get_mut(job) {
             if record.phase.is_terminal() {
@@ -1994,22 +2717,34 @@ impl PoolActor {
             }
             let applied = record.terminate(reason, now_ms);
             if let Some(dispatch) = record.timings.dispatch_ms {
-                self.metrics.observe(names::JOB_DURATION, now_ms.saturating_sub(dispatch));
+                self.metrics
+                    .observe(names::JOB_DURATION, now_ms.saturating_sub(dispatch));
             }
-            self.metrics.incr_label(names::JOBS_TERMINAL, "reason", applied.as_str(), 1);
+            self.metrics
+                .incr_label(names::JOBS_TERMINAL, "reason", applied.as_str(), 1);
             // Prompts are released the moment a job is terminal (§9).
             let reference = record.payload_ref.take();
             if let Some(id) = &reference {
                 self.payloads.release(id);
             }
-            effects.push(Effect::ReleasePayload { job: job.clone(), reference });
+            effects.push(Effect::ReleasePayload {
+                job: job.clone(),
+                reference,
+            });
             if let Some(count) = self.tenant_active.get_mut(&record.tenant) {
                 *count = count.saturating_sub(1);
             }
-            self.retention_timer.insert((now_ms.saturating_add(self.limits().job_retention_ms), job.clone()));
+            self.retention_timer.insert((
+                now_ms.saturating_add(self.limits().job_retention_ms),
+                job.clone(),
+            ));
             // The idempotency entry outlives the job so a late retry replays the
             // finished stream instead of re-running it (§5.2).
-            effects.push(Effect::Terminal { job: job.clone(), reason: applied, retryable: applied.retryable() });
+            effects.push(Effect::Terminal {
+                job: job.clone(),
+                reason: applied,
+                retryable: applied.retryable(),
+            });
         }
         // Any lease still pointing at the finished job must go, whoever held it.
         if let Some(lease) = self.leases.remove(job) {
@@ -2053,7 +2788,9 @@ impl PoolActor {
             .map(|(_, job)| job.clone())
             .collect();
         for job in due_leases {
-            let Some(lease) = self.leases.get(&job).cloned() else { continue };
+            let Some(lease) = self.leases.get(&job).cloned() else {
+                continue;
+            };
             if lease.deadline_ms > now_ms {
                 continue; // renewed between collection and application
             }
@@ -2084,7 +2821,8 @@ impl PoolActor {
             } else {
                 TerminalReason::QueueTimeout
             };
-            self.metrics.incr_label(names::LEASE_EXPIRIES, "kind", "no_dispatch", 1);
+            self.metrics
+                .incr_label(names::LEASE_EXPIRIES, "kind", "no_dispatch", 1);
             // Two different contracts, decided by whether the job has already
             // been answered:
             //   * `Pending`  → nothing was written, so `503 + Retry-After` is
@@ -2096,7 +2834,9 @@ impl PoolActor {
             //     stream would hang instead of ending.
             if phase == JobPhase::Pending {
                 effects.push(Effect::Reject {
-                    job: job.clone(),
+                    // `Effect::Reject.job` is optional by design (a rejection can
+                    // precede job creation); this one names the job it refused.
+                    job: Some(job.clone()),
                     status: 503,
                     code: reason.as_str().to_string(),
                     message: "no capable worker became ready in time".to_string(),
@@ -2126,13 +2866,23 @@ impl PoolActor {
         let overdue: Vec<JobId> = self
             .leases
             .values()
-            .filter(|lease| self.jobs.get(&lease.job).is_some_and(|r| r.deadline_ms <= now_ms))
+            .filter(|lease| {
+                self.jobs
+                    .get(&lease.job)
+                    .is_some_and(|r| r.deadline_ms <= now_ms)
+            })
             .map(|lease| lease.job.clone())
             .collect();
         for job in overdue {
             let worker = self.leases.get(&job).map(|l| l.worker.clone());
             if let Some(worker) = worker {
-                effects.push(Effect::SendWorker { worker, frame: HubFrame::Cancel { job: job.clone(), reason: CancelReason::Deadline } });
+                effects.push(Effect::SendWorker {
+                    worker,
+                    frame: HubFrame::Cancel {
+                        job: job.clone(),
+                        reason: CancelReason::Deadline,
+                    },
+                });
             }
             let through = self.jobs.get(&job).map(|r| r.seq.acked_through());
             let mut events = self.pending_batch(&job);
@@ -2142,7 +2892,10 @@ impl PoolActor {
                 retryable: false,
                 through_seq: through,
             });
-            effects.push(Effect::Relay { job: job.clone(), events });
+            effects.push(Effect::Relay {
+                job: job.clone(),
+                events,
+            });
             effects.extend(self.finish_job(&job, TerminalReason::DeadlineExceeded, now_ms));
         }
 
@@ -2151,7 +2904,11 @@ impl PoolActor {
         let degraded: Vec<WorkerId> = self
             .workers
             .iter()
-            .filter(|(_, w)| w.link == LinkState::Live && w.engine == EngineState::Ready && now_ms.saturating_sub(w.last_seen_ms) >= heartbeat_timeout)
+            .filter(|(_, w)| {
+                w.link == LinkState::Live
+                    && w.engine == EngineState::Ready
+                    && now_ms.saturating_sub(w.last_seen_ms) >= heartbeat_timeout
+            })
             .map(|(id, _)| id.clone())
             .collect();
         for worker in degraded {
@@ -2160,7 +2917,9 @@ impl PoolActor {
             }
             effects.push(Effect::Log {
                 level: LogLevel::Warn,
-                message: format!("worker {worker} missed {heartbeat_timeout} ms of heartbeats; pausing dispatch"),
+                message: format!(
+                    "worker {worker} missed {heartbeat_timeout} ms of heartbeats; pausing dispatch"
+                ),
             });
         }
 
@@ -2174,9 +2933,9 @@ impl PoolActor {
             .filter(|(_, r)| {
                 r.flush.pending_frames > 0
                     && !r.consumers.is_empty()
-                    && r.flush
-                        .oldest_ms
-                        .is_some_and(|first| now_ms.saturating_sub(first) >= limits.flush_interval_ms)
+                    && r.flush.oldest_ms.is_some_and(|first| {
+                        now_ms.saturating_sub(first) >= limits.flush_interval_ms
+                    })
             })
             .map(|(id, _)| id.clone())
             .collect();
@@ -2195,7 +2954,9 @@ impl PoolActor {
                 r.streaming
                     && !r.consumers.is_empty()
                     && matches!(r.phase, JobPhase::Pending | JobPhase::Queued)
-                    && r.last_ping_ms.map_or(true, |last| now_ms.saturating_sub(last) >= KEEPALIVE_INTERVAL_MS)
+                    && r.last_ping_ms.map_or(true, |last| {
+                        now_ms.saturating_sub(last) >= KEEPALIVE_INTERVAL_MS
+                    })
             })
             .map(|(id, _)| id.clone())
             .collect();
@@ -2208,7 +2969,10 @@ impl PoolActor {
 
         // 8. TTL sweeps. Prompts go first: they are the sensitive bytes.
         for id in self.payloads.purge_expired(now_ms) {
-            effects.push(Effect::ReleasePayload { job: JobId::new_unchecked(id.as_ref()), reference: Some(id) });
+            effects.push(Effect::ReleasePayload {
+                job: JobId::new_unchecked(id.as_ref()),
+                reference: Some(id),
+            });
         }
         for (artifact, path) in self.artifacts.purge_expired(now_ms) {
             effects.push(Effect::DeleteArtifact { artifact, path });
@@ -2244,10 +3008,21 @@ impl PoolActor {
         self.closed = true;
         let mut effects = Vec::new();
         for (job, lease) in self.leases.iter() {
-            effects.push(Effect::SendWorker { worker: lease.worker.clone(), frame: HubFrame::Cancel { job: job.clone(), reason: CancelReason::HubShutdown } });
+            effects.push(Effect::SendWorker {
+                worker: lease.worker.clone(),
+                frame: HubFrame::Cancel {
+                    job: job.clone(),
+                    reason: CancelReason::HubShutdown,
+                },
+            });
         }
         for worker in self.workers.keys() {
-            effects.push(Effect::SendWorker { worker: worker.clone(), frame: HubFrame::Bye { reason: ByeReason::Shutdown } });
+            effects.push(Effect::SendWorker {
+                worker: worker.clone(),
+                frame: HubFrame::Bye {
+                    reason: ByeReason::Shutdown,
+                },
+            });
         }
         let mut draining = self.queue.drain();
         draining.extend(self.leases.keys().cloned());
@@ -2280,13 +3055,24 @@ impl PoolActor {
 
     /// Recompute the gauges `/metrics` and `/healthz` read.
     fn refresh_gauges(&mut self) {
-        self.metrics.set(names::QUEUE_DEPTH, self.queue.depth() as u64);
-        self.metrics.set(names::READY_WORKERS, self.ready_workers() as u64);
-        self.metrics.set(names::LOADING_WORKERS, self.loading_workers() as u64);
-        self.metrics.set(names::CONNECTED_WORKERS, self.workers.values().filter(|w| w.link == LinkState::Live).count() as u64);
+        self.metrics
+            .set(names::QUEUE_DEPTH, self.queue.depth() as u64);
+        self.metrics
+            .set(names::READY_WORKERS, self.ready_workers() as u64);
+        self.metrics
+            .set(names::LOADING_WORKERS, self.loading_workers() as u64);
+        self.metrics.set(
+            names::CONNECTED_WORKERS,
+            self.workers
+                .values()
+                .filter(|w| w.link == LinkState::Live)
+                .count() as u64,
+        );
         self.metrics.set(names::LEASES, self.leases.len() as u64);
-        self.metrics.set("nexus_payload_bytes", self.payloads.bytes());
-        self.metrics.set("nexus_artifact_bytes_on_disk", self.artifacts.bytes());
+        self.metrics
+            .set("nexus_payload_bytes", self.payloads.bytes());
+        self.metrics
+            .set("nexus_artifact_bytes_on_disk", self.artifacts.bytes());
     }
 }
 
@@ -2333,7 +3119,10 @@ fn relay_into(
     // `content_type` is deliberately **not** consulted: the reference worker labels
     // every chunk `application/json` (`acceptance.rs:117` `delta_msg`), so the
     // label carries no information about reconstructibility.
-    if kind != FrameKind::Delta || text.contains("\"tool_calls\"") || text.contains("\"function_call\"") {
+    if kind != FrameKind::Delta
+        || text.contains("\"tool_calls\"")
+        || text.contains("\"function_call\"")
+    {
         record.output_opaque = true;
     }
     // A content type on a delta frame is recorded but never interpreted: only
@@ -2342,46 +3131,85 @@ fn relay_into(
         record.content_type = ct.to_string();
     }
 
-    record.replay.push(BufferedFrame { seq, kind, content: text.to_string(), artifact: artifact.cloned(), received_ms: now_ms });
+    record.replay.push(BufferedFrame {
+        seq,
+        kind,
+        content: text.to_string(),
+        artifact: artifact.cloned(),
+        received_ms: now_ms,
+    });
 
     // Account the frame in the gate first, then ask whether the window is full:
     // a frame that crosses the byte threshold must flush immediately, including
     // the frames that were waiting.
     record.flush.note(now_ms, text.len());
-    let batch: Vec<ConsumerEvent> = if record.flush.should_flush(now_ms, limits.flush_interval_ms, limits.flush_bytes) {
-        let events = record.replay.since(record.flush.last_flushed_seq).iter().map(frame_event).collect();
-        record.flush.commit_flush();
-        record.flush.seal_through(seq);
-        events
-    } else {
-        Vec::new()
-    };
+    let batch: Vec<ConsumerEvent> =
+        if record
+            .flush
+            .should_flush(now_ms, limits.flush_interval_ms, limits.flush_bytes)
+        {
+            let events = record
+                .replay
+                .since(record.flush.last_flushed_seq)
+                .into_iter()
+                .map(frame_event)
+                .collect();
+            record.flush.commit_flush();
+            record.flush.seal_through(seq);
+            events
+        } else {
+            Vec::new()
+        };
 
     // `bytes_delivered` is the "HTTP status is spent" flag (§7.2).
     record.bytes_delivered = true;
-    record.delivered_bytes = record.delivered_bytes.saturating_add(batch.iter().map(ConsumerEvent::size_bytes).sum::<usize>() as u64);
+    record.delivered_bytes = record
+        .delivered_bytes
+        .saturating_add(batch.iter().map(ConsumerEvent::size_bytes).sum::<usize>() as u64);
     batch
 }
 
 /// Convert one buffered frame into its consumer event.
 fn frame_event(frame: &BufferedFrame) -> ConsumerEvent {
     match frame.kind {
-        FrameKind::Delta => ConsumerEvent::Delta { seq: frame.seq, text: frame.content.clone() },
-        FrameKind::Log => ConsumerEvent::Log { seq: frame.seq, text: frame.content.clone() },
+        FrameKind::Delta => ConsumerEvent::Delta {
+            seq: frame.seq,
+            text: frame.content.clone(),
+        },
+        FrameKind::Log => ConsumerEvent::Log {
+            seq: frame.seq,
+            text: frame.content.clone(),
+        },
         FrameKind::Event => ConsumerEvent::Event {
             seq: frame.seq,
-            payload: serde_json::from_str(&frame.content).unwrap_or_else(|_| Value::String(frame.content.clone())),
+            payload: serde_json::from_str(&frame.content)
+                .unwrap_or_else(|_| Value::String(frame.content.clone())),
         },
         FrameKind::ArtifactChunk => ConsumerEvent::Artifact {
             seq: frame.seq,
-            manifest: frame.artifact.clone().expect("the protocol layer requires a manifest"),
+            manifest: frame
+                .artifact
+                .clone()
+                .expect("the protocol layer requires a manifest"),
         },
     }
 }
 
 /// Build a `Reject` effect.
-fn reject(job: Option<JobId>, status: u16, code: &str, message: &str, retry_after_ms: Option<u64>) -> Effect {
-    Effect::Reject { job, status, code: code.to_string(), message: message.to_string(), retry_after_ms }
+fn reject(
+    job: Option<JobId>,
+    status: u16,
+    code: &str,
+    message: &str,
+    retry_after_ms: Option<u64>,
+) -> Effect {
+    Effect::Reject {
+        job,
+        status,
+        code: code.to_string(),
+        message: message.to_string(),
+        retry_after_ms,
+    }
 }
 
 /// Wire name of a frame kind, for metric labels.
@@ -2405,7 +3233,10 @@ fn unsatisfiable_reason(requires: &Requires) -> String {
         parts.push(format!("{min} tokens of context"));
     }
     if !requires.capabilities.is_empty() {
-        parts.push(format!("capabilities {:?}", requires.capabilities.iter().collect::<Vec<_>>()));
+        parts.push(format!(
+            "capabilities {:?}",
+            requires.capabilities.iter().collect::<Vec<_>>()
+        ));
     }
     if parts.is_empty() {
         "no worker is connected to this pool".to_string()
@@ -2420,7 +3251,12 @@ fn usage_tokens(usage: Option<&Value>) -> Option<u64> {
     usage
         .and_then(|v| v.get("completion_tokens"))
         .and_then(Value::as_u64)
-        .or_else(|| usage.and_then(|v| v.get("usage")).and_then(|u| u.get("completion_tokens")).and_then(Value::as_u64))
+        .or_else(|| {
+            usage
+                .and_then(|v| v.get("usage"))
+                .and_then(|u| u.get("completion_tokens"))
+                .and_then(Value::as_u64)
+        })
 }
 
 /// Per-kind claim deadline, used when requeueing.

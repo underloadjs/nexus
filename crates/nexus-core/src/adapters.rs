@@ -12,9 +12,9 @@
 
 use std::collections::BTreeSet;
 
+use serde_json::json;
 use serde_json::Map;
 use serde_json::Value;
-use serde_json::json;
 
 use crate::config::BrokerConfig;
 use crate::ids::JobId;
@@ -53,13 +53,21 @@ impl AdapterError {
     /// Build a 400 with a message.
     #[must_use]
     pub fn bad_request(message: impl Into<String>) -> Self {
-        Self { status: 400, code: "invalid_request", message: message.into() }
+        Self {
+            status: 400,
+            code: "invalid_request",
+            message: message.into(),
+        }
     }
 
     /// Build a 404.
     #[must_use]
     pub fn not_found(message: impl Into<String>) -> Self {
-        Self { status: 404, code: "not_found", message: message.into() }
+        Self {
+            status: 404,
+            code: "not_found",
+            message: message.into(),
+        }
     }
 }
 
@@ -96,21 +104,34 @@ impl ChatRequest {
             .get("model")
             .and_then(Value::as_str)
             .filter(|m| !m.trim().is_empty())
-            .ok_or_else(|| AdapterError::bad_request("`model` is required and must be a non-empty string"))?
+            .ok_or_else(|| {
+                AdapterError::bad_request("`model` is required and must be a non-empty string")
+            })?
             .to_string();
 
         // `/v1/completions` carries `prompt`; chat carries `messages`. Accept
         // either so a client mixing the two is not silently dropped.
-        let has_input = body.get("messages").is_some_and(|m| m.is_array() && !m.as_array().expect("array").is_empty())
+        let has_input = body
+            .get("messages")
+            .is_some_and(|m| m.is_array() && !m.as_array().expect("array").is_empty())
             || body.get("prompt").is_some_and(|p| !p.is_null());
         if !has_input {
-            return Err(AdapterError::bad_request("`messages` (or `prompt`) is required"));
+            return Err(AdapterError::bad_request(
+                "`messages` (or `prompt`) is required",
+            ));
         }
 
         let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
         let requires = infer_requires(&model, body);
         let prompt_tokens_estimate = estimate_tokens(body);
-        Ok(Self { model, stream, kind: kind.to_string(), body: body.clone(), requires, prompt_tokens_estimate })
+        Ok(Self {
+            model,
+            stream,
+            kind: kind.to_string(),
+            body: body.clone(),
+            requires,
+            prompt_tokens_estimate,
+        })
     }
 
     /// Turn the request into an actor submission.
@@ -162,7 +183,10 @@ impl ChatRequest {
 #[must_use]
 pub fn infer_requires(model: &str, body: &Value) -> Requires {
     let mut capabilities: BTreeSet<String> = BTreeSet::new();
-    if body.get("tools").is_some_and(|t| t.is_array() && !t.as_array().expect("array").is_empty()) {
+    if body
+        .get("tools")
+        .is_some_and(|t| t.is_array() && !t.as_array().expect("array").is_empty())
+    {
         capabilities.insert("tools".to_string());
     }
     if body
@@ -172,13 +196,19 @@ pub fn infer_requires(model: &str, body: &Value) -> Requires {
     {
         capabilities.insert("vision".to_string());
     }
-    if body.get("logprobs").is_some_and(|l| !l.is_null() && l != &json!(false)) {
+    if body
+        .get("logprobs")
+        .is_some_and(|l| !l.is_null() && l != &json!(false))
+    {
         capabilities.insert("logprobs".to_string());
     }
     if body.get("response_format").is_some() || body.get("response_type").is_some() {
         capabilities.insert("structured_output".to_string());
     }
-    let min_context_tokens = body.get("max_completion_tokens").or(body.get("max_tokens")).and_then(Value::as_u64);
+    let min_context_tokens = body
+        .get("max_completion_tokens")
+        .or(body.get("max_tokens"))
+        .and_then(Value::as_u64);
 
     Requires {
         model: Some(model.to_string()),
@@ -265,7 +295,13 @@ pub fn openai_delta_payload(text: &str, job: &JobId, model: &str, created_ms: Ti
 
 /// The terminal chunk of an OpenAI stream: `finish_reason` plus `usage`.
 #[must_use]
-pub fn finish_chunk(job: &JobId, model: &str, created_ms: Timestamp, finish: FinishKind, usage: Option<&Value>) -> Value {
+pub fn finish_chunk(
+    job: &JobId,
+    model: &str,
+    created_ms: Timestamp,
+    finish: FinishKind,
+    usage: Option<&Value>,
+) -> Value {
     let mut chunk = json!({
         "id": completion_id(job),
         "object": "chat.completion.chunk",
@@ -295,10 +331,14 @@ pub fn http_error(code: &str, message: &str, retryable: bool) -> Value {
 /// Merge a relayed delta chunk into the accumulating message of a non-streaming
 /// response: content concatenates, `tool_calls` merge per index, reasoning text
 /// concatenates, `finish_reason` keeps the last non-null one.
-#[must_use]
+/// Mutates `message` in place; the return value is `()`, so no `#[must_use]`.
 pub fn merge_delta(message: &mut Value, delta: &Value) {
     if let Some(content) = delta.get("content").and_then(Value::as_str) {
-        let existing = message.get("content").and_then(Value::as_str).unwrap_or_default().to_string();
+        let existing = message
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
         message["content"] = Value::String(format!("{existing}{content}"));
     }
     if let Some(reasoning) = delta.get("reasoning_content").and_then(Value::as_str) {
@@ -317,14 +357,25 @@ pub fn merge_delta(message: &mut Value, delta: &Value) {
             .unwrap_or_default();
         for call in calls {
             let index = call.get("index").and_then(Value::as_u64).unwrap_or(0);
-            match merged.iter_mut().find(|slot| slot.get("index").and_then(Value::as_u64) == Some(index)) {
+            match merged
+                .iter_mut()
+                .find(|slot| slot.get("index").and_then(Value::as_u64) == Some(index))
+            {
                 Some(slot) => {
                     // Arguments arrive as fragments that concatenate; name and id
                     // arrive once.
-                    if let Some(name) = call.get("function").and_then(|f| f.get("name")).and_then(Value::as_str) {
+                    if let Some(name) = call
+                        .get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(Value::as_str)
+                    {
                         slot["function"]["name"] = Value::String(name.to_string());
                     }
-                    if let Some(args) = call.get("function").and_then(|f| f.get("arguments")).and_then(Value::as_str) {
+                    if let Some(args) = call
+                        .get("function")
+                        .and_then(|f| f.get("arguments"))
+                        .and_then(Value::as_str)
+                    {
                         let existing = slot
                             .get("function")
                             .and_then(|f| f.get("arguments"))
@@ -359,7 +410,12 @@ pub fn merge_delta(message: &mut Value, delta: &Value) {
 /// The events' delta payloads are parsed here — that is dialect work inside the
 /// adapter, and it is why the spine never has to understand a chunk.
 #[must_use]
-pub fn assemble_completion(job: &JobId, model: &str, created_ms: Timestamp, events: &[ConsumerEvent]) -> Value {
+pub fn assemble_completion(
+    job: &JobId,
+    model: &str,
+    created_ms: Timestamp,
+    events: &[ConsumerEvent],
+) -> Value {
     let mut message = json!({ "role": "assistant" });
     let mut finish: Option<String> = None;
     let mut usage: Option<Value> = None;
@@ -369,7 +425,11 @@ pub fn assemble_completion(job: &JobId, model: &str, created_ms: Timestamp, even
         match event {
             ConsumerEvent::Delta { text, .. } => {
                 if let Ok(chunk) = serde_json::from_str::<Value>(text) {
-                    if let Some(choice) = chunk.get("choices").and_then(Value::as_array).and_then(|c| c.first()) {
+                    if let Some(choice) = chunk
+                        .get("choices")
+                        .and_then(Value::as_array)
+                        .and_then(|c| c.first())
+                    {
                         if let Some(delta) = choice.get("delta") {
                             merge_delta(&mut message, delta);
                         }
@@ -382,11 +442,19 @@ pub fn assemble_completion(job: &JobId, model: &str, created_ms: Timestamp, even
                     }
                 } else {
                     // A bare token: still concatenate.
-                    let existing = message.get("content").and_then(Value::as_str).unwrap_or_default().to_string();
+                    let existing = message
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
                     message["content"] = Value::String(format!("{existing}{text}"));
                 }
             }
-            ConsumerEvent::Finish { finish: f, usage: u, .. } => {
+            ConsumerEvent::Finish {
+                finish: f,
+                usage: u,
+                ..
+            } => {
                 finish = Some(f.as_str().to_string());
                 usage = u.clone();
             }
@@ -419,7 +487,10 @@ trait WithOptionalLogprobs {
 
 impl WithOptionalLogprobs for Value {
     fn with_optional_logprobs(mut self, logprobs: Option<Value>) -> Value {
-        if let (Some(lp), Some(choice)) = (logprobs, self.get_mut("choices").and_then(Value::as_array_mut)) {
+        if let (Some(lp), Some(choice)) = (
+            logprobs,
+            self.get_mut("choices").and_then(Value::as_array_mut),
+        ) {
             if let Some(choice) = choice.first_mut() {
                 choice["logprobs"] = lp;
             }
@@ -432,7 +503,10 @@ impl WithOptionalLogprobs for Value {
 /// response, so a non-streaming client can still tell success from failure.
 fn message_extra(usage: &mut Option<Value>, code: &str, message: &str) {
     let mut map = Map::new();
-    map.insert("error".to_string(), json!({ "type": code, "message": message }));
+    map.insert(
+        "error".to_string(),
+        json!({ "type": code, "message": message }),
+    );
     *usage = Some(Value::Object(map));
 }
 
@@ -492,8 +566,12 @@ pub fn job_status_body(view: &JobView) -> Value {
 /// `Frame.meta`. Kept permissive: the manifest is the worker's description of an
 /// upload the hub has already verified by measurement.
 #[must_use]
-pub fn declared_artifact(manifest: Option<&crate::protocol::ArtifactManifest>) -> (Option<String>, Option<u64>) {
-    manifest.map(|m| (m.sha256.clone(), m.size_bytes)).unwrap_or((None, None))
+pub fn declared_artifact(
+    manifest: Option<&crate::protocol::ArtifactManifest>,
+) -> (Option<String>, Option<u64>) {
+    manifest
+        .map(|m| (m.sha256.clone(), m.size_bytes))
+        .unwrap_or((None, None))
 }
 
 /// The `GET /v1/models` document, derived from warm workers only (task §7.1).
@@ -518,7 +596,13 @@ pub fn models_document(models: &BTreeSet<String>, created_ms: Timestamp) -> Valu
 
 /// `/healthz` body: degraded capacity is reported, never hidden (task §8, §11).
 #[must_use]
-pub fn health_body(pool: &str, ready: usize, loading: usize, queue_depth: usize, lease_count: usize) -> Value {
+pub fn health_body(
+    pool: &str,
+    ready: usize,
+    loading: usize,
+    queue_depth: usize,
+    lease_count: usize,
+) -> Value {
     json!({
         "status": if ready == 0 { "degraded" } else { "ok" },
         "pool": pool,
@@ -550,8 +634,11 @@ mod tests {
 
     #[test]
     fn parse_requires_the_model_and_an_input() {
-        let err = ChatRequest::parse(&json!({"messages": [{"role": "user", "content": "hi"}]}), KIND_CHAT)
-            .expect_err("no model");
+        let err = ChatRequest::parse(
+            &json!({"messages": [{"role": "user", "content": "hi"}]}),
+            KIND_CHAT,
+        )
+        .expect_err("no model");
         assert_eq!(err.status, 400);
         assert_eq!(err.code, "invalid_request");
 
@@ -561,8 +648,11 @@ mod tests {
         let err = ChatRequest::parse(&json!("a string"), KIND_CHAT).expect_err("not an object");
         assert_eq!(err.message, "body must be a JSON object");
 
-        let req = ChatRequest::parse(&json!({"model": "qwen38", "prompt": "write a haiku", "max_tokens": 64}), KIND_COMPLETION)
-            .expect("completions body parses");
+        let req = ChatRequest::parse(
+            &json!({"model": "qwen38", "prompt": "write a haiku", "max_tokens": 64}),
+            KIND_COMPLETION,
+        )
+        .expect("completions body parses");
         assert_eq!(req.kind, KIND_COMPLETION);
         assert_eq!(req.model, "qwen38");
         assert_eq!(req.requires.min_context_tokens, Some(64));
@@ -570,31 +660,51 @@ mod tests {
 
     #[test]
     fn capability_inference_is_exact() {
-        let plain = infer_requires("qwen38", &json!({"model":"qwen38","messages":[{"role":"user","content":"hi"}]}));
+        let plain = infer_requires(
+            "qwen38",
+            &json!({"model":"qwen38","messages":[{"role":"user","content":"hi"}]}),
+        );
         assert_eq!(plain.capabilities, BTreeSet::new());
 
-        let tools = infer_requires("qwen38", &json!({"model":"qwen38","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function"}]}));
+        let tools = infer_requires(
+            "qwen38",
+            &json!({"model":"qwen38","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function"}]}),
+        );
         assert_eq!(tools.capabilities, BTreeSet::from(["tools".to_string()]));
 
-        let vision = infer_requires("qwen38", &json!({
-            "model":"qwen38",
-            "messages":[{"role":"user","content":[{"type":"text","text":"what is this"},{"type":"image_url","image_url":{"url":"http://x/y.png"}}]}]
-        }));
+        let vision = infer_requires(
+            "qwen38",
+            &json!({
+                "model":"qwen38",
+                "messages":[{"role":"user","content":[{"type":"text","text":"what is this"},{"type":"image_url","image_url":{"url":"http://x/y.png"}}]}]
+            }),
+        );
         assert_eq!(vision.capabilities, BTreeSet::from(["vision".to_string()]));
 
-        let both = infer_requires("qwen38", &json!({
-            "model":"qwen38",
-            "messages":[{"role":"user","content":[{"image":"base64..."}]}],
-            "logprobs": true,
-            "tools": [{"type":"function"}],
-            "response_format": {"type":"json_object"}
-        }));
+        let both = infer_requires(
+            "qwen38",
+            &json!({
+                "model":"qwen38",
+                "messages":[{"role":"user","content":[{"image":"base64..."}]}],
+                "logprobs": true,
+                "tools": [{"type":"function"}],
+                "response_format": {"type":"json_object"}
+            }),
+        );
         assert_eq!(
             both.capabilities,
-            BTreeSet::from(["tools".to_string(), "vision".to_string(), "logprobs".to_string(), "structured_output".to_string()])
+            BTreeSet::from([
+                "tools".to_string(),
+                "vision".to_string(),
+                "logprobs".to_string(),
+                "structured_output".to_string()
+            ])
         );
         // `logprobs: false` must not claim the capability.
-        let no_lp = infer_requires("qwen38", &json!({"model":"qwen38","messages":[{"role":"user","content":"hi"}],"logprobs": false}));
+        let no_lp = infer_requires(
+            "qwen38",
+            &json!({"model":"qwen38","messages":[{"role":"user","content":"hi"}],"logprobs": false}),
+        );
         assert!(!no_lp.capabilities.contains("logprobs"));
     }
 
@@ -602,15 +712,29 @@ mod tests {
     fn token_estimate_counts_every_string() {
         // Every string in the body is counted: "abcd" + "user" + "abcd" = 12
         // chars, which is 3 tokens at 4 chars/token.
-        assert_eq!(estimate_tokens(&json!({"model":"abcd","messages":[{"role":"user","content":"abcd"}]})), 3);
+        assert_eq!(
+            estimate_tokens(&json!({"model":"abcd","messages":[{"role":"user","content":"abcd"}]})),
+            3
+        );
         assert_eq!(estimate_tokens(&json!({})), 0);
     }
 
     #[test]
     fn submission_takes_idempotency_from_the_header_or_the_content_hash() {
         let c = cfg();
-        let req = ChatRequest::parse(&json!({"model":"qwen38","messages":[{"role":"user","content":"hi"}],"stream":true}), KIND_CHAT).expect("parse");
-        let sub = req.to_submission(&c, &TenantId::new_unchecked("acme"), PoolId::new_unchecked("llm.chat/qwen38"), Some("key-123"), Some("sess-9".to_string()), Priority::Realtime);
+        let req = ChatRequest::parse(
+            &json!({"model":"qwen38","messages":[{"role":"user","content":"hi"}],"stream":true}),
+            KIND_CHAT,
+        )
+        .expect("parse");
+        let sub = req.to_submission(
+            &c,
+            &TenantId::new_unchecked("acme"),
+            PoolId::new_unchecked("llm.chat/qwen38"),
+            Some("key-123"),
+            Some("sess-9".to_string()),
+            Priority::Realtime,
+        );
         assert_eq!(sub.idempotency_key, "key-123");
         assert_eq!(sub.session_hint.as_deref(), Some("sess-9"));
         assert_eq!(sub.priority, Priority::Realtime);
@@ -620,10 +744,31 @@ mod tests {
         assert_eq!(sub.requires.model.as_deref(), Some("qwen38"));
         assert_eq!(sub.requires.min_context_tokens, Some(524_288));
 
-        let hashed = req.to_submission(&c, &TenantId::new_unchecked("acme"), PoolId::new_unchecked("llm.chat/qwen38"), None, None, Priority::Default);
-        assert_eq!(hashed.idempotency_key.len(), 64, "a content hash is a sha256");
-        let other_tenant = req.to_submission(&c, &TenantId::new_unchecked("other"), PoolId::new_unchecked("llm.chat/qwen38"), None, None, Priority::Default);
-        assert_ne!(hashed.idempotency_key, other_tenant.idempotency_key, "tenants must not collide");
+        let hashed = req.to_submission(
+            &c,
+            &TenantId::new_unchecked("acme"),
+            PoolId::new_unchecked("llm.chat/qwen38"),
+            None,
+            None,
+            Priority::Default,
+        );
+        assert_eq!(
+            hashed.idempotency_key.len(),
+            64,
+            "a content hash is a sha256"
+        );
+        let other_tenant = req.to_submission(
+            &c,
+            &TenantId::new_unchecked("other"),
+            PoolId::new_unchecked("llm.chat/qwen38"),
+            None,
+            None,
+            Priority::Default,
+        );
+        assert_ne!(
+            hashed.idempotency_key, other_tenant.idempotency_key,
+            "tenants must not collide"
+        );
     }
 
     #[test]
@@ -643,12 +788,20 @@ mod tests {
     #[test]
     fn a_worker_chunk_that_is_already_openai_passes_through_verbatim() {
         let chunk = r#"{"id":"chatcmpl-x","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"get_weather","arguments":"{\"ci"}}],"reasoning_content":"thinking"},"finish_reason":null}]}"#;
-        assert_eq!(openai_delta_payload(chunk, &JobId::new_unchecked("job-1"), "qwen38", 0), chunk);
+        assert_eq!(
+            openai_delta_payload(chunk, &JobId::new_unchecked("job-1"), "qwen38", 0),
+            chunk
+        );
     }
 
     #[test]
     fn a_bare_token_is_wrapped_without_altering_its_text() {
-        let wrapped = openai_delta_payload("hello", &JobId::new_unchecked("job-1"), "qwen38", 1_700_000_000_000);
+        let wrapped = openai_delta_payload(
+            "hello",
+            &JobId::new_unchecked("job-1"),
+            "qwen38",
+            1_700_000_000_000,
+        );
         let value: Value = serde_json::from_str(&wrapped).expect("valid json");
         assert_eq!(value["choices"][0]["delta"]["content"], json!("hello"));
         assert_eq!(value["id"], json!("chatcmpl-job-1"));
@@ -656,11 +809,26 @@ mod tests {
 
     #[test]
     fn finish_chunk_carries_usage_untouched() {
-        let usage = json!({"prompt_tokens": 10, "completion_tokens": 4, "extra_engine_field": "kept"});
-        let chunk = finish_chunk(&JobId::new_unchecked("job-1"), "qwen38", 1_700_000_000_000, FinishKind::ToolCalls, Some(&usage));
+        let usage =
+            json!({"prompt_tokens": 10, "completion_tokens": 4, "extra_engine_field": "kept"});
+        let chunk = finish_chunk(
+            &JobId::new_unchecked("job-1"),
+            "qwen38",
+            1_700_000_000_000,
+            FinishKind::ToolCalls,
+            Some(&usage),
+        );
         assert_eq!(chunk["choices"][0]["finish_reason"], json!("tool_calls"));
         assert_eq!(chunk["usage"], usage);
-        assert!(finish_chunk(&JobId::new_unchecked("job-1"), "qwen38", 0, FinishKind::Stop, None).get("usage").is_none());
+        assert!(finish_chunk(
+            &JobId::new_unchecked("job-1"),
+            "qwen38",
+            0,
+            FinishKind::Stop,
+            None
+        )
+        .get("usage")
+        .is_none());
     }
 
     #[test]
@@ -674,31 +842,72 @@ mod tests {
             ConsumerEvent::Delta { seq: 5, text: r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"Paris\"}"}}]},"finish_reason":null}]}"#.to_string() },
             ConsumerEvent::Finish { seq: 6, finish: FinishKind::ToolCalls, usage: Some(json!({"completion_tokens": 12})) },
         ];
-        let assembled = assemble_completion(&JobId::new_unchecked("job-1"), "qwen38", 1_700_000_000_000, &events);
+        let assembled = assemble_completion(
+            &JobId::new_unchecked("job-1"),
+            "qwen38",
+            1_700_000_000_000,
+            &events,
+        );
         assert_eq!(assembled["object"], json!("chat.completion"));
-        assert_eq!(assembled["choices"][0]["message"]["content"], json!("Weather: sunny"));
-        assert_eq!(assembled["choices"][0]["message"]["reasoning_content"], json!("because"));
-        assert_eq!(assembled["choices"][0]["message"]["tool_calls"][0]["id"], json!("call_1"));
-        assert_eq!(assembled["choices"][0]["message"]["tool_calls"][0]["function"]["name"], json!("get_weather"));
+        assert_eq!(
+            assembled["choices"][0]["message"]["content"],
+            json!("Weather: sunny")
+        );
+        assert_eq!(
+            assembled["choices"][0]["message"]["reasoning_content"],
+            json!("because")
+        );
+        assert_eq!(
+            assembled["choices"][0]["message"]["tool_calls"][0]["id"],
+            json!("call_1")
+        );
+        assert_eq!(
+            assembled["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            json!("get_weather")
+        );
         assert_eq!(
             assembled["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
             json!("{\"city\":\"Paris\"}")
         );
-        assert_eq!(assembled["choices"][0]["message"]["tool_calls"].as_array().expect("one call").len(), 1, "fragments must merge by index");
-        assert_eq!(assembled["choices"][0]["finish_reason"], json!("tool_calls"));
+        assert_eq!(
+            assembled["choices"][0]["message"]["tool_calls"]
+                .as_array()
+                .expect("one call")
+                .len(),
+            1,
+            "fragments must merge by index"
+        );
+        assert_eq!(
+            assembled["choices"][0]["finish_reason"],
+            json!("tool_calls")
+        );
         assert_eq!(assembled["usage"]["completion_tokens"], json!(12));
     }
 
     #[test]
     fn assembly_of_an_error_stream_is_marked_not_silent() {
         let events = vec![
-            ConsumerEvent::Delta { seq: 1, text: "partial".to_string() },
-            ConsumerEvent::Error { code: "worker_gone_partial".into(), message: "died mid-stream".into(), retryable: false, through_seq: Some(1) },
+            ConsumerEvent::Delta {
+                seq: 1,
+                text: "partial".to_string(),
+            },
+            ConsumerEvent::Error {
+                code: "worker_gone_partial".into(),
+                message: "died mid-stream".into(),
+                retryable: false,
+                through_seq: Some(1),
+            },
         ];
         let assembled = assemble_completion(&JobId::new_unchecked("job-2"), "qwen38", 0, &events);
-        assert_eq!(assembled["choices"][0]["message"]["content"], json!("partial"));
+        assert_eq!(
+            assembled["choices"][0]["message"]["content"],
+            json!("partial")
+        );
         assert_eq!(assembled["choices"][0]["finish_reason"], json!("error"));
-        assert_eq!(assembled["usage"]["error"]["type"], json!("worker_gone_partial"));
+        assert_eq!(
+            assembled["usage"]["error"]["type"],
+            json!("worker_gone_partial")
+        );
     }
 
     #[test]
@@ -712,8 +921,14 @@ mod tests {
             json!({"status":"degraded","pool":"llm.chat/qwen38","ready_workers":0,"loading_workers":1,"queue_depth":2,"leases":0,"capacity_signal":"cold_start"})
         );
         assert_eq!(health_body("p", 1, 0, 0, 0)["status"], json!("ok"));
-        assert_eq!(http_error("capability_unsatisfied", "no vision worker", false)["error"]["type"], json!("capability_unsatisfied"));
-        assert_eq!(in_band_error("worker_gone_partial", "x", false)["error"]["retryable"], json!(false));
+        assert_eq!(
+            http_error("capability_unsatisfied", "no vision worker", false)["error"]["type"],
+            json!("capability_unsatisfied")
+        );
+        assert_eq!(
+            in_band_error("worker_gone_partial", "x", false)["error"]["retryable"],
+            json!(false)
+        );
         assert_eq!(declared_artifact(None), (None, None));
     }
 }

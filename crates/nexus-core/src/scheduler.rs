@@ -57,7 +57,10 @@ pub fn rendezvous_score(session: &str, worker: &str) -> u64 {
 
 /// The worker a session should land on if it is still connected.
 #[must_use]
-pub fn affinity_target(session: &str, workers: &BTreeMap<WorkerId, WorkerRecord>) -> Option<WorkerId> {
+pub fn affinity_target(
+    session: &str,
+    workers: &BTreeMap<WorkerId, WorkerRecord>,
+) -> Option<WorkerId> {
     let mut best: Option<(u64, &WorkerId)> = None;
     for (id, w) in workers {
         if !w.dispatchable() {
@@ -81,8 +84,14 @@ pub fn affinity_target(session: &str, workers: &BTreeMap<WorkerId, WorkerRecord>
 #[must_use]
 pub fn prefers_dedicated(job: &JobRecord) -> bool {
     job.priority == Priority::Realtime
-        || job.requires.kv_estimate_tokens.is_some_and(|v| v >= LONG_CONTEXT_TOKENS)
-        || job.requires.min_context_tokens.is_some_and(|v| v >= LONG_CONTEXT_TOKENS)
+        || job
+            .requires
+            .kv_estimate_tokens
+            .is_some_and(|v| v >= LONG_CONTEXT_TOKENS)
+        || job
+            .requires
+            .min_context_tokens
+            .is_some_and(|v| v >= LONG_CONTEXT_TOKENS)
 }
 
 /// Hard filters: live + ready + in this pool + capability match + capacity +
@@ -117,11 +126,16 @@ pub fn eligible(
         .filter(|w| w.available_slots() > 0)
         // KV budget (task §8): only enforced when the worker reports it, because
         // an engine that cannot report free KV must not be excluded outright.
-        .filter(|w| match (job.requires.kv_estimate_tokens, w.free_kv_tokens) {
-            (Some(need), Some(free)) => free >= need,
-            _ => true,
-        })
+        .filter(
+            |w| match (job.requires.kv_estimate_tokens, w.free_kv_tokens) {
+                (Some(need), Some(free)) => free >= need,
+                _ => true,
+            },
+        )
         .map(|w| Candidate {
+            // The candidate identity is part of the ranking payload: `without_failed`
+            // below filters on it, and the actor dispatches to it by name.
+            worker: w.id.clone(),
             affinity: affinity.as_ref() == Some(&w.id),
             preferred_tier: prefer_dedicated && w.tier == WorkerTier::Dedicated,
             free_slots: w.available_slots(),
@@ -138,7 +152,11 @@ pub fn eligible(
         .filter(|c| Some(&c.worker) != job.last_worker.as_ref())
         .cloned()
         .collect();
-    let mut raw = if without_failed.is_empty() { all.clone() } else { without_failed };
+    let mut raw = if without_failed.is_empty() {
+        all.clone()
+    } else {
+        without_failed
+    };
 
     // Ephemeral spill rule: with an empty queue, keep ephemeral hosts out — but
     // only when a dedicated worker is actually eligible, so an ephemeral-only
@@ -192,7 +210,13 @@ mod tests {
     use std::collections::BTreeSet;
 
     /// Worker with the reference capability offer (qwen38, 512K, tools).
-    fn w(id: &str, tier: WorkerTier, free_slots: u32, free_kv: Option<u64>, ready: bool) -> WorkerRecord {
+    fn w(
+        id: &str,
+        tier: WorkerTier,
+        free_slots: u32,
+        free_kv: Option<u64>,
+        ready: bool,
+    ) -> WorkerRecord {
         fixture::worker(id, tier, 4, free_slots, free_kv, ready)
     }
 
@@ -207,8 +231,14 @@ mod tests {
     #[test]
     fn loading_and_full_workers_are_never_candidates() {
         let workers = BTreeMap::from([
-            (WorkerId::new_unchecked("w-loading"), w("w-loading", WorkerTier::Dedicated, 4, None, false)),
-            (WorkerId::new_unchecked("w-full"), w("w-full", WorkerTier::Dedicated, 0, None, true)),
+            (
+                WorkerId::new_unchecked("w-loading"),
+                w("w-loading", WorkerTier::Dedicated, 4, None, false),
+            ),
+            (
+                WorkerId::new_unchecked("w-full"),
+                w("w-full", WorkerTier::Dedicated, 0, None, true),
+            ),
         ]);
         assert_eq!(eligible(&workers, &pool(), &job(), 1).len(), 0);
         assert_eq!(pick(&workers, &pool(), &job(), 1), None);
@@ -217,18 +247,36 @@ mod tests {
     #[test]
     fn least_loaded_wins_and_the_tie_break_is_the_worker_id() {
         let workers = BTreeMap::from([
-            (WorkerId::new_unchecked("w-busy"), w("w-busy", WorkerTier::Dedicated, 1, Some(10), true)),
-            (WorkerId::new_unchecked("w-idle"), w("w-idle", WorkerTier::Dedicated, 3, Some(10), true)),
+            (
+                WorkerId::new_unchecked("w-busy"),
+                w("w-busy", WorkerTier::Dedicated, 1, Some(10), true),
+            ),
+            (
+                WorkerId::new_unchecked("w-idle"),
+                w("w-idle", WorkerTier::Dedicated, 3, Some(10), true),
+            ),
         ]);
-        assert_eq!(pick(&workers, &pool(), &job(), 1), Some(WorkerId::new_unchecked("w-idle")));
+        assert_eq!(
+            pick(&workers, &pool(), &job(), 1),
+            Some(WorkerId::new_unchecked("w-idle"))
+        );
 
         // Perfect tie → lowest id, deterministically.
         let tied = BTreeMap::from([
-            (WorkerId::new_unchecked("w-z"), w("w-z", WorkerTier::Dedicated, 2, None, true)),
-            (WorkerId::new_unchecked("w-a"), w("w-a", WorkerTier::Dedicated, 2, None, true)),
+            (
+                WorkerId::new_unchecked("w-z"),
+                w("w-z", WorkerTier::Dedicated, 2, None, true),
+            ),
+            (
+                WorkerId::new_unchecked("w-a"),
+                w("w-a", WorkerTier::Dedicated, 2, None, true),
+            ),
         ]);
         for _ in 0..32 {
-            assert_eq!(pick(&tied, &pool(), &job(), 1), Some(WorkerId::new_unchecked("w-a")));
+            assert_eq!(
+                pick(&tied, &pool(), &job(), 1),
+                Some(WorkerId::new_unchecked("w-a"))
+            );
         }
     }
 
@@ -237,14 +285,29 @@ mod tests {
         let mut j = job();
         j.requires.kv_estimate_tokens = Some(300_000);
         let workers = BTreeMap::from([
-            (WorkerId::new_unchecked("w-tight"), w("w-tight", WorkerTier::Dedicated, 4, Some(120_000), true)),
-            (WorkerId::new_unchecked("w-wide"), w("w-wide", WorkerTier::Dedicated, 1, Some(400_000), true)),
+            (
+                WorkerId::new_unchecked("w-tight"),
+                w("w-tight", WorkerTier::Dedicated, 4, Some(120_000), true),
+            ),
+            (
+                WorkerId::new_unchecked("w-wide"),
+                w("w-wide", WorkerTier::Dedicated, 1, Some(400_000), true),
+            ),
         ]);
-        assert_eq!(pick(&workers, &pool(), &j, 1), Some(WorkerId::new_unchecked("w-wide")));
+        assert_eq!(
+            pick(&workers, &pool(), &j, 1),
+            Some(WorkerId::new_unchecked("w-wide"))
+        );
 
         // A worker that reports no KV figure is not excluded outright.
-        let blind = BTreeMap::from([(WorkerId::new_unchecked("w-blind"), w("w-blind", WorkerTier::Dedicated, 1, None, true))]);
-        assert_eq!(pick(&blind, &pool(), &j, 1), Some(WorkerId::new_unchecked("w-blind")));
+        let blind = BTreeMap::from([(
+            WorkerId::new_unchecked("w-blind"),
+            w("w-blind", WorkerTier::Dedicated, 1, None, true),
+        )]);
+        assert_eq!(
+            pick(&blind, &pool(), &j, 1),
+            Some(WorkerId::new_unchecked("w-blind"))
+        );
     }
 
     #[test]
@@ -252,42 +315,84 @@ mod tests {
         let mut j = job();
         j.requires.kv_estimate_tokens = Some(200_000);
         let workers = BTreeMap::from([
-            (WorkerId::new_unchecked("w-eph"), w("w-eph", WorkerTier::Ephemeral, 4, Some(900_000), true)),
-            (WorkerId::new_unchecked("w-ded"), w("w-ded", WorkerTier::Dedicated, 2, Some(900_000), true)),
+            (
+                WorkerId::new_unchecked("w-eph"),
+                w("w-eph", WorkerTier::Ephemeral, 4, Some(900_000), true),
+            ),
+            (
+                WorkerId::new_unchecked("w-ded"),
+                w("w-ded", WorkerTier::Dedicated, 2, Some(900_000), true),
+            ),
         ]);
         assert!(prefers_dedicated(&j));
-        assert_eq!(pick(&workers, &pool(), &j, 4), Some(WorkerId::new_unchecked("w-ded")));
+        assert_eq!(
+            pick(&workers, &pool(), &j, 4),
+            Some(WorkerId::new_unchecked("w-ded"))
+        );
 
         // Realtime priority also prefers dedicated.
         let mut rt = job();
         rt.priority = Priority::Realtime;
-        assert_eq!(pick(&workers, &pool(), &rt, 4), Some(WorkerId::new_unchecked("w-ded")));
+        assert_eq!(
+            pick(&workers, &pool(), &rt, 4),
+            Some(WorkerId::new_unchecked("w-ded"))
+        );
     }
 
     #[test]
     fn ephemeral_is_burst_only_when_the_queue_is_empty() {
         let workers = BTreeMap::from([
-            (WorkerId::new_unchecked("w-eph"), w("w-eph", WorkerTier::Ephemeral, 4, None, true)),
-            (WorkerId::new_unchecked("w-ded"), w("w-ded", WorkerTier::Dedicated, 4, None, true)),
+            (
+                WorkerId::new_unchecked("w-eph"),
+                w("w-eph", WorkerTier::Ephemeral, 4, None, true),
+            ),
+            (
+                WorkerId::new_unchecked("w-ded"),
+                w("w-ded", WorkerTier::Dedicated, 4, None, true),
+            ),
         ]);
         // Queue empty → dedicated carries the floor.
-        assert_eq!(pick(&workers, &pool(), &job(), 0), Some(WorkerId::new_unchecked("w-ded")));
+        assert_eq!(
+            pick(&workers, &pool(), &job(), 0),
+            Some(WorkerId::new_unchecked("w-ded"))
+        );
         // Queue non-empty and same free capacity → ephemeral takes the spill so
         // the dedicated host stays free for latency-sensitive work.
-        assert_eq!(pick(&workers, &pool(), &job(), 3), Some(WorkerId::new_unchecked("w-eph")));
+        assert_eq!(
+            pick(&workers, &pool(), &job(), 3),
+            Some(WorkerId::new_unchecked("w-eph"))
+        );
         // Dedicated alone in the pool with an empty queue still gets the job.
-        let only_ded = BTreeMap::from([(WorkerId::new_unchecked("w-ded"), w("w-ded", WorkerTier::Dedicated, 4, None, true))]);
-        assert_eq!(pick(&only_ded, &pool(), &job(), 0), Some(WorkerId::new_unchecked("w-ded")));
+        let only_ded = BTreeMap::from([(
+            WorkerId::new_unchecked("w-ded"),
+            w("w-ded", WorkerTier::Dedicated, 4, None, true),
+        )]);
+        assert_eq!(
+            pick(&only_ded, &pool(), &job(), 0),
+            Some(WorkerId::new_unchecked("w-ded"))
+        );
         // Ephemeral-only pool: the tier rule must not starve it.
-        let only_eph = BTreeMap::from([(WorkerId::new_unchecked("w-eph"), w("w-eph", WorkerTier::Ephemeral, 4, None, true))]);
-        assert_eq!(pick(&only_eph, &pool(), &job(), 0), Some(WorkerId::new_unchecked("w-eph")));
+        let only_eph = BTreeMap::from([(
+            WorkerId::new_unchecked("w-eph"),
+            w("w-eph", WorkerTier::Ephemeral, 4, None, true),
+        )]);
+        assert_eq!(
+            pick(&only_eph, &pool(), &job(), 0),
+            Some(WorkerId::new_unchecked("w-eph"))
+        );
     }
 
     #[test]
     fn session_affinity_overrides_least_loaded_and_follows_the_worker() {
         let workers = BTreeMap::from([
-            (WorkerId::new_unchecked("w-cache"), w("w-cache", WorkerTier::Dedicated, 1, None, true)),
-            (WorkerId::new_unchecked("w-free"), w("w-free", WorkerTier::Dedicated, 4, None, true)),
+            (
+                WorkerId::new_unchecked("w-cache"),
+                w("w-cache", WorkerTier::Dedicated, 1, None, true),
+            ),
+            (
+                WorkerId::new_unchecked("w-free"),
+                w("w-free", WorkerTier::Dedicated, 4, None, true),
+            ),
         ]);
         let session = "sess-42";
         let target = affinity_target(session, &workers).expect("a target");
@@ -296,7 +401,10 @@ mod tests {
         // Whichever worker the hash picked, that is the choice despite less free
         // capacity: re-prefilling 100K tokens costs far more than the queue hop.
         assert_eq!(pick(&workers, &pool(), &j, 1), Some(target.clone()));
-        assert!(target == WorkerId::new_unchecked("w-cache") || target == WorkerId::new_unchecked("w-free"));
+        assert!(
+            target == WorkerId::new_unchecked("w-cache")
+                || target == WorkerId::new_unchecked("w-free")
+        );
 
         // Rendezvous stability: removing a worker moves only the sessions that
         // were hashed to it. With two workers, the sessions on the *other*
@@ -315,10 +423,16 @@ mod tests {
             .map(|i| format!("sess-{i}"))
             .find(|s| affinity_target(s, &workers).as_ref() == Some(&other))
             .expect("some session must land on the non-target worker");
-        assert_eq!(affinity_target(&probe, &without_target).as_ref(), Some(&other));
+        assert_eq!(
+            affinity_target(&probe, &without_target).as_ref(),
+            Some(&other)
+        );
         // The evicted session is the only one that moves, and it moves to the
         // surviving worker (§8: "invalidate the mapping on worker death").
-        assert_eq!(affinity_target(session, &without_target).as_ref(), Some(&other));
+        assert_eq!(
+            affinity_target(session, &without_target).as_ref(),
+            Some(&other)
+        );
         assert_eq!(affinity_target(session, &BTreeMap::new()), None);
     }
 
@@ -326,24 +440,42 @@ mod tests {
     fn capability_mismatch_at_dispatch_time_is_excluded() {
         let mut j = job();
         j.requires.capabilities = BTreeSet::from(["vision".to_string()]);
-        let workers = BTreeMap::from([(WorkerId::new_unchecked("w-tools"), w("w-tools", WorkerTier::Dedicated, 4, None, true))]);
+        let workers = BTreeMap::from([(
+            WorkerId::new_unchecked("w-tools"),
+            w("w-tools", WorkerTier::Dedicated, 4, None, true),
+        )]);
         assert_eq!(pick(&workers, &pool(), &j, 1), None, "worker lacks vision");
     }
 
     #[test]
     fn requeue_avoids_the_failed_worker_but_not_the_only_option() {
         let workers = BTreeMap::from([
-            (WorkerId::new_unchecked("w-dead"), w("w-dead", WorkerTier::Dedicated, 4, None, true)),
-            (WorkerId::new_unchecked("w-live"), w("w-live", WorkerTier::Dedicated, 4, None, true)),
+            (
+                WorkerId::new_unchecked("w-dead"),
+                w("w-dead", WorkerTier::Dedicated, 4, None, true),
+            ),
+            (
+                WorkerId::new_unchecked("w-live"),
+                w("w-live", WorkerTier::Dedicated, 4, None, true),
+            ),
         ]);
         let mut j = job();
         j.last_worker = Some(WorkerId::new_unchecked("w-dead"));
-        assert_eq!(pick(&workers, &pool(), &j, 1), Some(WorkerId::new_unchecked("w-live")));
+        assert_eq!(
+            pick(&workers, &pool(), &j, 1),
+            Some(WorkerId::new_unchecked("w-live"))
+        );
 
         // Only the failed worker remains: retrying beats failing for an
         // idempotent kind.
-        let only_failed = BTreeMap::from([(WorkerId::new_unchecked("w-dead"), w("w-dead", WorkerTier::Dedicated, 4, None, true))]);
-        assert_eq!(pick(&only_failed, &pool(), &j, 1), Some(WorkerId::new_unchecked("w-dead")));
+        let only_failed = BTreeMap::from([(
+            WorkerId::new_unchecked("w-dead"),
+            w("w-dead", WorkerTier::Dedicated, 4, None, true),
+        )]);
+        assert_eq!(
+            pick(&only_failed, &pool(), &j, 1),
+            Some(WorkerId::new_unchecked("w-dead"))
+        );
     }
 
     #[test]

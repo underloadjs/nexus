@@ -119,7 +119,11 @@ impl Metrics {
     /// Read a counter or gauge; `0` when never written.
     #[must_use]
     pub fn get(&self, name: &str) -> u64 {
-        self.counters.get(name).or(self.gauges.get(name)).copied().unwrap_or(0)
+        self.counters
+            .get(name)
+            .or(self.gauges.get(name))
+            .copied()
+            .unwrap_or(0)
     }
 
     /// All counter keys and values, sorted (tests assert on this exact set).
@@ -146,10 +150,16 @@ impl Metrics {
         let mut families: BTreeMap<String, Vec<(String, u64, &'static str)>> = BTreeMap::new();
 
         for (key, value) in &self.gauges {
-            families.entry(base_name(key)).or_default().push((key.clone(), *value, "gauge"));
+            families
+                .entry(base_name(key))
+                .or_default()
+                .push((key.clone(), *value, "gauge"));
         }
         for (key, value) in &self.counters {
-            families.entry(base_name(key)).or_default().push((key.clone(), *value, "counter"));
+            families
+                .entry(base_name(key))
+                .or_default()
+                .push((key.clone(), *value, "counter"));
         }
 
         for (base, samples) in families {
@@ -209,13 +219,15 @@ mod tests {
             concat!(
                 "# TYPE nexus_frames_duplicate_total counter\n",
                 "nexus_frames_duplicate_total 4\n",
+                "# HELP nexus_queue_depth Queued jobs per pool\n",
                 "# TYPE nexus_queue_depth gauge\n",
                 "nexus_queue_depth 2\n",
                 "# TYPE nexus_ready_workers gauge\n",
                 "nexus_ready_workers{pool=\"llm.chat/qwen38\"} 1\n"
             ),
             "families are sorted by base name, gauges and counters share the \
-             same ordering pass, and HELP appears only when registered"
+             same ordering pass, and HELP appears for exactly the family that \
+             registered one (nexus_queue_depth here, and only there)"
         );
     }
 
@@ -236,7 +248,10 @@ mod tests {
 
     #[test]
     fn base_name_splits_labels() {
-        assert_eq!(base_name("nexus_jobs_total{reason=\"x\"}"), "nexus_jobs_total");
+        assert_eq!(
+            base_name("nexus_jobs_total{reason=\"x\"}"),
+            "nexus_jobs_total"
+        );
         assert_eq!(base_name("nexus_jobs_total"), "nexus_jobs_total");
     }
 }

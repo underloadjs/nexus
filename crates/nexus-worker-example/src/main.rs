@@ -21,6 +21,10 @@
 //! Bulk output uses the hub's HTTP upload slot instead of the socket, so a 40 MB
 //! render cannot starve other jobs' deltas (task §10).
 
+// `main()` and the example's test-ish paths are allowed to be blunt: this crate is
+// a reference client, not the shipped library (workspace lint policy, Cargo.toml).
+#![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
+
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::sync::atomic::AtomicBool;
@@ -43,8 +47,8 @@ use nexus_core::protocol::Requires;
 use nexus_core::protocol::WireCaps;
 use nexus_core::protocol::WorkerFrame;
 use nexus_core::WorkerTier;
-use serde_json::Value;
 use serde_json::json;
+use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tokio_tungstenite::connect_async;
@@ -113,7 +117,12 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// One hub connection, for its whole lifetime.
-async fn session(cfg: &Config, out_rx: &mut mpsc::UnboundedReceiver<String>, out_tx: &mpsc::UnboundedSender<String>, cancels: &CancelFlags) -> anyhow::Result<ByeReason> {
+async fn session(
+    cfg: &Config,
+    out_rx: &mut mpsc::UnboundedReceiver<String>,
+    out_tx: &mpsc::UnboundedSender<String>,
+    cancels: &CancelFlags,
+) -> anyhow::Result<ByeReason> {
     // The pool token rides in the query string: the hub accepts either form, and a
     // notebook cell cannot always set an `Authorization` header on a WebSocket.
     let url = with_token(&cfg.hub_ws, &cfg.pool_token);
@@ -134,7 +143,10 @@ async fn session(cfg: &Config, out_rx: &mut mpsc::UnboundedReceiver<String>, out
             capabilities: cfg.capabilities.clone(),
             kv_estimate_tokens: None,
         },
-        attestation: Attestation { model_shas: cfg.model_shas.clone(), weight_bytes: Some(WEIGHT_BYTES) },
+        attestation: Attestation {
+            model_shas: cfg.model_shas.clone(),
+            weight_bytes: Some(WEIGHT_BYTES),
+        },
         protocol: nexus_core::PROTOCOL_VERSION,
         engine: Some("strata".to_string()),
         tier: Some(cfg.tier),
@@ -175,6 +187,11 @@ async fn session(cfg: &Config, out_rx: &mut mpsc::UnboundedReceiver<String>, out
                         continue;
                     }
                     Some(Ok(Message::Pong(_))) => continue,
+                    // `Message::Frame` is tungstenite's low-level frame variant: the
+                    // public API never yields one here, but the match has to stay
+                    // exhaustive across tungstenite releases, so it is ignored like
+                    // a pong rather than treated as a close.
+                    Some(Ok(Message::Frame(_))) => continue,
                     Some(Ok(Message::Close(_))) | None => return Ok(ByeReason::Shutdown),
                     Some(Err(err)) => return Err(err.into()),
                 };
@@ -271,7 +288,10 @@ where
 async fn run_job(
     engine: String,
     hub_http: String,
-    pool_token: String,
+    // Unused by design: every bulk transfer this job performs is authorized by the
+    // attempt-scoped token inside `Assigned` (`artifact_put.token`, or the payload
+    // ref's token), never by the connection's pool token.
+    _pool_token: String,
     job: nexus_core::JobId,
     attempt: u32,
     kind: String,
@@ -360,7 +380,13 @@ async fn run_job(
         }
     }
 
-    let done = WorkerFrame::Done { job: job.clone(), seq, finish, usage, error: None };
+    let done = WorkerFrame::Done {
+        job: job.clone(),
+        seq,
+        finish,
+        usage,
+        error: None,
+    };
     if let Ok(line) = encode_line(&done, &caps) {
         let _ = out.send(line);
     }
@@ -391,7 +417,11 @@ enum EngineEvent {
 /// is a client-side shortcut, not a protocol limit: a production worker would
 /// parse each `data:` block as it arrives. Until then, end-to-end TTFT through
 /// this example equals the engine's full generation time.
-async fn engine_stream_chat(engine: &str, body: &[u8], continuation: Option<&str>) -> anyhow::Result<Vec<EngineEvent>> {
+async fn engine_stream_chat(
+    engine: &str,
+    body: &[u8],
+    continuation: Option<&str>,
+) -> anyhow::Result<Vec<EngineEvent>> {
     let mut payload: Value = serde_json::from_slice(body)?;
     if let Some(partial) = continuation {
         // Resume-by-continuation (task §7.4): the hub appends the frames the
@@ -405,16 +435,24 @@ async fn engine_stream_chat(engine: &str, body: &[u8], continuation: Option<&str
     // `stream: true` is forced: the hub relays deltas, so buffering the whole
     // answer here would reintroduce the latency the design removes.
     payload["stream"] = json!(true);
-    let text = http_post(&format!("{engine}/v1/chat/completions"), &serde_json::to_string(&payload)?).await?;
+    let text = http_post(
+        &format!("{engine}/v1/chat/completions"),
+        &serde_json::to_string(&payload)?,
+    )
+    .await?;
 
     let mut events = Vec::new();
     for block in text.split("\n\n") {
         for line in block.lines() {
-            let Some(data) = line.strip_prefix("data: ") else { continue };
+            let Some(data) = line.strip_prefix("data: ") else {
+                continue;
+            };
             if data.trim() == "[DONE]" {
                 continue;
             }
-            let Ok(chunk) = serde_json::from_str::<Value>(data) else { continue };
+            let Ok(chunk) = serde_json::from_str::<Value>(data) else {
+                continue;
+            };
             if let Some(usage) = chunk.get("usage").filter(|u| !u.is_null()) {
                 events.push(EngineEvent::Usage(usage.clone()));
             }
@@ -444,7 +482,11 @@ fn continuation_as_text(raw: &str) -> String {
                 parsed += 1;
                 if let Some(choices) = value.get("choices").and_then(Value::as_array) {
                     for choice in choices {
-                        if let Some(text) = choice.get("delta").and_then(|d| d.get("content")).and_then(Value::as_str) {
+                        if let Some(text) = choice
+                            .get("delta")
+                            .and_then(|d| d.get("content"))
+                            .and_then(Value::as_str)
+                        {
                             out.push_str(text);
                         }
                     }
@@ -490,7 +532,13 @@ async fn engine_status(engine: &str) -> EngineStatus {
 async fn resolve_payload(cfg: &Config, payload: &JobPayload) -> Vec<u8> {
     match payload {
         JobPayload::Inline { body, .. } => serde_json::to_vec(body).unwrap_or_default(),
-        JobPayload::ByRef { path, token, sha256, size_bytes, .. } => {
+        JobPayload::ByRef {
+            path,
+            token,
+            sha256,
+            size_bytes,
+            ..
+        } => {
             eprintln!("[worker] fetching payload ref {path} ({size_bytes} bytes, sha {sha256})");
             let url = format!("{}{path}", cfg.hub_http);
             match http_get_with_token(&url, token).await {
@@ -505,8 +553,15 @@ async fn resolve_payload(cfg: &Config, payload: &JobPayload) -> Vec<u8> {
 }
 
 /// Upload one artifact chunk to the hub's pre-signed slot.
-async fn upload_artifact(hub_http: &str, path: &str, token: &str, body: &str) -> anyhow::Result<()> {
-    http_put(&format!("{hub_http}{path}?token={token}&complete=1"), body).await.map(|_| ())
+async fn upload_artifact(
+    hub_http: &str,
+    path: &str,
+    token: &str,
+    body: &str,
+) -> anyhow::Result<()> {
+    http_put(&format!("{hub_http}{path}?token={token}&complete=1"), body)
+        .await
+        .map(|_| ())
 }
 
 /// Minimal HTTP GET over loopback: the worker keeps no HTTP client dependency, and
@@ -532,24 +587,41 @@ async fn http_put(url: &str, body: &str) -> anyhow::Result<String> {
 
 /// The tiny request/response walk. `Connection: close` is deliberate: a worker that
 /// is re-run as a notebook cell must not depend on pooled keep-alive state.
-async fn http_request(method: &str, url: &str, auth_or_type: Option<&str>, body: Option<&str>) -> anyhow::Result<String> {
+async fn http_request(
+    method: &str,
+    url: &str,
+    auth_or_type: Option<&str>,
+    body: Option<&str>,
+) -> anyhow::Result<String> {
     use tokio::io::AsyncReadExt;
     use tokio::io::AsyncWriteExt;
 
-    let (scheme, rest) = url.split_once("://").ok_or_else(|| anyhow::anyhow!("not a url: {url}"))?;
+    let (scheme, rest) = url
+        .split_once("://")
+        .ok_or_else(|| anyhow::anyhow!("not a url: {url}"))?;
     if scheme != "http" {
-        return Err(anyhow::anyhow!("only plain http is supported on this hop: {scheme}"));
+        return Err(anyhow::anyhow!(
+            "only plain http is supported on this hop: {scheme}"
+        ));
     }
     let (authority, path) = rest
         .split_once('/')
-        .map_or((rest.to_string(), "/".to_string()), |(host, path)| (host.to_string(), format!("/{path}")));
+        .map_or((rest.to_string(), "/".to_string()), |(host, path)| {
+            (host.to_string(), format!("/{path}"))
+        });
     let host = authority.split(':').next().unwrap_or("127.0.0.1");
-    let port = authority.split(':').nth(1).and_then(|p| p.parse::<u16>().ok()).unwrap_or(80);
+    let port = authority
+        .split(':')
+        .nth(1)
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(80);
 
     let mut stream = tokio::net::TcpStream::connect((host, port)).await?;
     let mut request = format!("{method} {path} HTTP/1.1\r\nHost: {authority}\r\nAccept: */*\r\n");
     match auth_or_type {
-        Some(value) if value.starts_with("Bearer") => request.push_str(&format!("Authorization: {value}\r\n")),
+        Some(value) if value.starts_with("Bearer") => {
+            request.push_str(&format!("Authorization: {value}\r\n"))
+        }
         Some(value) => request.push_str(&format!("Content-Type: {value}\r\n")),
         None => {}
     }
@@ -571,7 +643,10 @@ async fn http_request(method: &str, url: &str, auth_or_type: Option<&str>, body:
     };
     let status = head.split_whitespace().nth(1).unwrap_or("?");
     if !status.starts_with('2') {
-        return Err(anyhow::anyhow!("peer returned {status}: {}", rest.chars().take(200).collect::<String>()));
+        return Err(anyhow::anyhow!(
+            "peer returned {status}: {}",
+            rest.chars().take(200).collect::<String>()
+        ));
     }
     Ok(rest.to_string())
 }
@@ -605,12 +680,16 @@ impl Config {
     /// Read config, refusing to start without a pool token: the hub denies
     /// unauthenticated workers by default, so a tokenless client is a bug.
     fn from_env() -> Self {
-        let var = |key: &str, default: &str| std::env::var(key).unwrap_or_else(|_| default.to_string());
+        let var =
+            |key: &str, default: &str| std::env::var(key).unwrap_or_else(|_| default.to_string());
         let pool_token = var("NEXUS_POOL_TOKEN", "");
         if pool_token.is_empty() {
             eprintln!("[worker] NEXUS_POOL_TOKEN is empty: the hub will reject this connection");
         }
-        let capacity = var("NEXUS_CAPACITY", "4").parse::<u32>().unwrap_or(4).min(MAX_CAPACITY);
+        let capacity = var("NEXUS_CAPACITY", "4")
+            .parse::<u32>()
+            .unwrap_or(4)
+            .min(MAX_CAPACITY);
         Self {
             worker_id: var("NEXUS_WORKER_ID", &format!("wkr-{}", std::process::id())),
             hub_ws: var("NEXUS_HUB_WS", HUB_WS_DEFAULT),

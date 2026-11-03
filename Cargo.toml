@@ -29,9 +29,10 @@ repository = "https://github.com/underloadjs/nexus"
 publish = false
 
 # ---------------------------------------------------------------------------
-# Shared dependency graph. Versions pinned to exact majors that are known to
-# exist; `cargo update` was not run in this pass (no toolchain on this host —
-# see README "Verification status"), so these are stated as intended floors.
+# Shared dependency graph. Every entry below resolved against the live registry
+# on the pinned toolchain (see README "Verification status"); the resulting graph
+# is committed in this package's `Cargo.lock`, so `--locked` builds are
+# reproducible. Versions are caret requirements, not exact pins.
 # ---------------------------------------------------------------------------
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }

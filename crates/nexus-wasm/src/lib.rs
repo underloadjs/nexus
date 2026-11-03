@@ -33,14 +33,18 @@
 //! `serde-wasm-bindgen` conversion layer is needed and the payloads are exactly
 //! the shapes the native runtime emits — one contract, two hosts.
 
+// Test builds may be blunt (see `nexus-core`'s crate attributes and the workspace
+// lint policy in Cargo.toml): an `expect` in a test is the assertion.
+#![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
+
 use wasm_bindgen::prelude::*;
 
 use nexus_core::adapters;
 use nexus_core::ids::ArtifactId;
 use nexus_core::ids::ConsumerId;
 use nexus_core::ids::JobId;
-use nexus_core::ids::PoolId;
 use nexus_core::ids::PayloadRefId;
+use nexus_core::ids::PoolId;
 use nexus_core::ids::WorkerId;
 use nexus_core::ActorMsg;
 use nexus_core::BrokerConfig;
@@ -84,7 +88,12 @@ impl NexusBroker {
             .cloned()
             .ok_or_else(|| JsError::new("config has no pools"))?;
         let actor = PoolActor::new(PoolId::new_unchecked(pool.clone()), cfg);
-        Ok(Self { actor: Some(actor), pool, conns: std::collections::BTreeMap::new(), now_ms: 0 })
+        Ok(Self {
+            actor: Some(actor),
+            pool,
+            conns: std::collections::BTreeMap::new(),
+            now_ms: 0,
+        })
     }
 
     /// Reserve this worker's connection id and send its `Hello`.
@@ -92,18 +101,31 @@ impl NexusBroker {
     /// `hello_json` is the `WorkerFrame::Hello` object (the same bytes a real
     /// worker puts on the socket).
     #[wasm_bindgen(js_name = hello)]
-    pub fn hello(&mut self, worker_id: &str, hello_json: &str, now_ms: f64) -> Result<String, JsError> {
+    pub fn hello(
+        &mut self,
+        worker_id: &str,
+        hello_json: &str,
+        now_ms: f64,
+    ) -> Result<String, JsError> {
         let now = self.clock(now_ms);
-        let frame: nexus_core::WorkerFrame =
-            serde_json::from_str(hello_json).map_err(|e| JsError::new(&format!("hello json: {e}")))?;
-        let hello = HelloInput::from_frame(&frame).ok_or_else(|| JsError::new("expected a hello frame"))?;
+        let frame: nexus_core::WorkerFrame = serde_json::from_str(hello_json)
+            .map_err(|e| JsError::new(&format!("hello json: {e}")))?;
+        let hello =
+            HelloInput::from_frame(&frame).ok_or_else(|| JsError::new("expected a hello frame"))?;
         // Reserve the connection id before touching the actor: `next_conn` needs
         // `&mut self`, and the actor's mutable borrow has to outlive it. Taking
         // the actor borrow first is what made the previous ordering a
         // double-borrow of `self`.
         let conn = self.next_conn(worker_id);
         let actor = self.actor_mut()?;
-        let effects = actor.handle(now, ActorMsg::Hello { worker: WorkerId::new_unchecked(worker_id), conn, hello });
+        let effects = actor.handle(
+            now,
+            ActorMsg::Hello {
+                worker: WorkerId::new_unchecked(worker_id),
+                conn,
+                hello,
+            },
+        );
         Ok(to_json(&effects))
     }
 
@@ -111,12 +133,27 @@ impl NexusBroker {
     /// attached automatically, so a host that drops and re-runs a connection gets
     /// the same stale-frame rejection the native runtime applies.
     #[wasm_bindgen(js_name = workerFrame)]
-    pub fn worker_frame(&mut self, worker_id: &str, frame_json: &str, now_ms: f64) -> Result<String, JsError> {
+    pub fn worker_frame(
+        &mut self,
+        worker_id: &str,
+        frame_json: &str,
+        now_ms: f64,
+    ) -> Result<String, JsError> {
         let now = self.clock(now_ms);
-        let conn = *self.conns.get(worker_id).ok_or_else(|| JsError::new("call hello() for this worker first"))?;
-        let frame: nexus_core::WorkerFrame =
-            serde_json::from_str(frame_json).map_err(|e| JsError::new(&format!("frame json: {e}")))?;
-        let effects = self.actor_mut()?.handle(now, ActorMsg::WorkerFrame { worker: WorkerId::new_unchecked(worker_id), conn, frame });
+        let conn = *self
+            .conns
+            .get(worker_id)
+            .ok_or_else(|| JsError::new("call hello() for this worker first"))?;
+        let frame: nexus_core::WorkerFrame = serde_json::from_str(frame_json)
+            .map_err(|e| JsError::new(&format!("frame json: {e}")))?;
+        let effects = self.actor_mut()?.handle(
+            now,
+            ActorMsg::WorkerFrame {
+                worker: WorkerId::new_unchecked(worker_id),
+                conn,
+                frame,
+            },
+        );
         Ok(to_json(&effects))
     }
 
@@ -125,7 +162,13 @@ impl NexusBroker {
     pub fn worker_gone(&mut self, worker_id: &str, now_ms: f64) -> Result<String, JsError> {
         let now = self.clock(now_ms);
         let conn = self.conns.remove(worker_id).unwrap_or(0);
-        let effects = self.actor_mut()?.handle(now, ActorMsg::WorkerGone { worker: WorkerId::new_unchecked(worker_id), conn });
+        let effects = self.actor_mut()?.handle(
+            now,
+            ActorMsg::WorkerGone {
+                worker: WorkerId::new_unchecked(worker_id),
+                conn,
+            },
+        );
         Ok(to_json(&effects))
     }
 
@@ -133,10 +176,15 @@ impl NexusBroker {
     /// the host (the native runtime uses an id generator; a notebook host can use
     /// `crypto.randomUUID()`).
     #[wasm_bindgen(js_name = submit)]
-    pub fn submit(&mut self, job_id: &str, submission_json: &str, now_ms: f64) -> Result<String, JsError> {
+    pub fn submit(
+        &mut self,
+        job_id: &str,
+        submission_json: &str,
+        now_ms: f64,
+    ) -> Result<String, JsError> {
         let now = self.clock(now_ms);
-        let submission: Submission =
-            serde_json::from_str(submission_json).map_err(|e| JsError::new(&format!("submission json: {e}")))?;
+        let submission: Submission = serde_json::from_str(submission_json)
+            .map_err(|e| JsError::new(&format!("submission json: {e}")))?;
         let effects = self.actor_mut()?.handle(
             now,
             ActorMsg::Submit {
@@ -150,22 +198,40 @@ impl NexusBroker {
 
     /// Attach a consumer for replay (`Last-Event-ID` / `?from_seq=`).
     #[wasm_bindgen(js_name = attach)]
-    pub fn attach(&mut self, job_id: &str, consumer_id: &str, from_seq: f64, now_ms: f64) -> Result<String, JsError> {
+    pub fn attach(
+        &mut self,
+        job_id: &str,
+        consumer_id: &str,
+        from_seq: f64,
+        now_ms: f64,
+    ) -> Result<String, JsError> {
         let now = self.clock(now_ms);
         let effects = self.actor_mut()?.handle(
             now,
-            ActorMsg::Attach { job: JobId::new_unchecked(job_id), consumer: ConsumerId::new_unchecked(consumer_id), from_seq: from_seq as u64 },
+            ActorMsg::Attach {
+                job: JobId::new_unchecked(job_id),
+                consumer: ConsumerId::new_unchecked(consumer_id),
+                from_seq: from_seq as u64,
+            },
         );
         Ok(to_json(&effects))
     }
 
     /// Detach a consumer; a streaming job's last detach fans out `Cancel` (§6).
     #[wasm_bindgen(js_name = detach)]
-    pub fn detach(&mut self, job_id: &str, consumer_id: &str, now_ms: f64) -> Result<String, JsError> {
+    pub fn detach(
+        &mut self,
+        job_id: &str,
+        consumer_id: &str,
+        now_ms: f64,
+    ) -> Result<String, JsError> {
         let now = self.clock(now_ms);
         let effects = self.actor_mut()?.handle(
             now,
-            ActorMsg::Detach { job: JobId::new_unchecked(job_id), consumer: ConsumerId::new_unchecked(consumer_id) },
+            ActorMsg::Detach {
+                job: JobId::new_unchecked(job_id),
+                consumer: ConsumerId::new_unchecked(consumer_id),
+            },
         );
         Ok(to_json(&effects))
     }
@@ -176,7 +242,10 @@ impl NexusBroker {
         let now = self.clock(now_ms);
         let effects = self.actor_mut()?.handle(
             now,
-            ActorMsg::Cancel { job: JobId::new_unchecked(job_id), reason: nexus_core::protocol::CancelReason::ConsumerGone },
+            ActorMsg::Cancel {
+                job: JobId::new_unchecked(job_id),
+                reason: nexus_core::protocol::CancelReason::ConsumerGone,
+            },
         );
         Ok(to_json(&effects))
     }
@@ -213,7 +282,10 @@ impl NexusBroker {
                 chunk_bytes: chunk_bytes as u64,
                 complete,
                 stored_sha256,
-                declared: nexus_core::actor::DeclaredArtifact { sha256: declared_sha256, size_bytes: declared_size.map(|v| v as u64) },
+                declared: nexus_core::actor::DeclaredArtifact {
+                    sha256: declared_sha256,
+                    size_bytes: declared_size.map(|v| v as u64),
+                },
                 content_type,
             },
         );
@@ -226,48 +298,77 @@ impl NexusBroker {
     #[wasm_bindgen(js_name = tick)]
     pub fn tick(&mut self, now_ms: f64) -> Result<String, JsError> {
         let now = self.clock(now_ms);
-        Ok(to_json(&self.actor_mut()?.handle(now, ActorMsg::Tick { now_ms: now })))
+        Ok(to_json(
+            &self
+                .actor_mut()?
+                .handle(now, ActorMsg::Tick { now_ms: now }),
+        ))
     }
 
     /// Drain the pool: cancel leased jobs, fail queued ones retryably.
     #[wasm_bindgen(js_name = shutdown)]
     pub fn shutdown(&mut self, now_ms: f64) -> Result<String, JsError> {
         let now = self.clock(now_ms);
-        Ok(to_json(&self.actor_mut()?.handle(now, ActorMsg::Shutdown { now_ms: now })))
+        Ok(to_json(
+            &self
+                .actor_mut()?
+                .handle(now, ActorMsg::Shutdown { now_ms: now }),
+        ))
     }
 
     /// Derived job view as JSON, or `null` when unknown.
     #[wasm_bindgen(js_name = jobView)]
     pub fn job_view(&self, job_id: &str) -> Option<String> {
         let actor = self.actor.as_ref()?;
-        actor.job_view(&JobId::new_unchecked(job_id)).map(|view| serde_json::to_string(&view).unwrap_or_default())
+        actor
+            .job_view(&JobId::new_unchecked(job_id))
+            .map(|view| serde_json::to_string(&view).unwrap_or_default())
     }
 
     /// The spilled prompt bytes for a worker fetch, as JSON metadata with the
     /// body as a UTF-8 string; `null` when unauthorized or gone. The native
     /// runtime serves the same grant as raw bytes.
     #[wasm_bindgen(js_name = payloadFetch)]
-    pub fn payload_fetch(&self, ref_id: &str, token: &str, worker_id: &str, attempt: f64, now_ms: f64) -> Option<String> {
+    pub fn payload_fetch(
+        &self,
+        ref_id: &str,
+        token: &str,
+        worker_id: &str,
+        attempt: f64,
+        now_ms: f64,
+    ) -> Option<String> {
         let actor = self.actor.as_ref()?;
         let entry = actor
             .payloads()
-            .authorize_fetch(&PayloadRefId::parse(ref_id).ok()?, token, &WorkerId::new_unchecked(worker_id), attempt as u32, now_ms as u64)
+            .authorize_fetch(
+                &PayloadRefId::parse(ref_id).ok()?,
+                token,
+                &WorkerId::new_unchecked(worker_id),
+                attempt as u32,
+                now_ms as u64,
+            )
             .ok()?;
         let body = String::from_utf8(entry.bytes.clone()).ok()?;
-        Some(serde_json::to_string(&json!({
+        // `to_string(..).ok()` already yields the `Option<String>` this returns; the
+        // extra `Some(..)` wrapped an Option in an Option.
+        serde_json::to_string(&json!({
             "sha256": entry.sha256,
             "size_bytes": entry.size_bytes,
             "content_type": entry.content_type,
             "body": body,
         }))
-        .ok())
+        .ok()
     }
 
     /// `GET /v1/models` body, derived from warm workers only.
     #[wasm_bindgen(js_name = modelsDocument)]
     pub fn models_document(&self, now_ms: f64) -> String {
         match self.actor.as_ref() {
-            Some(actor) => serde_json::to_string(&adapters::models_document(&actor.warm_models(), now_ms as u64)).unwrap_or_default(),
+            Some(actor) => serde_json::to_string(&adapters::models_document(
+                &actor.warm_models(),
+                now_ms as u64,
+            ))
+            .unwrap_or_default(),
             None => "{\"object\":\"list\",\"data\":[]}".to_string(),
         }
     }
@@ -291,13 +392,19 @@ impl NexusBroker {
     /// `GET /metrics` body in Prometheus text format.
     #[wasm_bindgen(js_name = metricsText)]
     pub fn metrics_text(&self) -> String {
-        self.actor.as_ref().map(|a| a.metrics().render()).unwrap_or_default()
+        self.actor
+            .as_ref()
+            .map(|a| a.metrics().render())
+            .unwrap_or_default()
     }
 
     /// A counter value, so a JS test can assert metrics without parsing text.
     #[wasm_bindgen(js_name = metricValue)]
     pub fn metric_value(&self, name: &str) -> f64 {
-        self.actor.as_ref().map(|a| a.metrics().get(name) as f64).unwrap_or(0.0)
+        self.actor
+            .as_ref()
+            .map(|a| a.metrics().get(name) as f64)
+            .unwrap_or(0.0)
     }
 
     /// Decode one worker→hub line with the configured caps. Exposed so the JS
@@ -305,7 +412,8 @@ impl NexusBroker {
     #[wasm_bindgen(js_name = decodeWorkerLine)]
     pub fn decode_worker_line(&self, line: &str) -> Result<String, JsError> {
         let caps = self.actor()?.limits().worker_caps();
-        let frame = nexus_core::protocol::decode_worker_frame(line, &caps).map_err(|e| JsError::new(&e.to_string()))?;
+        let frame = nexus_core::protocol::decode_worker_frame(line, &caps)
+            .map_err(|e| JsError::new(&e.to_string()))?;
         Ok(serde_json::to_string(&frame).map_err(|e| JsError::new(&e.to_string()))?)
     }
 
@@ -313,7 +421,8 @@ impl NexusBroker {
     #[wasm_bindgen(js_name = encodeHubFrame)]
     pub fn encode_hub_frame(&self, frame_json: &str) -> Result<String, JsError> {
         let caps = self.actor()?.limits().hub_caps();
-        let frame: nexus_core::HubFrame = serde_json::from_str(frame_json).map_err(|e| JsError::new(&e.to_string()))?;
+        let frame: nexus_core::HubFrame =
+            serde_json::from_str(frame_json).map_err(|e| JsError::new(&e.to_string()))?;
         nexus_core::protocol::encode_line(&frame, &caps).map_err(|e| JsError::new(&e.to_string()))
     }
 
@@ -321,10 +430,18 @@ impl NexusBroker {
     /// JS edge (or the smoke test) builds submissions the same way the Rust
     /// adapters do.
     #[wasm_bindgen(js_name = submissionFromChat)]
-    pub fn submission_from_chat(&self, body_json: &str, tenant: &str, idempotency_key: Option<String>, session_hint: Option<String>) -> Result<String, JsError> {
+    pub fn submission_from_chat(
+        &self,
+        body_json: &str,
+        tenant: &str,
+        idempotency_key: Option<String>,
+        session_hint: Option<String>,
+    ) -> Result<String, JsError> {
         let actor = self.actor()?;
-        let body: Value = serde_json::from_str(body_json).map_err(|e| JsError::new(&format!("body json: {e}")))?;
-        let req = adapters::ChatRequest::parse(&body, adapters::KIND_CHAT).map_err(|e| JsError::new(&e.to_string()))?;
+        let body: Value = serde_json::from_str(body_json)
+            .map_err(|e| JsError::new(&format!("body json: {e}")))?;
+        let req = adapters::ChatRequest::parse(&body, adapters::KIND_CHAT)
+            .map_err(|e| JsError::new(&e.to_string()))?;
         let cfg = actor.config();
         let sub = req.to_submission(
             cfg,
@@ -354,11 +471,15 @@ impl NexusBroker {
     }
 
     fn actor(&self) -> Result<&PoolActor, JsError> {
-        self.actor.as_ref().ok_or_else(|| JsError::new("broker is not initialised"))
+        self.actor
+            .as_ref()
+            .ok_or_else(|| JsError::new("broker is not initialised"))
     }
 
     fn actor_mut(&mut self) -> Result<&mut PoolActor, JsError> {
-        self.actor.as_mut().ok_or_else(|| JsError::new("broker is not initialised"))
+        self.actor
+            .as_mut()
+            .ok_or_else(|| JsError::new("broker is not initialised"))
     }
 }
 

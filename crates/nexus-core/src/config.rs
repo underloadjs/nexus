@@ -183,7 +183,12 @@ pub struct ConfigError {
 
 /// Sample kind entry helper, keeping `Default` readable.
 fn streaming_kind(pool: &str) -> KindConfig {
-    KindConfig { pool: pool.to_string(), idempotent: true, streaming: true, ..KindConfig::default() }
+    KindConfig {
+        pool: pool.to_string(),
+        idempotent: true,
+        streaming: true,
+        ..KindConfig::default()
+    }
 }
 
 impl Default for BrokerConfig {
@@ -215,7 +220,8 @@ impl Default for BrokerConfig {
                 ..PoolConfig::default()
             },
         );
-        cfg.pools.insert(image_pool.to_string(), PoolConfig::default());
+        cfg.pools
+            .insert(image_pool.to_string(), PoolConfig::default());
 
         let mut llm_requires = Requires::default();
         llm_requires.model = Some("qwen38".to_string());
@@ -223,11 +229,17 @@ impl Default for BrokerConfig {
 
         cfg.kinds.insert(
             "llm.chat".to_string(),
-            KindConfig { requires: llm_requires.clone(), ..streaming_kind(llm_pool) },
+            KindConfig {
+                requires: llm_requires.clone(),
+                ..streaming_kind(llm_pool)
+            },
         );
         cfg.kinds.insert(
             "llm.completion".to_string(),
-            KindConfig { requires: llm_requires, ..streaming_kind(llm_pool) },
+            KindConfig {
+                requires: llm_requires,
+                ..streaming_kind(llm_pool)
+            },
         );
         // Non-streaming, artifact-producing: the ComfyUI shape of §7.3.
         cfg.kinds.insert(
@@ -250,7 +262,8 @@ impl Default for BrokerConfig {
             },
         );
 
-        cfg.tenants.insert("default".to_string(), TenantConfig::default());
+        cfg.tenants
+            .insert("default".to_string(), TenantConfig::default());
         cfg
     }
 }
@@ -306,7 +319,9 @@ impl BrokerConfig {
             // otherwise boot on sample pools and no credentials and call that
             // "configured".
             let parsed: Self = serde_json::from_str(json).map_err(|e| ConfigError {
-                problems: vec![format!("NEXUS_CONFIG_JSON is not a valid broker config: {e}")],
+                problems: vec![format!(
+                    "NEXUS_CONFIG_JSON is not a valid broker config: {e}"
+                )],
             })?;
             *self = parsed;
             return Ok(());
@@ -331,40 +346,96 @@ impl BrokerConfig {
             }
         };
         let flag = |key: &str| {
-            text(key).map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            text(key).map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
         };
 
         set_num("NEXUS_HEARTBEAT_MS", &mut self.limits.heartbeat_ms);
         set_num("NEXUS_LEASE_MS", &mut self.limits.lease_ms);
         set_num("NEXUS_RESUME_GRACE_MS", &mut self.limits.resume_grace_ms);
-        set_num("NEXUS_NO_WORKER_GRACE_MS", &mut self.limits.no_worker_grace_ms);
-        set_num("NEXUS_CLAIM_DEADLINE_MS", &mut self.limits.claim_deadline_ms);
+        set_num(
+            "NEXUS_NO_WORKER_GRACE_MS",
+            &mut self.limits.no_worker_grace_ms,
+        );
+        set_num(
+            "NEXUS_CLAIM_DEADLINE_MS",
+            &mut self.limits.claim_deadline_ms,
+        );
         set_num("NEXUS_JOB_HARD_CAP_MS", &mut self.limits.job_hard_cap_ms);
         set_num("NEXUS_CANCEL_ACK_MS", &mut self.limits.cancel_ack_ms);
-        set_num("NEXUS_FLUSH_INTERVAL_MS", &mut self.limits.flush_interval_ms);
+        set_num(
+            "NEXUS_FLUSH_INTERVAL_MS",
+            &mut self.limits.flush_interval_ms,
+        );
         set_usize("NEXUS_FLUSH_BYTES", &mut self.limits.flush_bytes);
         set_usize("NEXUS_REPLAY_BYTES", &mut self.limits.replay_bytes);
-        set_usize("NEXUS_PARTIAL_TEXT_CAP_BYTES", &mut self.limits.partial_text_cap_bytes);
+        set_usize(
+            "NEXUS_PARTIAL_TEXT_CAP_BYTES",
+            &mut self.limits.partial_text_cap_bytes,
+        );
         set_num("NEXUS_PAYLOAD_TTL_MS", &mut self.limits.payload_ttl_ms);
         set_num("NEXUS_ARTIFACT_TTL_MS", &mut self.limits.artifact_ttl_ms);
         set_num("NEXUS_JOB_RETENTION_MS", &mut self.limits.job_retention_ms);
-        set_num("NEXUS_IDEMPOTENCY_TTL_MS", &mut self.limits.idempotency_ttl_ms);
-        set_usize("NEXUS_IDEMPOTENCY_MAX_ENTRIES", &mut self.limits.max_idempotency_entries);
-        set_num("NEXUS_TENANT_MAX_PAYLOAD_BYTES", &mut self.limits.tenant_max_payload_bytes);
-        set_num("NEXUS_TENANT_MAX_PROMPT_TOKENS", &mut self.limits.tenant_max_prompt_tokens);
+        set_num(
+            "NEXUS_IDEMPOTENCY_TTL_MS",
+            &mut self.limits.idempotency_ttl_ms,
+        );
+        set_usize(
+            "NEXUS_IDEMPOTENCY_MAX_ENTRIES",
+            &mut self.limits.max_idempotency_entries,
+        );
+        set_num(
+            "NEXUS_TENANT_MAX_PAYLOAD_BYTES",
+            &mut self.limits.tenant_max_payload_bytes,
+        );
+        set_num(
+            "NEXUS_TENANT_MAX_PROMPT_TOKENS",
+            &mut self.limits.tenant_max_prompt_tokens,
+        );
         set_num("NEXUS_MAX_SPILL_BYTES", &mut self.limits.max_spill_bytes);
-        set_num("NEXUS_MAX_ARTIFACT_BYTES", &mut self.limits.max_artifact_bytes);
-        set_usize("NEXUS_ARTIFACT_CHUNK_BYTES", &mut self.limits.artifact_chunk_bytes);
-        set_usize("NEXUS_INLINE_PAYLOAD_CAP_BYTES", &mut self.limits.inline_payload_cap_bytes);
-        set_usize("NEXUS_WORKER_LINE_CAP_BYTES", &mut self.limits.worker_line_cap_bytes);
-        set_usize("NEXUS_WORKER_FRAME_TEXT_CAP_BYTES", &mut self.limits.worker_frame_text_cap_bytes);
+        set_num(
+            "NEXUS_MAX_ARTIFACT_BYTES",
+            &mut self.limits.max_artifact_bytes,
+        );
+        set_usize(
+            "NEXUS_ARTIFACT_CHUNK_BYTES",
+            &mut self.limits.artifact_chunk_bytes,
+        );
+        set_usize(
+            "NEXUS_INLINE_PAYLOAD_CAP_BYTES",
+            &mut self.limits.inline_payload_cap_bytes,
+        );
+        set_usize(
+            "NEXUS_WORKER_LINE_CAP_BYTES",
+            &mut self.limits.worker_line_cap_bytes,
+        );
+        set_usize(
+            "NEXUS_WORKER_FRAME_TEXT_CAP_BYTES",
+            &mut self.limits.worker_frame_text_cap_bytes,
+        );
         set_usize("NEXUS_QUEUE_DEPTH", &mut self.limits.queue_depth);
-        set_usize("NEXUS_TENANT_MAX_CONCURRENT", &mut self.limits.tenant_max_concurrent);
-        set_usize("NEXUS_MAX_WORKERS_PER_POOL", &mut self.limits.max_workers_per_pool);
+        set_usize(
+            "NEXUS_TENANT_MAX_CONCURRENT",
+            &mut self.limits.tenant_max_concurrent,
+        );
+        set_usize(
+            "NEXUS_MAX_WORKERS_PER_POOL",
+            &mut self.limits.max_workers_per_pool,
+        );
         set_usize("NEXUS_REPLAY_FRAMES", &mut self.limits.replay_frames);
-        set_usize("NEXUS_MAX_SPILLED_PAYLOADS", &mut self.limits.max_spilled_payloads);
+        set_usize(
+            "NEXUS_MAX_SPILLED_PAYLOADS",
+            &mut self.limits.max_spilled_payloads,
+        );
         set_u32("NEXUS_MAX_ATTEMPTS", &mut self.limits.max_attempts);
-        set_u32("NEXUS_MAX_CONTINUATIONS", &mut self.limits.max_continuations);
+        set_u32(
+            "NEXUS_MAX_CONTINUATIONS",
+            &mut self.limits.max_continuations,
+        );
         // Booleans use the `flag` helper (1/true/yes/on); the JSON config reaches
         // the same field by name through `Limits`' serde derive.
         if let Some(on) = flag("NEXUS_CONTINUATION_ALLOW_OPAQUE") {
@@ -383,10 +454,14 @@ impl BrokerConfig {
             self.auth.api_keys = split_list(list)
                 .into_iter()
                 .map(|entry| match entry.split_once('=') {
-                    Some((key, tenant)) => {
-                        ApiKeyConfig { key: key.trim().to_string(), tenant: tenant.trim().to_string() }
-                    }
-                    None => ApiKeyConfig { key: entry.trim().to_string(), tenant: "default".to_string() },
+                    Some((key, tenant)) => ApiKeyConfig {
+                        key: key.trim().to_string(),
+                        tenant: tenant.trim().to_string(),
+                    },
+                    None => ApiKeyConfig {
+                        key: entry.trim().to_string(),
+                        tenant: "default".to_string(),
+                    },
                 })
                 .collect();
         }
@@ -413,11 +488,15 @@ impl BrokerConfig {
             if k.pool.is_empty() {
                 problems.push(format!("kind {kind:?} has no pool"));
             } else if !self.pools.contains_key(&k.pool) {
-                problems.push(format!("kind {kind:?} references unknown pool {:?}", k.pool));
+                problems.push(format!(
+                    "kind {kind:?} references unknown pool {:?}",
+                    k.pool
+                ));
             }
         }
         if !self.kinds.contains_key("llm.chat") {
-            problems.push("kind \"llm.chat\" must exist: the OpenAI adapter depends on it".to_string());
+            problems
+                .push("kind \"llm.chat\" must exist: the OpenAI adapter depends on it".to_string());
         }
 
         if !self.auth.allow_anonymous {
@@ -494,25 +573,33 @@ impl BrokerConfig {
     /// Effective queue depth for a pool.
     #[must_use]
     pub fn queue_depth_for(&self, pool: &PoolId) -> usize {
-        self.pool(pool).and_then(|p| p.queue_depth).unwrap_or(self.limits.queue_depth)
+        self.pool(pool)
+            .and_then(|p| p.queue_depth)
+            .unwrap_or(self.limits.queue_depth)
     }
 
     /// Effective lease lifetime for a pool.
     #[must_use]
     pub fn lease_ms_for(&self, pool: &PoolId) -> u64 {
-        self.pool(pool).and_then(|p| p.lease_ms).unwrap_or(self.limits.lease_ms)
+        self.pool(pool)
+            .and_then(|p| p.lease_ms)
+            .unwrap_or(self.limits.lease_ms)
     }
 
     /// Effective heartbeat expectation for a pool.
     #[must_use]
     pub fn heartbeat_ms_for(&self, pool: &PoolId) -> u64 {
-        self.pool(pool).and_then(|p| p.heartbeat_ms).unwrap_or(self.limits.heartbeat_ms)
+        self.pool(pool)
+            .and_then(|p| p.heartbeat_ms)
+            .unwrap_or(self.limits.heartbeat_ms)
     }
 
     /// Effective artifact TTL for a pool.
     #[must_use]
     pub fn artifact_ttl_for(&self, pool: &PoolId) -> u64 {
-        self.pool(pool).and_then(|p| p.artifact_ttl_ms).unwrap_or(self.limits.artifact_ttl_ms)
+        self.pool(pool)
+            .and_then(|p| p.artifact_ttl_ms)
+            .unwrap_or(self.limits.artifact_ttl_ms)
     }
 
     /// Whether a tier may join a pool; an empty `allowed_tiers` admits both.
@@ -588,8 +675,14 @@ mod tests {
         assert!(chat.idempotent && chat.streaming);
         let hook = cfg.kind("notify.webhook").expect("kind");
         assert!(!hook.idempotent && !hook.streaming);
-        assert_eq!(cfg.queue_depth_for(&PoolId::new_unchecked("llm.chat/qwen38")), 128);
-        assert_eq!(cfg.tenant_concurrency_for(&TenantId::new_unchecked("default")), 4);
+        assert_eq!(
+            cfg.queue_depth_for(&PoolId::new_unchecked("llm.chat/qwen38")),
+            128
+        );
+        assert_eq!(
+            cfg.tenant_concurrency_for(&TenantId::new_unchecked("default")),
+            4
+        );
     }
 
     #[test]
@@ -598,17 +691,35 @@ mod tests {
         // rather than quietly accepting anyone.
         let cfg = BrokerConfig::default();
         let err = cfg.validate().expect_err("must fail");
-        assert!(err.problems.iter().any(|p| p.contains("auth.worker_tokens is empty")));
-        assert!(err.problems.iter().any(|p| p.contains("auth.api_keys is empty")));
-        assert!(err.problems.iter().any(|p| p.contains("auth.model_shas is empty")));
+        assert!(err
+            .problems
+            .iter()
+            .any(|p| p.contains("auth.worker_tokens is empty")));
+        assert!(err
+            .problems
+            .iter()
+            .any(|p| p.contains("auth.api_keys is empty")));
+        assert!(err
+            .problems
+            .iter()
+            .any(|p| p.contains("auth.model_shas is empty")));
     }
 
     #[test]
     fn kind_referencing_unknown_pool_is_caught() {
         let mut cfg = anonymous();
-        cfg.kinds.insert("bad.kind".to_string(), KindConfig { pool: "nope".to_string(), ..Default::default() });
+        cfg.kinds.insert(
+            "bad.kind".to_string(),
+            KindConfig {
+                pool: "nope".to_string(),
+                ..Default::default()
+            },
+        );
         let err = cfg.validate().expect_err("must fail");
-        assert_eq!(err.problems, vec![r#"kind "bad.kind" references unknown pool "nope""#.to_string()]);
+        assert_eq!(
+            err.problems,
+            vec![r#"kind "bad.kind" references unknown pool "nope""#.to_string()]
+        );
     }
 
     #[test]
@@ -616,23 +727,41 @@ mod tests {
         let mut values = BTreeMap::new();
         values.insert("NEXUS_QUEUE_DEPTH".to_string(), "7".to_string());
         values.insert("NEXUS_LEASE_MS".to_string(), "90000".to_string());
-        values.insert("NEXUS_POOL_TOKENS".to_string(), " tok-a ,tok-b ".to_string());
+        values.insert(
+            "NEXUS_POOL_TOKENS".to_string(),
+            " tok-a ,tok-b ".to_string(),
+        );
         values.insert("NEXUS_API_KEYS".to_string(), "sk-1=acme,sk-2".to_string());
         values.insert("NEXUS_MODEL_SHAS".to_string(), "aa\nbb".to_string());
         values.insert("NEXUS_ALLOW_ANONYMOUS".to_string(), "0".to_string());
-        let cfg = BrokerConfig::from_values(&values);
+        let mut cfg = BrokerConfig::from_values(&values);
         assert_eq!(cfg.limits.queue_depth, 7);
         assert_eq!(cfg.limits.lease_ms, 90_000);
-        assert_eq!(cfg.auth.worker_tokens, vec!["tok-a".to_string(), "tok-b".to_string()]);
+        assert_eq!(
+            cfg.auth.worker_tokens,
+            vec!["tok-a".to_string(), "tok-b".to_string()]
+        );
         assert_eq!(
             cfg.auth.api_keys,
             vec![
-                ApiKeyConfig { key: "sk-1".to_string(), tenant: "acme".to_string() },
-                ApiKeyConfig { key: "sk-2".to_string(), tenant: "default".to_string() },
+                ApiKeyConfig {
+                    key: "sk-1".to_string(),
+                    tenant: "acme".to_string()
+                },
+                ApiKeyConfig {
+                    key: "sk-2".to_string(),
+                    tenant: "default".to_string()
+                },
             ]
         );
         assert_eq!(cfg.auth.model_shas.len(), 2);
         assert!(!cfg.auth.allow_anonymous);
+        // `validate()` refuses an api key that names an undeclared tenant: §9's
+        // tenant registry is declared, never inferred from a credential. The env
+        // path starts from `BrokerConfig::default()`, which declares only
+        // "default", so this fixture declares `acme` before validating.
+        cfg.tenants
+            .insert("acme".to_string(), TenantConfig::default());
         assert!(cfg.validate().is_ok(), "{:?}", cfg.validate().err());
     }
 
@@ -642,15 +771,31 @@ mod tests {
         // `queue_dpeth` is caught by `deny_unknown_fields`, and a document that
         // replaces everything cannot be silently skipped: the hub would otherwise
         // boot on the sample pools with no credentials and call that configured.
-        values.insert("NEXUS_CONFIG_JSON".to_string(), r#"{"limits":{"queue_dpeth":4}}"#.to_string());
+        values.insert(
+            "NEXUS_CONFIG_JSON".to_string(),
+            r#"{"limits":{"queue_dpeth":4}}"#.to_string(),
+        );
         let err = BrokerConfig::from_values_checked(&values).expect_err("a typo must stop startup");
-        assert!(err.problems[0].contains("NEXUS_CONFIG_JSON"), "{:?}", err.problems);
+        assert!(
+            err.problems[0].contains("NEXUS_CONFIG_JSON"),
+            "{:?}",
+            err.problems
+        );
         // The best-effort accessor still yields the defaults, and says so by
         // keeping the documented default depth rather than a partial merge.
         assert_eq!(BrokerConfig::from_values(&values).limits.queue_depth, 128);
         // A valid document replaces everything.
-        values.insert("NEXUS_CONFIG_JSON".to_string(), r#"{"limits":{"queue_depth":3}}"#.to_string());
-        assert_eq!(BrokerConfig::from_values_checked(&values).expect("valid").limits.queue_depth, 3);
+        values.insert(
+            "NEXUS_CONFIG_JSON".to_string(),
+            r#"{"limits":{"queue_depth":3}}"#.to_string(),
+        );
+        assert_eq!(
+            BrokerConfig::from_values_checked(&values)
+                .expect("valid")
+                .limits
+                .queue_depth,
+            3
+        );
     }
 
     #[test]
@@ -658,7 +803,10 @@ mod tests {
         let mut values = BTreeMap::new();
         values.insert("NEXUS_QUEUE_DEPTH".to_string(), "lots".to_string());
         let cfg = BrokerConfig::from_values(&values);
-        assert_eq!(cfg.limits.queue_depth, 128, "an unparsable value keeps the default");
+        assert_eq!(
+            cfg.limits.queue_depth, 128,
+            "an unparsable value keeps the default"
+        );
     }
 
     #[test]
@@ -670,7 +818,11 @@ mod tests {
 
         let err = BrokerConfig::from_json_str(r#"{"limits":{"queue_dpeth":4}}"#)
             .expect_err("a limit-name typo must be a hard error");
-        assert!(err.problems[0].contains("queue_dpeth"), "{}", err.problems[0]);
+        assert!(
+            err.problems[0].contains("queue_dpeth"),
+            "{}",
+            err.problems[0]
+        );
     }
 
     #[test]
@@ -685,10 +837,22 @@ mod tests {
                 ..PoolConfig::default()
             },
         );
-        assert_eq!(cfg.queue_depth_for(&PoolId::new_unchecked("llm.chat/qwen38")), 3);
-        assert_eq!(cfg.lease_ms_for(&PoolId::new_unchecked("llm.chat/qwen38")), 90_000);
-        assert!(!cfg.tier_allowed(&PoolId::new_unchecked("llm.chat/qwen38"), WorkerTier::Ephemeral));
+        assert_eq!(
+            cfg.queue_depth_for(&PoolId::new_unchecked("llm.chat/qwen38")),
+            3
+        );
+        assert_eq!(
+            cfg.lease_ms_for(&PoolId::new_unchecked("llm.chat/qwen38")),
+            90_000
+        );
+        assert!(!cfg.tier_allowed(
+            &PoolId::new_unchecked("llm.chat/qwen38"),
+            WorkerTier::Ephemeral
+        ));
         // A pool with no override still reports the global lease.
-        assert_eq!(cfg.lease_ms_for(&PoolId::new_unchecked("image.render/comfyui")), 60_000);
+        assert_eq!(
+            cfg.lease_ms_for(&PoolId::new_unchecked("image.render/comfyui")),
+            60_000
+        );
     }
 }

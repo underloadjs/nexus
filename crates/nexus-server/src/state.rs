@@ -30,18 +30,21 @@ use nexus_core::ids::JobId;
 use nexus_core::ids::PayloadRefId;
 use nexus_core::ids::PoolId;
 use nexus_core::ids::WorkerId;
+// `Hub::cfg` is typed by name in three places below, so the type itself is needed.
 use nexus_core::protocol::ByeReason;
 use nexus_core::protocol::HubFrame;
 use nexus_core::protocol::WireCaps;
 use nexus_core::ActorMsg;
+use nexus_core::BrokerConfig;
 use nexus_core::ConsumerEvent;
 use nexus_core::Effect;
+use nexus_core::JobPhase;
 use nexus_core::JobView;
 use nexus_core::PoolActor;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
-use tokio::sync::Mutex;
 use tokio::sync::oneshot;
+use tokio::sync::Mutex;
 
 /// Actor mailbox depth. Bounded so a submission flood back-pressures the HTTP
 /// layer instead of growing memory without end (task §8).
@@ -144,7 +147,10 @@ impl JobRelay {
 
     /// Broadcast one event, marking the stream finished when it is terminal.
     pub fn push(&self, event: ConsumerEvent) {
-        let terminal = matches!(event, ConsumerEvent::Finish { .. } | ConsumerEvent::Error { .. });
+        let terminal = matches!(
+            event,
+            ConsumerEvent::Finish { .. } | ConsumerEvent::Error { .. }
+        );
         let _ = self.events.send(RelayItem::Event(event));
         if terminal && !self.finished.swap(true, Ordering::Relaxed) {
             let _ = self.events.send(RelayItem::End);
@@ -262,8 +268,15 @@ impl IdSource {
     /// New source, salted from the wall clock.
     #[must_use]
     pub fn new() -> Self {
-        let salt = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos() as u64);
-        Self { job: AtomicU64::new(1), conn: AtomicU64::new(1), consumer: AtomicU64::new(1), salt }
+        let salt = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos() as u64);
+        Self {
+            job: AtomicU64::new(1),
+            conn: AtomicU64::new(1),
+            consumer: AtomicU64::new(1),
+            salt,
+        }
     }
 
     /// Next job id.
@@ -309,7 +322,9 @@ impl Hub {
             );
         }
         let hub = Arc::new(Self {
-            epoch_ms: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64),
+            epoch_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis() as u64),
             api_keys: nexus_core::auth::ApiKeyRegistry::from_config(&cfg.auth),
             pool_tokens: nexus_core::auth::PoolTokenRegistry::from_config(&cfg.auth),
             job_index: Mutex::new(HashMap::new()),
@@ -321,7 +336,8 @@ impl Hub {
             pools,
         });
         for (pid, rx) in starts {
-            let actor = PoolActor::with_artifact_root(pid.clone(), hub.cfg.clone(), &hub.artifact_root);
+            let actor =
+                PoolActor::with_artifact_root(pid.clone(), hub.cfg.clone(), &hub.artifact_root);
             let handle = Arc::clone(hub.pools.get(&pid).expect("pool handle exists"));
             tokio::spawn(run_actor(pid, actor, rx, handle, Arc::clone(&hub)));
         }
@@ -337,12 +353,20 @@ impl Hub {
     /// Pool ids in a stable order.
     #[must_use]
     pub fn pool_ids(&self) -> Vec<PoolId> {
-        self.pools.keys().collect::<BTreeSet<_>>().into_iter().cloned().collect()
+        self.pools
+            .keys()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .cloned()
+            .collect()
     }
 
     /// Record which pool owns a job (called by the submit handler).
     pub async fn bind_job(&self, job: &JobId, pool: &PoolId) {
-        self.job_index.lock().await.insert(job.clone(), pool.clone());
+        self.job_index
+            .lock()
+            .await
+            .insert(job.clone(), pool.clone());
     }
 
     /// Route a job to its pool from the read-mostly index.
@@ -359,12 +383,32 @@ impl Hub {
     pub async fn job_snapshot(&self, job: &JobId) -> Option<JobView> {
         let handle = self.route_job(job).await?;
         let (reply, waiting) = oneshot::channel();
-        self.snapshot_waiters.lock().await.entry(job.clone()).or_default().push(reply);
-        if handle.tx.send(ActorMsg::Query { job: job.clone() }).await.is_err() {
+        self.snapshot_waiters
+            .lock()
+            .await
+            .entry(job.clone())
+            .or_default()
+            .push(reply);
+        if handle
+            .tx
+            .send(ActorMsg::Query { job: job.clone() })
+            .await
+            .is_err()
+        {
             self.forget_snapshot_waiter(job).await;
             return None;
         }
-        let view = tokio::time::timeout(std::time::Duration::from_millis(PROBE_TIMEOUT_MS), waiting).await.ok().ok().flatten().flatten();
+        // `timeout(..)` yields `Result<Result<Option<JobView>, RecvError>, Elapsed>`:
+        // `.ok()` drops the timeout arm, `and_then(ok())` drops the channel-closed
+        // arm, and the final `.flatten()` unwraps the `Option<JobView>` the waiter
+        // sent. (`Result` is not an iterator, so `.flatten()` alone cannot step over
+        // the inner `Result`.)
+        let view =
+            tokio::time::timeout(std::time::Duration::from_millis(PROBE_TIMEOUT_MS), waiting)
+                .await
+                .ok()
+                .and_then(|answered| answered.ok())
+                .flatten();
         if view.is_none() {
             self.forget_snapshot_waiter(job).await;
         }
@@ -382,19 +426,39 @@ impl Hub {
     }
 
     /// Fetch a spilled payload on behalf of a worker, through the actor.
-    pub async fn payload_fetch(&self, reference: &PayloadRefId, token: &str, worker: &WorkerId, attempt: u32) -> Option<PayloadGrant> {
+    pub async fn payload_fetch(
+        &self,
+        reference: &PayloadRefId,
+        token: &str,
+        worker: &WorkerId,
+        attempt: u32,
+    ) -> Option<PayloadGrant> {
         // A payload reference is the job id it was spilled for (see `PayloadBook`),
         // so routing the job routes the payload.
         let job = JobId::new_unchecked(reference.as_ref().to_string());
         let handle = self.route_job(&job).await?;
         let (reply, waiting) = oneshot::channel();
-        self.payload_waiters.lock().await.insert(reference.clone(), reply);
-        let msg = ActorMsg::FetchPayload { reference: reference.clone(), token: token.to_string(), worker: worker.clone(), attempt };
+        self.payload_waiters
+            .lock()
+            .await
+            .insert(reference.clone(), reply);
+        let msg = ActorMsg::FetchPayload {
+            reference: reference.clone(),
+            token: token.to_string(),
+            worker: worker.clone(),
+            attempt,
+        };
         if handle.tx.send(msg).await.is_err() {
             self.payload_waiters.lock().await.remove(reference);
             return None;
         }
-        let grant = tokio::time::timeout(std::time::Duration::from_millis(PROBE_TIMEOUT_MS), waiting).await.ok().ok().flatten();
+        // See `job_snapshot` for the shape: `Result<Result<PayloadGrant, RecvError>,
+        // Elapsed>`, so `.ok()` plus `and_then(ok())` is the whole answer.
+        let grant =
+            tokio::time::timeout(std::time::Duration::from_millis(PROBE_TIMEOUT_MS), waiting)
+                .await
+                .ok()
+                .and_then(|answered| answered.ok());
         if grant.is_none() {
             self.payload_waiters.lock().await.remove(reference);
         }
@@ -404,7 +468,9 @@ impl Hub {
     /// Wall-clock milliseconds, for OpenAI's `created` field.
     #[must_use]
     pub fn wall_ms(&self) -> u64 {
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(self.epoch_ms, |d| d.as_millis() as u64)
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(self.epoch_ms, |d| d.as_millis() as u64)
     }
 
     /// Aggregate warm capacity, read from the mirrored gauges.
@@ -437,11 +503,16 @@ impl Hub {
         let mut families: BTreeMap<String, (String, BTreeMap<String, u64>)> = BTreeMap::new();
         for handle in self.pools.values() {
             let gauges = handle.gauges.lock().await;
-            for (kind, entries) in [("gauge", gauges.metrics.gauges()), ("counter", gauges.metrics.counters())] {
+            for (kind, entries) in [
+                ("gauge", gauges.metrics.gauges()),
+                ("counter", gauges.metrics.counters()),
+            ] {
                 for (key, value) in entries {
                     let base = nexus_core::metrics::base_name(key);
                     let labeled = with_pool_label(key, handle.id.as_ref());
-                    let slot = families.entry(base).or_insert_with(|| (kind.to_string(), BTreeMap::new()));
+                    let slot = families
+                        .entry(base)
+                        .or_insert_with(|| (kind.to_string(), BTreeMap::new()));
                     *slot.1.entry(labeled).or_insert(0) += *value;
                 }
             }
@@ -519,7 +590,11 @@ impl PoolHandle {
 /// Send one message to a pool actor. An error means the actor exited, which the
 /// caller turns into a retryable failure rather than a hang.
 pub async fn send(handle: &PoolHandle, msg: ActorMsg) -> anyhow::Result<()> {
-    handle.tx.send(msg).await.map_err(|_| anyhow::anyhow!("pool actor mailbox is closed"))
+    handle
+        .tx
+        .send(msg)
+        .await
+        .map_err(|_| anyhow::anyhow!("pool actor mailbox is closed"))
 }
 
 /// Push an already-encoded frame to a worker's live socket.
@@ -529,7 +604,12 @@ pub async fn send(handle: &PoolHandle, msg: ActorMsg) -> anyhow::Result<()> {
 /// inline payload near `inline_payload_cap_bytes` is far larger than the 1 MiB
 /// default line, and encoding it against the default would drop the dispatch
 /// silently — the worker is never told and the lease only lapses at expiry.
-pub async fn send_frame(handle: &Arc<PoolHandle>, worker: &WorkerId, frame: &HubFrame, caps: &WireCaps) {
+pub async fn send_frame(
+    handle: &Arc<PoolHandle>,
+    worker: &WorkerId,
+    frame: &HubFrame,
+    caps: &WireCaps,
+) {
     let line = match encode_line(frame, caps) {
         Ok(line) => line,
         Err(err) => {
@@ -548,7 +628,12 @@ pub async fn send_frame(handle: &Arc<PoolHandle>, worker: &WorkerId, frame: &Hub
             // a client that honours `Bye` would drop the good connection and
             // reconnect forever. The WASM host sees the frame; it owns the
             // sockets and can tell its own generations apart.
-            if matches!(frame, HubFrame::Bye { reason: ByeReason::Evicted }) {
+            if matches!(
+                frame,
+                HubFrame::Bye {
+                    reason: ByeReason::Evicted
+                }
+            ) {
                 tracing::debug!(%worker, "eviction `Bye` handled by the connection registry, not the live socket");
                 return;
             }
@@ -571,7 +656,12 @@ pub async fn send_frame(handle: &Arc<PoolHandle>, worker: &WorkerId, frame: &Hub
             // rules run and an in-flight `Assigned`/`Cancel` is resolved rather than
             // silently swallowed.
             const SEND_GRACE_MS: u64 = 25;
-            match tokio::time::timeout(std::time::Duration::from_millis(SEND_GRACE_MS), conn.tx.send(WorkerWrite::Frame(line))).await {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(SEND_GRACE_MS),
+                conn.tx.send(WorkerWrite::Frame(line)),
+            )
+            .await
+            {
                 Ok(Ok(())) => {}
                 Ok(Err(_)) => {
                     tracing::warn!(%worker, "worker socket closed during send");
@@ -604,7 +694,10 @@ fn encode_line(frame: &HubFrame, caps: &WireCaps) -> Result<String, nexus_core::
 /// is saturated the report is dropped with a log, and the actor's lease timer still
 /// resolves the job — a late answer, never a lost one.
 fn report_dead_connection(handle: &Arc<PoolHandle>, worker: &WorkerId, conn: u64) {
-    if let Err(err) = handle.tx.try_send(ActorMsg::WorkerGone { worker: worker.clone(), conn }) {
+    if let Err(err) = handle.tx.try_send(ActorMsg::WorkerGone {
+        worker: worker.clone(),
+        conn,
+    }) {
         tracing::warn!(%worker, %err, "pool mailbox would block: the WorkerGone report is deferred to the lease timer");
     }
 }
@@ -612,7 +705,13 @@ fn report_dead_connection(handle: &Arc<PoolHandle>, worker: &WorkerId, conn: u64
 /// The actor task: take a message, mutate state, perform the effects. Nothing else
 /// holds a mutable reference to the actor, which is what makes the claim guarantee
 /// structural rather than "a mutex we hope is held correctly" (task §5).
-async fn run_actor(pool: PoolId, mut actor: PoolActor, mut rx: mpsc::Receiver<ActorMsg>, handle: Arc<PoolHandle>, hub: Arc<Hub>) {
+async fn run_actor(
+    pool: PoolId,
+    mut actor: PoolActor,
+    mut rx: mpsc::Receiver<ActorMsg>,
+    handle: Arc<PoolHandle>,
+    hub: Arc<Hub>,
+) {
     let tick_ms = actor.config().heartbeat_ms_for(&pool).min(1_000).max(50);
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(tick_ms));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -649,31 +748,79 @@ async fn run_actor(pool: PoolId, mut actor: PoolActor, mut rx: mpsc::Receiver<Ac
 fn monotonic_ms() -> u64 {
     use std::sync::OnceLock;
     static ORIGIN: OnceLock<std::time::Instant> = OnceLock::new();
-    ORIGIN.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+    ORIGIN
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
 }
 
 /// Perform the actor's effects, in order: worker writes first, so a consumer never
 /// receives a terminal event before its owning worker was told.
-async fn dispatch(hub: &Arc<Hub>, handle: &Arc<PoolHandle>, actor: &PoolActor, effects: Vec<Effect>) {
+async fn dispatch(
+    hub: &Arc<Hub>,
+    handle: &Arc<PoolHandle>,
+    actor: &PoolActor,
+    effects: Vec<Effect>,
+) {
     for effect in effects {
         match effect {
             // Outbound caps come from the hub's own configuration so an
             // `Assigned` with a large inline payload is not dropped for
             // exceeding a default that is smaller than the inline cap.
-            Effect::SendWorker { worker, frame } => send_frame(handle, &worker, &frame, &hub.cfg.limits.hub_caps()).await,
-            Effect::Accepted { job, attached, replayed } => {
-                let relay = handle.relay(&job, actor.limits().consumer_backpressure_frames).await;
-                relay.resolve(Gate::Accepted).await;
-                if attached {
-                    let target = relay.replay_target.lock().await.take();
-                    if let Some(tx) = target {
-                        for event in replayed {
-                            let _ = tx.send(RelayItem::Event(event)).await;
-                        }
+            Effect::SendWorker { worker, ref frame } => {
+                send_frame(handle, &worker, frame, &hub.cfg.limits.hub_caps()).await;
+                // §7.2's second half. A job submitted while the pool had no warm
+                // worker was `Accepted` but deliberately left unanswered (see the
+                // `Accepted` arm below: the grace window can still end in a `503`
+                // with no body bytes). Handing the job to a worker is the moment
+                // the request became serviceable, so the body may open now.
+                if let HubFrame::Assigned { job, .. } = frame {
+                    let relay = handle
+                        .relay(job, actor.limits().consumer_backpressure_frames)
+                        .await;
+                    relay.resolve(Gate::Accepted).await;
+                }
+            }
+            Effect::Accepted {
+                job,
+                attached,
+                replayed,
+            } => {
+                let relay = handle
+                    .relay(&job, actor.limits().consumer_backpressure_frames)
+                    .await;
+                // `attached` joins an execution that is already running, so its
+                // stream is open by definition. A fresh submission whose record is
+                // still `Pending` is the §7.2 grace case: nothing may be written
+                // yet, and the gate stays unresolved until either an `Assigned`
+                // lands (arm above) or the grace expiry answers `503`.
+                if attached
+                    || actor
+                        .job(&job)
+                        .is_some_and(|record| record.phase != JobPhase::Pending)
+                {
+                    relay.resolve(Gate::Accepted).await;
+                }
+                // The private replay queue carries only this consumer's buffered
+                // prefix. A fresh submission has none, so the sender must be
+                // dropped: `pump_sse` otherwise waits in its replay loop forever
+                // and never watches the fan-out, which would delay every delta
+                // until the job terminates and swallow §6's consumer-disconnect
+                // `Detach` (the worker would keep generating for nobody).
+                let target = relay.replay_target.lock().await.take();
+                if let (Some(tx), true) = (target, attached) {
+                    for event in replayed {
+                        let _ = tx.send(RelayItem::Event(event)).await;
                     }
                 }
             }
-            Effect::Reject { job, status, code, message, retry_after_ms } => {
+            Effect::Reject {
+                job,
+                status,
+                code,
+                message,
+                retry_after_ms,
+            } => {
                 let gate = Gate::Reject {
                     status: StatusCode::from_u16(status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
                     code: code.clone(),
@@ -691,26 +838,46 @@ async fn dispatch(hub: &Arc<Hub>, handle: &Arc<PoolHandle>, actor: &PoolActor, e
                 }
             }
             Effect::Relay { job, events } => {
-                let relay = handle.relay(&job, actor.limits().consumer_backpressure_frames).await;
+                let relay = handle
+                    .relay(&job, actor.limits().consumer_backpressure_frames)
+                    .await;
                 for event in events {
                     relay.push(event);
                 }
             }
-            Effect::ReplayTo { job, consumer, events, lossy } => {
-                let relay = handle.relay(&job, actor.limits().consumer_backpressure_frames).await;
+            Effect::ReplayTo {
+                job,
+                consumer,
+                events,
+                lossy,
+            } => {
+                let relay = handle
+                    .relay(&job, actor.limits().consumer_backpressure_frames)
+                    .await;
                 match relay.replay_target.lock().await.take() {
                     Some(tx) => {
                         if lossy {
                             // The ring already evicted part of what was asked for:
                             // say so, rather than pretending the text is complete.
-                            let _ = tx.send(RelayItem::Event(ConsumerEvent::Gap { expected: 0, got: 0 })).await;
+                            let _ = tx
+                                .send(RelayItem::Event(ConsumerEvent::Gap {
+                                    expected: 0,
+                                    got: 0,
+                                }))
+                                .await;
                         }
                         for event in events {
                             let _ = tx.send(RelayItem::Event(event)).await;
                         }
                     }
-                    None => tracing::debug!(pool = %handle.id, %job, %consumer, "attach replay had no waiting consumer"),
-                }
+                    None => {
+                        tracing::debug!(pool = %handle.id, %job, %consumer, "attach replay had no waiting consumer")
+                    }
+                };
+                // The trailing `;` matters: without it the `match` is the block's
+                // tail expression, so the `MutexGuard` temporary created by
+                // `replay_target.lock()` would outlive `relay` and its drop would run
+                // on a borrow of a value that is already gone (E0597).
             }
             Effect::Keepalive { job } => {
                 if let Some(relay) = handle.relays.lock().await.get(&job) {
@@ -724,7 +891,11 @@ async fn dispatch(hub: &Arc<Hub>, handle: &Arc<PoolHandle>, actor: &PoolActor, e
                 tracing::info!(pool = %handle.id, %artifact, %path, "artifact TTL expired");
                 crate::io::delete_artifact(&path).await;
             }
-            Effect::Terminal { job, reason, retryable } => {
+            Effect::Terminal {
+                job,
+                reason,
+                retryable,
+            } => {
                 tracing::info!(pool = %handle.id, %job, reason = reason.as_str(), retryable, "job terminal");
                 // A terminal job's fan-out has carried its last event, so the map
                 // entry goes: without this, `relays` grows for the hub's lifetime
@@ -745,9 +916,21 @@ async fn dispatch(hub: &Arc<Hub>, handle: &Arc<PoolHandle>, actor: &PoolActor, e
                     }
                 }
             }
-            Effect::PayloadBytes { reference, granted, bytes, content_type, sha256, reason } => {
+            Effect::PayloadBytes {
+                reference,
+                granted,
+                bytes,
+                content_type,
+                sha256,
+                reason,
+            } => {
                 if let Some(waiter) = hub.payload_waiters.lock().await.remove(&reference) {
-                    let _ = waiter.send(PayloadGrant { bytes, content_type, sha256, reason });
+                    let _ = waiter.send(PayloadGrant {
+                        bytes,
+                        content_type,
+                        sha256,
+                        reason,
+                    });
                 } else {
                     tracing::debug!(%reference, granted, "payload answer had no waiter");
                 }
@@ -765,7 +948,12 @@ async fn dispatch(hub: &Arc<Hub>, handle: &Arc<PoolHandle>, actor: &PoolActor, e
 /// Cancel every leased job on shutdown, so GPUs stop generating (task §6, §16.18).
 pub async fn drain_pools(hub: &Arc<Hub>) {
     for handle in hub.pools.values() {
-        let _ = handle.tx.send(ActorMsg::Shutdown { now_ms: monotonic_ms() }).await;
+        let _ = handle
+            .tx
+            .send(ActorMsg::Shutdown {
+                now_ms: monotonic_ms(),
+            })
+            .await;
     }
 }
 
@@ -796,7 +984,10 @@ mod tests {
             with_pool_label(r#"nexus_frames_total{kind="delta"}"#, "llm.chat/qwen38"),
             r#"nexus_frames_total{pool="llm.chat/qwen38",kind="delta"}"#
         );
-        assert_eq!(with_pool_label("nexus_queue_depth", "p"), r#"nexus_queue_depth{pool="p"}"#);
+        assert_eq!(
+            with_pool_label("nexus_queue_depth", "p"),
+            r#"nexus_queue_depth{pool="p"}"#
+        );
     }
 
     /// The actor applies its effects inline, so a worker whose outbound queue is
@@ -818,28 +1009,54 @@ mod tests {
         });
 
         let (worker_tx, worker_rx) = mpsc::channel::<WorkerWrite>(1);
-        worker_tx.send(WorkerWrite::Frame("queued".to_string())).await.expect("the first frame fits");
-        handle.workers.lock().await.insert(WorkerId::new_unchecked("w-stalled"), WorkerConn { conn: 7, tx: worker_tx });
+        worker_tx
+            .send(WorkerWrite::Frame("queued".to_string()))
+            .await
+            .expect("the first frame fits");
+        handle.workers.lock().await.insert(
+            WorkerId::new_unchecked("w-stalled"),
+            WorkerConn {
+                conn: 7,
+                tx: worker_tx,
+            },
+        );
 
         let started = std::time::Instant::now();
         send_frame(
             &handle,
             &WorkerId::new_unchecked("w-stalled"),
-            &HubFrame::Cancel { job: JobId::new_unchecked("job-1"), reason: CancelReason::ConsumerGone },
+            &HubFrame::Cancel {
+                job: JobId::new_unchecked("job-1"),
+                reason: CancelReason::ConsumerGone,
+            },
             &WireCaps::default(),
         )
         .await;
         let elapsed = started.elapsed();
 
-        assert!(elapsed >= std::time::Duration::from_millis(20), "the queue gets its grace period first: {elapsed:?}");
-        assert!(elapsed < std::time::Duration::from_millis(500), "the send is bounded, never indefinite: {elapsed:?}");
-
-        let report = actor_rx.recv().await.expect("the failed send must reach the actor");
         assert!(
-            matches!(report, ActorMsg::WorkerGone { worker, conn } if worker.as_ref() == "w-stalled" && conn == 7),
+            elapsed >= std::time::Duration::from_millis(20),
+            "the queue gets its grace period first: {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "the send is bounded, never indefinite: {elapsed:?}"
+        );
+
+        let report = actor_rx
+            .recv()
+            .await
+            .expect("the failed send must reach the actor");
+        // Matched on a reference: binding `worker`/`conn` out of the owned value
+        // would partially move `report`, and the message below still formats it.
+        assert!(
+            matches!(&report, ActorMsg::WorkerGone { worker, conn } if worker.as_ref() == "w-stalled" && *conn == 7),
             "the report carries the connection the actor believes is live: {report:?}"
         );
-        assert!(actor_rx.try_recv().is_err(), "exactly one report per failed send");
+        assert!(
+            actor_rx.try_recv().is_err(),
+            "exactly one report per failed send"
+        );
         drop(worker_rx);
     }
 }

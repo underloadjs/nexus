@@ -4,6 +4,10 @@
 //! slower way to run out of memory.
 
 use crate::protocol::WireCaps;
+// Derives below are serde ones: the import is what makes `#[derive(Serialize,
+// Deserialize)]` resolve (it is not in the std prelude).
+use serde::Deserialize;
+use serde::Serialize;
 
 /// All numeric policy for one pool's actor plus the shared wire/store bounds.
 ///
@@ -213,7 +217,8 @@ impl Limits {
             problems.push("max_attempts must be >= 1".to_string());
         }
         if self.queue_depth == 0 {
-            problems.push("queue_depth must be > 0 (a 0-depth pool can never accept work)".to_string());
+            problems
+                .push("queue_depth must be > 0 (a 0-depth pool can never accept work)".to_string());
         }
         if self.resume_grace_ms > self.lease_ms {
             problems.push("resume_grace_ms must not exceed lease_ms".to_string());
@@ -237,8 +242,14 @@ mod tests {
         assert_eq!(l.tenant_max_prompt_tokens, 524_288);
         assert_eq!((l.heartbeat_ms, l.lease_ms), (20_000, 60_000));
         assert_eq!((l.flush_interval_ms, l.flush_bytes), (75, 1_536));
-        assert_eq!(l.max_continuations, 0, "resume-by-continuation is opt-in (§7.4)");
-        assert!(!l.continuation_allows_opaque_output, "opaque (tool-call / non-delta) output is never auto-continued by default (§7.4)");
+        assert_eq!(
+            l.max_continuations, 0,
+            "resume-by-continuation is opt-in (§7.4)"
+        );
+        assert!(
+            !l.continuation_allows_opaque_output,
+            "opaque (tool-call / non-delta) output is never auto-continued by default (§7.4)"
+        );
     }
 
     #[test]

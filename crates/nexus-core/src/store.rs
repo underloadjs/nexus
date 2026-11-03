@@ -136,7 +136,14 @@ impl PayloadBook {
     /// New book with the configured bounds.
     #[must_use]
     pub fn new(max_entries: usize, max_bytes: u64, ttl_ms: u64) -> Self {
-        Self { entries: BTreeMap::new(), total_bytes: 0, max_entries, max_bytes, ttl_ms, rejected: 0 }
+        Self {
+            entries: BTreeMap::new(),
+            total_bytes: 0,
+            max_entries,
+            max_bytes,
+            ttl_ms,
+            rejected: 0,
+        }
     }
 
     /// Spill decision (task §10): at or below the inline cap the payload rides
@@ -205,7 +212,8 @@ impl PayloadBook {
         self.total_bytes = self.total_bytes.saturating_add(size_bytes);
         self.entries.insert(id.clone(), entry);
         Ok(PayloadDescriptor {
-            id,
+            // Cloned, not moved: `id` is still needed for the fetch path below.
+            id: id.clone(),
             token: token.to_string(),
             path: format!("/v1/payloads/{}", id.as_ref()),
             sha256,
@@ -269,12 +277,16 @@ impl PayloadBook {
         attempt: u32,
         now_ms: Timestamp,
     ) -> Result<&PayloadEntry, CoreError> {
-        let entry = self
-            .entries
-            .get(id)
-            .ok_or_else(|| CoreError::Queue(format!("payload {} is gone or expired", id.as_ref())))?;
-        if !crate::util::constant_time_eq(entry.token_digest.as_bytes(), sha256_hex(token.as_bytes()).as_bytes()) {
-            return Err(CoreError::Unauthorized("payload token does not match".to_string()));
+        let entry = self.entries.get(id).ok_or_else(|| {
+            CoreError::Queue(format!("payload {} is gone or expired", id.as_ref()))
+        })?;
+        if !crate::util::constant_time_eq(
+            entry.token_digest.as_bytes(),
+            sha256_hex(token.as_bytes()).as_bytes(),
+        ) {
+            return Err(CoreError::Unauthorized(
+                "payload token does not match".to_string(),
+            ));
         }
         match &entry.owner_worker {
             Some(owner) if owner == worker && entry.attempt == attempt => {}
@@ -290,7 +302,9 @@ impl PayloadBook {
             }
         }
         if now_ms >= entry.expires_ms {
-            return Err(CoreError::Unauthorized("payload reference expired".to_string()));
+            return Err(CoreError::Unauthorized(
+                "payload reference expired".to_string(),
+            ));
         }
         Ok(entry)
     }
@@ -355,7 +369,12 @@ pub struct ArtifactBook {
 impl ArtifactBook {
     /// New book rooted at `root` (server-side directory or object prefix).
     #[must_use]
-    pub fn new(root: impl Into<String>, max_bytes: u64, chunk_cap_bytes: usize, ttl_ms: u64) -> Self {
+    pub fn new(
+        root: impl Into<String>,
+        max_bytes: u64,
+        chunk_cap_bytes: usize,
+        ttl_ms: u64,
+    ) -> Self {
         Self {
             entries: BTreeMap::new(),
             total_bytes: 0,
@@ -368,8 +387,18 @@ impl ArtifactBook {
 
     /// Build the `Assigned.artifact_put` hint for an artifact slot.
     #[must_use]
-    pub fn upload_hint(&self, artifact: &ArtifactId, token: &str, expires_ms: Timestamp, chunk_bytes: usize) -> Option<ArtifactPut> {
-        let record = self.entries.get(artifact).map(|entry| entry.record.clone())?;
+    pub fn upload_hint(
+        &self,
+        artifact: &ArtifactId,
+        token: &str,
+        expires_ms: Timestamp,
+        chunk_bytes: usize,
+    ) -> Option<ArtifactPut> {
+        // Existence gate only. The stored record's own `path` is the hub-side
+        // location, which this worker-facing PUT hint deliberately does not leak.
+        if !self.entries.contains_key(artifact) {
+            return None;
+        }
         Some(ArtifactPut {
             artifact: artifact.to_string(),
             path: format!("/v1/artifacts/{}", artifact.as_ref()),
@@ -413,7 +442,9 @@ impl ArtifactBook {
             // its bytes must leave the shared budget here, or `total_bytes`
             // ratchets up on every retry and eventually refuses an upload that
             // fits `max_artifact_bytes`.
-            self.total_bytes = self.total_bytes.saturating_sub(previous.record.recorded_bytes());
+            self.total_bytes = self
+                .total_bytes
+                .saturating_sub(previous.record.recorded_bytes());
         }
         self.entries.insert(id, entry.clone());
         entry
@@ -450,7 +481,10 @@ impl ArtifactBook {
             });
         }
         let entry = self.entries.get_mut(id).ok_or_else(|| {
-            CoreError::Queue(format!("artifact {} is unknown or already expired", id.as_ref()))
+            CoreError::Queue(format!(
+                "artifact {} is unknown or already expired",
+                id.as_ref()
+            ))
         })?;
         if entry.owner_worker.as_ref() != Some(worker) || entry.attempt != attempt {
             return Err(CoreError::Unauthorized(
@@ -463,7 +497,9 @@ impl ArtifactBook {
             });
         }
         let projected = entry.record.recorded_bytes().saturating_add(chunk_bytes);
-        if projected > self.max_bytes || self.total_bytes.saturating_add(chunk_bytes) > self.max_bytes {
+        if projected > self.max_bytes
+            || self.total_bytes.saturating_add(chunk_bytes) > self.max_bytes
+        {
             return Err(CoreError::TooLarge {
                 what: "artifact total",
                 limit: self.max_bytes as usize,
@@ -573,7 +609,9 @@ impl ArtifactBook {
             .collect();
         for (id, _) in &stale {
             if let Some(entry) = self.entries.remove(id) {
-                self.total_bytes = self.total_bytes.saturating_sub(entry.record.recorded_bytes());
+                self.total_bytes = self
+                    .total_bytes
+                    .saturating_sub(entry.record.recorded_bytes());
             }
         }
         stale
@@ -587,7 +625,10 @@ impl ArtifactBook {
 /// [`CoreError::InvalidId`] when either component fails the alphabet check.
 pub fn artifact_path_checked(root: &str, job: &str, artifact: &str) -> Result<String, CoreError> {
     if !is_safe_id(job) {
-        return Err(CoreError::InvalidId { kind: "job path component", value: job.to_string() });
+        return Err(CoreError::InvalidId {
+            kind: "job path component",
+            value: job.to_string(),
+        });
     }
     if !is_safe_id(artifact) {
         return Err(CoreError::InvalidId {
@@ -615,7 +656,13 @@ mod tests {
         PayloadBook::new(4, 1 << 20, 5_000)
     }
 
-    fn register(b: &mut PayloadBook, job: &str, size: usize) -> PayloadDescriptor {
+    /// Budget-aware variant of [`register`]: keeps the `Result` so the spill-budget
+    /// tests can assert on the refusal instead of panicking inside the helper.
+    fn try_register(
+        b: &mut PayloadBook,
+        job: &str,
+        size: usize,
+    ) -> Result<PayloadDescriptor, CoreError> {
         let bytes = vec![7u8; size];
         let sha = sha256_hex(&bytes);
         b.register(
@@ -626,12 +673,18 @@ mod tests {
             "application/json".to_string(),
             1_000,
         )
-        .expect("register")
+    }
+
+    fn register(b: &mut PayloadBook, job: &str, size: usize) -> PayloadDescriptor {
+        try_register(b, job, size).expect("register")
     }
 
     #[test]
     fn spill_threshold_is_strictly_above_the_cap() {
-        assert!(!PayloadBook::needs_spill(8 << 20, 8 << 20), "exactly at the cap rides inline");
+        assert!(
+            !PayloadBook::needs_spill(8 << 20, 8 << 20),
+            "exactly at the cap rides inline"
+        );
         assert!(PayloadBook::needs_spill((8 << 20) + 1, 8 << 20));
     }
 
@@ -640,7 +693,10 @@ mod tests {
         // Anchor: services/molab/molab-strata-runtime.py:95-96 SHARD_TABLE sha
         // for shard 1 of the pinned GGUF. Recomputed here for a known input so
         // the digest helper is pinned against a real-world expectation.
-        assert_eq!(sha256_hex(b""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
         assert_eq!(
             sha256_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
@@ -670,7 +726,12 @@ mod tests {
             Err(CoreError::Unauthorized(_))
         ));
         b.assign_owner(&id, &w1, 1);
-        assert_eq!(b.authorize_fetch(&id, "tok", &w1, 1, 1_100).expect("ok").size_bytes, 4096);
+        assert_eq!(
+            b.authorize_fetch(&id, "tok", &w1, 1, 1_100)
+                .expect("ok")
+                .size_bytes,
+            4096
+        );
         // The wrong token is refused even with the right worker.
         assert!(matches!(
             b.authorize_fetch(&id, "wrong", &w1, 1, 1_100),
@@ -694,25 +755,41 @@ mod tests {
         assert!(b.authorize_fetch(&id, "tok", &w1, 1, 5_999).is_ok());
 
         b.record_fetch(&id);
-        assert_eq!(b.authorize_fetch(&id, "tok", &w1, 1, 1_100).expect("still ok").fetch_count, 1);
+        assert_eq!(
+            b.authorize_fetch(&id, "tok", &w1, 1, 1_100)
+                .expect("still ok")
+                .fetch_count,
+            1
+        );
         // Releasing for the job frees the bytes and invalidates the ref.
-        assert_eq!(b.release_for_job(&JobId::new_unchecked("job-a")), vec![id.clone()]);
+        assert_eq!(
+            b.release_for_job(&JobId::new_unchecked("job-a")),
+            vec![id.clone()]
+        );
         assert_eq!(b.bytes(), 0);
-        assert!(matches!(b.authorize_fetch(&id, "tok", &w1, 1, 1_100), Err(CoreError::Queue(_))));
+        assert!(matches!(
+            b.authorize_fetch(&id, "tok", &w1, 1, 1_100),
+            Err(CoreError::Queue(_))
+        ));
     }
 
     #[test]
     fn spill_budget_is_enforced_in_bytes_and_count() {
         let mut b = PayloadBook::new(2, 10_000, 1_000);
         register(&mut b, "job-1", 6_000);
-        let err = register(&mut b, "job-2", 6_000).expect_err("byte budget");
+        let err = try_register(&mut b, "job-2", 6_000).expect_err("byte budget");
         assert!(matches!(err, CoreError::Queue(_)), "{err}");
         assert_eq!(b.rejected(), 1);
         assert_eq!(b.len(), 1);
-        // Purge by TTL frees room, exactly at the boundary.
-        assert_eq!(b.purge_expired(999), Vec::<PayloadRefId>::new());
-        assert_eq!(b.purge_expired(1_000), vec![PayloadRefId::new_unchecked("job-1")]);
-        assert!(register(&mut b, "job-2", 6_000).is_ok());
+        // The TTL clock starts at registration: the helper registers at `now_ms =
+        // 1_000` and the book's ttl is 1_000, so the entry expires at 2_000 and
+        // `purge_expired` is inclusive at that instant (`now_ms >= expires_ms`).
+        assert_eq!(b.purge_expired(1_999), Vec::<PayloadRefId>::new());
+        assert_eq!(
+            b.purge_expired(2_000),
+            vec![PayloadRefId::new_unchecked("job-1")]
+        );
+        assert!(try_register(&mut b, "job-2", 6_000).is_ok());
         assert_eq!(b.bytes(), 6_000);
     }
 
@@ -731,8 +808,17 @@ mod tests {
         assert_eq!(a.get(&id).expect("entry").recorded_bytes(), 3_072);
         assert_eq!(a.bytes(), 3_072);
         // Chunk over cap is refused before any state change.
-        let err = a.record_chunk(&id, &w, 1, 2, 40_000, 1_300).expect_err("too big");
-        assert!(matches!(err, CoreError::TooLarge { what: "artifact chunk", limit: 32_768, .. }));
+        let err = a
+            .record_chunk(&id, &w, 1, 2, 40_000, 1_300)
+            .expect_err("too big");
+        assert!(matches!(
+            err,
+            CoreError::TooLarge {
+                what: "artifact chunk",
+                limit: 32_768,
+                ..
+            }
+        ));
         // Wrong owner is refused.
         assert!(matches!(
             a.record_chunk(&id, &WorkerId::new_unchecked("wkr-x"), 1, 3, 1, 1_300),
@@ -756,24 +842,44 @@ mod tests {
         assert_eq!(record.stored_sha256.as_deref(), Some(declared.as_str()));
         assert_eq!(record.size_bytes, 3_072);
         // Writing after completion is refused.
-        assert!(matches!(a.record_chunk(&id, &w, 1, 4, 1, 1_500), Err(CoreError::Protocol { .. })));
+        assert!(matches!(
+            a.record_chunk(&id, &w, 1, 4, 1, 1_500),
+            Err(CoreError::Protocol { .. })
+        ));
         // A mismatched digest must fail, not silently accept the worker's claim.
-        let bad = a.complete(&id, Some("00".repeat(32)), None, sha256_hex(b"x"), 1, None, 1_600);
-        assert!(matches!(bad, Err(CoreError::Protocol { reason }) if reason.contains("digest mismatch")));
+        let bad = a.complete(
+            &id,
+            Some("00".repeat(32)),
+            None,
+            sha256_hex(b"x"),
+            1,
+            None,
+            1_600,
+        );
+        assert!(
+            matches!(bad, Err(CoreError::Protocol { reason }) if reason.contains("digest mismatch"))
+        );
         // So must a mismatched size.
         let bad_size = a.complete(&id, None, Some(9_999), declared.clone(), 3_072, None, 1_700);
-        assert!(matches!(bad_size, Err(CoreError::Protocol { reason }) if reason.contains("size mismatch")));
+        assert!(
+            matches!(bad_size, Err(CoreError::Protocol { reason }) if reason.contains("size mismatch"))
+        );
     }
 
     #[test]
     fn artifact_ttl_purge_reports_paths_for_deletion() {
         let mut a = ArtifactBook::new("/tmp/art", 100_000, 1_024, 1_000);
         let job = JobId::new_unchecked("job-1");
-        a.register(&job, ArtifactId::new_unchecked("art-1"), 0);
+        // Slot allocation only: the purge assertion below reads the book itself, so
+        // the returned entry is not needed here.
+        let _ = a.register(&job, ArtifactId::new_unchecked("art-1"), 0);
         assert!(a.purge_expired(999).is_empty());
         assert_eq!(
             a.purge_expired(1_000),
-            vec![(ArtifactId::new_unchecked("art-1"), "/tmp/art/job-1/art-1".to_string())]
+            vec![(
+                ArtifactId::new_unchecked("art-1"),
+                "/tmp/art/job-1/art-1".to_string()
+            )]
         );
         assert_eq!(a.len(), 0);
     }
@@ -786,11 +892,17 @@ mod tests {
         );
         assert!(matches!(
             artifact_path_checked("root", "../etc", "art-1"),
-            Err(CoreError::InvalidId { kind: "job path component", .. })
+            Err(CoreError::InvalidId {
+                kind: "job path component",
+                ..
+            })
         ));
         assert!(matches!(
             artifact_path_checked("root", "job-1", "a/b"),
-            Err(CoreError::InvalidId { kind: "artifact path component", .. })
+            Err(CoreError::InvalidId {
+                kind: "artifact path component",
+                ..
+            })
         ));
         // Trailing separator on the root must not double up.
         assert_eq!(artifact_path("root/", "j", "a"), "root/j/a".to_string());

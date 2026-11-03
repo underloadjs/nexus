@@ -57,7 +57,10 @@ impl SeqTracker {
             SeqVerdict::Accepted
         } else {
             self.gaps += 1;
-            SeqVerdict::Gap { expected: self.last_accepted + 1, got: seq }
+            SeqVerdict::Gap {
+                expected: self.last_accepted + 1,
+                got: seq,
+            }
         };
         self.last_accepted = seq;
         verdict
@@ -130,7 +133,9 @@ impl ReplayBuffer {
         let mut evicted = Vec::new();
         self.frames.push_back(frame);
         self.bytes += size;
-        while self.frames.len() > self.max_frames || (self.bytes > self.max_bytes && self.frames.len() > 1) {
+        while self.frames.len() > self.max_frames
+            || (self.bytes > self.max_bytes && self.frames.len() > 1)
+        {
             if let Some(old) = self.frames.pop_front() {
                 self.bytes = self.bytes.saturating_sub(old.size_bytes());
                 self.dropped_frames += 1;
@@ -198,7 +203,13 @@ mod tests {
     use crate::protocol::FrameKind;
 
     fn frame(seq: u64, content: &str) -> BufferedFrame {
-        BufferedFrame { seq, kind: FrameKind::Delta, content: content.to_string(), artifact: None, received_ms: 0 }
+        BufferedFrame {
+            seq,
+            kind: FrameKind::Delta,
+            content: content.to_string(),
+            artifact: None,
+            received_ms: 0,
+        }
     }
 
     #[test]
@@ -206,9 +217,23 @@ mod tests {
         let mut t = SeqTracker::new();
         assert_eq!(t.accept(1), SeqVerdict::Accepted);
         assert_eq!(t.accept(2), SeqVerdict::Accepted);
-        assert_eq!(t.accept(5), SeqVerdict::Gap { expected: 3, got: 5 });
-        assert_eq!(t.accept(3), SeqVerdict::Duplicate, "an older seq is a duplicate");
-        assert_eq!(t.accept(0), SeqVerdict::Duplicate, "seq 0 means 'nothing yet'");
+        assert_eq!(
+            t.accept(5),
+            SeqVerdict::Gap {
+                expected: 3,
+                got: 5
+            }
+        );
+        assert_eq!(
+            t.accept(3),
+            SeqVerdict::Duplicate,
+            "an older seq is a duplicate"
+        );
+        assert_eq!(
+            t.accept(0),
+            SeqVerdict::Duplicate,
+            "seq 0 means 'nothing yet'"
+        );
         assert_eq!(t.acked_through(), 5);
         assert_eq!((t.duplicates(), t.gaps(), t.total_frames()), (2, 1, 5));
         assert!(t.done_is_current(5));
@@ -217,17 +242,30 @@ mod tests {
 
     #[test]
     fn replay_evicts_on_byte_bound_and_reports_loss() {
-        // 3 frames of ~50 bytes each into a 120-byte ring → oldest two evicted.
-        let mut ring = ReplayBuffer::new(64, 120);
-        ring.push(frame(1, &"x".repeat(60)));
-        ring.push(frame(2, &"y".repeat(60)));
-        ring.push(frame(3, &"z".repeat(60)));
+        // The ring's byte bound is clamped to 1 KiB (`ReplayBuffer::new`, mirroring
+        // `Limits::validate`'s "replay ring must hold at least 1 frame and 1 KiB"),
+        // so the frames have to be big enough for the byte bound to be the binding
+        // constraint: each entry costs `content.len() + 32` (model.rs), so three
+        // 500-byte frames are 532 each, and 2 × 532 = 1064 > 1024 evicts the oldest.
+        let mut ring = ReplayBuffer::new(64, 1_024);
+        ring.push(frame(1, &"x".repeat(500)));
+        ring.push(frame(2, &"y".repeat(500)));
+        ring.push(frame(3, &"z".repeat(500)));
         assert_eq!(ring.len(), 1);
         assert_eq!(ring.earliest_seq(), Some(3));
         assert_eq!(ring.dropped_frames(), 2);
-        assert!(ring.replay_is_lossy(1), "asking for seq 1 can no longer be gap-free");
-        assert!(!ring.replay_is_lossy(2), "seq 2 is the boundary: only seq 3 remains, which is contiguous after 2");
-        assert_eq!(ring.since(2).iter().map(|f| f.seq).collect::<Vec<_>>(), vec![3]);
+        assert!(
+            ring.replay_is_lossy(1),
+            "asking for seq 1 can no longer be gap-free"
+        );
+        assert!(
+            !ring.replay_is_lossy(2),
+            "seq 2 is the boundary: only seq 3 remains, which is contiguous after 2"
+        );
+        assert_eq!(
+            ring.since(2).iter().map(|f| f.seq).collect::<Vec<_>>(),
+            vec![3]
+        );
     }
 
     #[test]
@@ -237,7 +275,10 @@ mod tests {
             ring.push(frame(seq, "a"));
         }
         assert_eq!(ring.len(), 3);
-        assert_eq!(ring.since(0).iter().map(|f| f.seq).collect::<Vec<_>>(), vec![3, 4, 5]);
+        assert_eq!(
+            ring.since(0).iter().map(|f| f.seq).collect::<Vec<_>>(),
+            vec![3, 4, 5]
+        );
         // Byte bound can never drop the only frame, however large it is.
         let mut tight = ReplayBuffer::new(8, 1024);
         tight.push(frame(1, &"b".repeat(4096)));

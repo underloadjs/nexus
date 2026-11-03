@@ -96,15 +96,37 @@ pub struct RangeQuery {
 }
 
 /// Serve one spilled prompt to the worker that owns it.
-pub async fn fetch_payload(State(hub): State<Arc<Hub>>, Path(id): Path<String>, Query(query): Query<PayloadQuery>, headers: axum::http::HeaderMap) -> Response {
+pub async fn fetch_payload(
+    State(hub): State<Arc<Hub>>,
+    Path(id): Path<String>,
+    Query(query): Query<PayloadQuery>,
+    headers: axum::http::HeaderMap,
+) -> Response {
     let Some(reference) = PayloadRefId::parse(&id).ok() else {
-        return json_error(StatusCode::BAD_REQUEST, "invalid_id", "payload id is not in the safe alphabet");
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_id",
+            "payload id is not in the safe alphabet",
+        );
     };
-    let Some(token) = bearer(headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok())).or(query.token.as_deref()) else {
-        return json_error(StatusCode::UNAUTHORIZED, "unauthorized", "a payload reference needs its bearer token");
+    let Some(token) = bearer(
+        headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok()),
+    )
+    .or(query.token.as_deref()) else {
+        return json_error(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "a payload reference needs its bearer token",
+        );
     };
     let Ok(worker) = WorkerId::parse(&query.worker) else {
-        return json_error(StatusCode::BAD_REQUEST, "invalid_id", "worker id is not in the safe alphabet");
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_id",
+            "worker id is not in the safe alphabet",
+        );
     };
     let attempt = query.attempt.unwrap_or(1) as u32;
     // The actor answers: token digest, owning worker, owning attempt and the TTL
@@ -118,24 +140,59 @@ pub async fn fetch_payload(State(hub): State<Arc<Hub>>, Path(id): Path<String>, 
             .header("x-nexus-sha256", grant.sha256)
             .body(axum::body::Body::from(grant.bytes))
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
-        Some(grant) => json_error(StatusCode::FORBIDDEN, "payload_denied", grant.reason.as_deref().unwrap_or("denied")),
-        None => json_error(StatusCode::NOT_FOUND, "payload_unavailable", "the payload is gone, expired, or its pool is unknown"),
+        Some(grant) => json_error(
+            StatusCode::FORBIDDEN,
+            "payload_denied",
+            grant.reason.as_deref().unwrap_or("denied"),
+        ),
+        None => json_error(
+            StatusCode::NOT_FOUND,
+            "payload_unavailable",
+            "the payload is gone, expired, or its pool is unknown",
+        ),
     }
 }
 
 /// Accept one artifact chunk from its owning worker.
-pub async fn put_artifact(State(hub): State<Arc<Hub>>, Path(id): Path<String>, Query(query): Query<ArtifactQuery>, headers: axum::http::HeaderMap, body: Bytes) -> Response {
-    let Some(token) = bearer(headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok())).or(query.token.as_deref()) else {
-        return json_error(StatusCode::UNAUTHORIZED, "unauthorized", "an artifact upload needs its bearer token");
+pub async fn put_artifact(
+    State(hub): State<Arc<Hub>>,
+    Path(id): Path<String>,
+    Query(query): Query<ArtifactQuery>,
+    headers: axum::http::HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some(token) = bearer(
+        headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok()),
+    )
+    .or(query.token.as_deref()) else {
+        return json_error(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "an artifact upload needs its bearer token",
+        );
     };
     let Ok(artifact) = ArtifactId::parse(&id) else {
-        return json_error(StatusCode::BAD_REQUEST, "invalid_id", "artifact id is not in the safe alphabet");
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_id",
+            "artifact id is not in the safe alphabet",
+        );
     };
     let Ok(job) = JobId::parse(&query.job) else {
-        return json_error(StatusCode::BAD_REQUEST, "invalid_id", "job id is not in the safe alphabet");
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_id",
+            "job id is not in the safe alphabet",
+        );
     };
     let Ok(worker) = WorkerId::parse(&query.worker) else {
-        return json_error(StatusCode::BAD_REQUEST, "invalid_id", "worker id is not in the safe alphabet");
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_id",
+            "worker id is not in the safe alphabet",
+        );
     };
     let chunk = query.chunk.unwrap_or(0);
     let complete = query.complete.unwrap_or(0) == 1;
@@ -147,22 +204,47 @@ pub async fn put_artifact(State(hub): State<Arc<Hub>>, Path(id): Path<String>, Q
     // `Assigned.artifact_put.chunk_bytes`.
     let chunk_cap = hub.cfg.limits.artifact_chunk_bytes;
     if body.len() > chunk_cap {
-        return json_error(StatusCode::PAYLOAD_TOO_LARGE, "chunk_too_large", &format!("{} bytes exceeds the {chunk_cap} byte chunk cap", body.len()));
+        return json_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "chunk_too_large",
+            &format!(
+                "{} bytes exceeds the {chunk_cap} byte chunk cap",
+                body.len()
+            ),
+        );
     }
 
     // Bytes first: the hub measures what it actually stored, which is what makes
     // the declared digest verifiable instead of taken on trust (task §9).
-    let (path, written, digest) = match write_chunk(&hub.artifact_root, &job, &artifact, attempt, chunk, &body, complete).await {
+    let (path, written, digest) = match write_chunk(
+        &hub.artifact_root,
+        &job,
+        &artifact,
+        attempt,
+        chunk,
+        &body,
+        complete,
+    )
+    .await
+    {
         Ok(value) => value,
         Err(err) => {
             tracing::warn!(%job, %artifact, %err, "artifact write failed");
-            return json_error(StatusCode::INTERNAL_SERVER_ERROR, "artifact_write_failed", &err.to_string());
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "artifact_write_failed",
+                &err.to_string(),
+            );
         }
     };
     tracing::debug!(%job, %artifact, chunk, written, %path, "artifact chunk stored");
 
     let Some(handle) = hub.route_job(&job).await else {
-        return json_error(StatusCode::NOT_FOUND, "unknown_job", "no pool owns that job");
+        return json_error(
+            StatusCode::NOT_FOUND,
+            "unknown_job",
+            "no pool owns that job",
+        );
     };
     // The upload carries no socket, so the hub resolves the worker's live
     // generation; an absent one means the worker is already gone.
@@ -177,11 +259,18 @@ pub async fn put_artifact(State(hub): State<Arc<Hub>>, Path(id): Path<String>, Q
         chunk_bytes: written,
         complete,
         stored_sha256: complete.then_some(digest.clone()),
-        declared: DeclaredArtifact { sha256: query.sha256.clone(), size_bytes: query.size },
+        declared: DeclaredArtifact {
+            sha256: query.sha256.clone(),
+            size_bytes: query.size,
+        },
         content_type: query.content_type.clone(),
     };
     if state::send(handle.as_ref(), msg).await.is_err() {
-        return json_error(StatusCode::SERVICE_UNAVAILABLE, "hub_shutdown", "the pool actor is draining; retry");
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "hub_shutdown",
+            "the pool actor is draining; retry",
+        );
     }
     let body = serde_json::to_string(&serde_json::json!({
         "accepted_bytes": written,
@@ -191,22 +280,40 @@ pub async fn put_artifact(State(hub): State<Arc<Hub>>, Path(id): Path<String>, Q
         "token_hint": format!("{}…", &token[..token.len().min(8)]),
     }))
     .expect("object serializes");
-    (StatusCode::ACCEPTED, [(header::CONTENT_TYPE, "application/json")], body).into_response()
+    (
+        StatusCode::ACCEPTED,
+        [(header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+        .into_response()
 }
 
 /// `GET /v1/artifacts/{id}` — direct artifact download. The artifact id is derived
 /// from the job id (`art-<job>`, see `PoolActor::dispatch`), so the job is the
 /// routing key.
-pub async fn get_artifact(State(hub): State<Arc<Hub>>, headers: axum::http::HeaderMap, Path(id): Path<String>, Query(range): Query<RangeQuery>) -> Response {
+pub async fn get_artifact(
+    State(hub): State<Arc<Hub>>,
+    headers: axum::http::HeaderMap,
+    Path(id): Path<String>,
+    Query(range): Query<RangeQuery>,
+) -> Response {
     let tenant = match crate::consumer::tenant_of(&hub, &headers) {
         Ok(tenant) => tenant,
         Err(response) => return response,
     };
     let Some(job_name) = id.strip_prefix("art-") else {
-        return json_error(StatusCode::BAD_REQUEST, "invalid_artifact_id", "artifact ids are derived from their job id");
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_artifact_id",
+            "artifact ids are derived from their job id",
+        );
     };
     let Ok(job) = JobId::parse(job_name) else {
-        return json_error(StatusCode::BAD_REQUEST, "invalid_id", "the embedded job id is not safe");
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_id",
+            "the embedded job id is not safe",
+        );
     };
     let Some(view) = hub.job_snapshot(&job).await else {
         return json_error(StatusCode::NOT_FOUND, "unknown_job", "no such job");
@@ -215,12 +322,28 @@ pub async fn get_artifact(State(hub): State<Arc<Hub>>, headers: axum::http::Head
     // id used to be unauthenticated (§9 tenancy), and a foreign job answers `404`
     // so ids are not enumerable.
     if view.tenant != tenant {
-        return json_error(StatusCode::NOT_FOUND, "unknown_job", "no such job for this tenant");
+        return json_error(
+            StatusCode::NOT_FOUND,
+            "unknown_job",
+            "no such job for this tenant",
+        );
     }
     let Some(artifact) = view.artifact else {
-        return json_error(StatusCode::NOT_FOUND, "artifact_unavailable", "this job produced no artifact");
+        return json_error(
+            StatusCode::NOT_FOUND,
+            "artifact_unavailable",
+            "this job produced no artifact",
+        );
     };
-    serve_artifact(&artifact.path, artifact.size_bytes, &artifact.content_type, artifact.stored_sha256.as_deref(), range.from.unwrap_or(0), range.to.unwrap_or(artifact.size_bytes)).await
+    serve_artifact(
+        &artifact.path,
+        artifact.size_bytes,
+        &artifact.content_type,
+        artifact.stored_sha256.as_deref(),
+        range.from.unwrap_or(0),
+        range.to.unwrap_or(artifact.size_bytes),
+    )
+    .await
 }
 
 /// Bytes copied per poll while streaming an artifact range.
@@ -254,7 +377,14 @@ const STREAM_INFLIGHT_CHUNKS: usize = 4;
 ///   digest-checked without reading the whole object (which is exactly what this
 ///   function must not do), so `x-nexus-sha256` is documented as the digest of the
 ///   whole artifact, never of the range.
-pub async fn serve_artifact(path: &str, size: u64, content_type: &str, sha256: Option<&str>, from: u64, to: u64) -> Response {
+pub async fn serve_artifact(
+    path: &str,
+    size: u64,
+    content_type: &str,
+    sha256: Option<&str>,
+    from: u64,
+    to: u64,
+) -> Response {
     let to = to.min(size);
     // `from >= size` is unsatisfiable for a non-empty object; `from > to` can only
     // happen when the client asked for a backwards range (`?from=10&to=4`).
@@ -270,37 +400,58 @@ pub async fn serve_artifact(path: &str, size: u64, content_type: &str, sha256: O
         Ok(file) => file,
         Err(err) => {
             tracing::warn!(%path, %err, "artifact read failed");
-            return json_error(StatusCode::NOT_FOUND, "artifact_unavailable", "the artifact file is missing");
+            return json_error(
+                StatusCode::NOT_FOUND,
+                "artifact_unavailable",
+                "the artifact file is missing",
+            );
         }
     };
     match file.metadata().await {
         Ok(meta) if meta.len() >= to => {}
         Ok(meta) => {
             tracing::error!(%path, recorded = size, on_disk = meta.len(), "artifact is shorter than the recorded size");
-            return json_error(StatusCode::INTERNAL_SERVER_ERROR, "artifact_incomplete", "the stored artifact is shorter than its recorded size");
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "artifact_incomplete",
+                "the stored artifact is shorter than its recorded size",
+            );
         }
         Err(err) => {
             tracing::warn!(%path, %err, "artifact stat failed");
-            return json_error(StatusCode::NOT_FOUND, "artifact_unavailable", "the artifact file is missing");
+            return json_error(
+                StatusCode::NOT_FOUND,
+                "artifact_unavailable",
+                "the artifact file is missing",
+            );
         }
     }
     // Seek before the status is committed: a failed seek is a `404`, not a body
     // that starts and stops. Everything after this point reads forward only.
     if let Err(err) = file.seek(std::io::SeekFrom::Start(from)).await {
         tracing::warn!(%path, %err, from, "artifact seek failed");
-        return json_error(StatusCode::NOT_FOUND, "artifact_unavailable", "the artifact file is missing");
+        return json_error(
+            StatusCode::NOT_FOUND,
+            "artifact_unavailable",
+            "the artifact file is missing",
+        );
     }
 
     // A whole-object read is the one case where the digest is verifiable while
     // streaming, so it is verified; partial reads keep the digest as an
     // out-of-band value the consumer can check after assembling ranges.
-    let verify = sha256.filter(|_| from == 0 && to == size && size > 0).map(str::to_string);
+    let verify = sha256
+        .filter(|_| from == 0 && to == size && size > 0)
+        .map(str::to_string);
     let declared = sha256.map(str::to_string);
     let path_owned = path.to_string();
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(STREAM_INFLIGHT_CHUNKS);
+    let (tx, rx) =
+        tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(STREAM_INFLIGHT_CHUNKS);
     tokio::spawn(async move {
         let mut reader = file.take(length);
-        let mut hasher = verify.as_ref().map(|_| <sha2::Sha256 as sha2::Digest>::new());
+        let mut hasher = verify
+            .as_ref()
+            .map(|_| <sha2::Sha256 as sha2::Digest>::new());
         let mut buffer = vec![0u8; STREAM_CHUNK_BYTES as usize];
         let mut streamed = 0u64;
         loop {
@@ -312,7 +463,11 @@ pub async fn serve_artifact(path: &str, size: u64, content_type: &str, sha256: O
                         sha2::Digest::update(h, &buffer[..read]);
                     }
                     // The peer hung up: stop reading, do not spin on a closed body.
-                    if tx.send(Ok(Bytes::copy_from_slice(&buffer[..read]))).await.is_err() {
+                    if tx
+                        .send(Ok(Bytes::copy_from_slice(&buffer[..read])))
+                        .await
+                        .is_err()
+                    {
                         tracing::debug!(path = %path_owned, streamed, "artifact download consumer hung up mid-range");
                         return;
                     }
@@ -328,21 +483,37 @@ pub async fn serve_artifact(path: &str, size: u64, content_type: &str, sha256: O
             // EOF before the declared length: the body is short, so the status
             // (200/206) was a lie. Abort rather than answer a silent truncation.
             tracing::error!(path = %path_owned, streamed, expected = length, "artifact range ended early");
-            let _ = tx.send(Err(std::io::Error::other("the artifact ended before the requested range"))).await;
+            let _ = tx
+                .send(Err(std::io::Error::other(
+                    "the artifact ended before the requested range",
+                )))
+                .await;
             return;
         }
-        if let (Some(expected), Some(h)) = (verify.as_ref(), hasher.as_ref()) {
-            let digest = sha2::Digest::finalize(h.clone());
-            let actual = nexus_core::store::sha256_hex(&digest[..]);
+        if let (Some(expected), Some(h)) = (verify, hasher) {
+            // `sha256_hex` digests *its input*, so feeding it the already-final
+            // digest would hex a hash of a hash and abort every correct download.
+            // The streaming path must hex the 32 digest bytes instead (test 15:
+            // the recorded digest is the object's own sha256).
+            let digest = sha2::Digest::finalize(h);
+            let actual: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
             if actual != *expected {
                 tracing::error!(path = %path_owned, expected, actual, "stored artifact digest does not match its bytes");
-                let _ = tx.send(Err(std::io::Error::other("the artifact does not match its recorded digest"))).await;
+                let _ = tx
+                    .send(Err(std::io::Error::other(
+                        "the artifact does not match its recorded digest",
+                    )))
+                    .await;
             }
         }
     });
 
     let mut builder = Response::builder()
-        .status(if partial { StatusCode::PARTIAL_CONTENT } else { StatusCode::OK })
+        .status(if partial {
+            StatusCode::PARTIAL_CONTENT
+        } else {
+            StatusCode::OK
+        })
         .header(header::CONTENT_TYPE, content_type)
         .header(header::CONTENT_LENGTH, length)
         .header(header::ACCEPT_RANGES, "bytes");
@@ -351,7 +522,10 @@ pub async fn serve_artifact(path: &str, size: u64, content_type: &str, sha256: O
         builder = builder.header("x-nexus-sha256", sha);
     }
     if partial {
-        builder = builder.header(header::CONTENT_RANGE, format!("bytes {from}-{}", to.saturating_sub(1)));
+        builder = builder.header(
+            header::CONTENT_RANGE,
+            format!("bytes {from}-{}", to.saturating_sub(1)),
+        );
     }
     builder
         .body(axum::body::Body::from_stream(ReceiverStream::new(rx)))
@@ -366,7 +540,12 @@ fn range_unsatisfiable(size: u64) -> Response {
             (header::CONTENT_RANGE, format!("bytes */{size}")),
             (header::CONTENT_TYPE, "application/json".to_string()),
         ],
-        serde_json::to_string(&nexus_core::adapters::http_error("range_unsatisfiable", "the requested range is outside the artifact", false)).unwrap_or_else(|_| "{}".to_string()),
+        serde_json::to_string(&nexus_core::adapters::http_error(
+            "range_unsatisfiable",
+            "the requested range is outside the artifact",
+            false,
+        ))
+        .unwrap_or_else(|_| "{}".to_string()),
     )
         .into_response()
 }
@@ -376,7 +555,15 @@ fn range_unsatisfiable(size: u64) -> Response {
 /// Returns `(path, bytes_written, sha256 of the whole assembled artifact so far)`.
 /// When `complete` is set the parts are concatenated into the final object, so a
 /// consumer download reads one file.
-async fn write_chunk(root: &str, job: &JobId, artifact: &ArtifactId, attempt: u32, chunk: u64, body: &[u8], complete: bool) -> anyhow::Result<(String, u64, String)> {
+async fn write_chunk(
+    root: &str,
+    job: &JobId,
+    artifact: &ArtifactId,
+    attempt: u32,
+    chunk: u64,
+    body: &[u8],
+    complete: bool,
+) -> anyhow::Result<(String, u64, String)> {
     // Reject traversal before touching the filesystem (task §9 "secure paths").
     let base = artifact_path_checked(root, job.as_ref(), artifact.as_ref())?;
     // Parts are scoped **per attempt**. `ArtifactBook::register` re-opens the same
@@ -434,12 +621,18 @@ pub async fn delete_artifact(path: &str) {
 /// Create the artifact root at startup, so a first upload cannot fail on a missing
 /// directory.
 pub async fn ensure_root(root: &str) -> anyhow::Result<()> {
-    tokio::fs::create_dir_all(root).await.map_err(|err| anyhow::anyhow!("cannot create artifact root {root}: {err}"))
+    tokio::fs::create_dir_all(root)
+        .await
+        .map_err(|err| anyhow::anyhow!("cannot create artifact root {root}: {err}"))
 }
 
 /// An OpenAI-shaped JSON error body.
 fn json_error(status: StatusCode, code: &str, message: &str) -> Response {
-    let body = nexus_core::adapters::http_error(code, message, status == StatusCode::SERVICE_UNAVAILABLE || status == StatusCode::TOO_MANY_REQUESTS);
+    let body = nexus_core::adapters::http_error(
+        code,
+        message,
+        status == StatusCode::SERVICE_UNAVAILABLE || status == StatusCode::TOO_MANY_REQUESTS,
+    );
     let text = serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string());
     (status, [(header::CONTENT_TYPE, "application/json")], text).into_response()
 }
@@ -506,7 +699,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("scratch directory");
         let path = dir.join("object.bin");
-        tokio::fs::write(&path, bytes).await.expect("scratch object");
+        tokio::fs::write(&path, bytes)
+            .await
+            .expect("scratch object");
         path.display().to_string()
     }
 
@@ -527,8 +722,16 @@ mod tests {
     async fn drain(response: Response) -> Served {
         // Header names are `HeaderName` values here: `HeaderMap::get` is generic over
         // `AsHeaderName`, and `&HeaderName` is an implementor that needs no conversion.
-        let headers = response.headers();
-        let read = |name: &axum::http::HeaderName| headers.get(name).and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
+        // The map is cloned so the header reads do not keep `response` borrowed past
+        // `into_body()` — consuming the body is what takes ownership of the response.
+        let headers = response.headers().clone();
+        let read = |name: &axum::http::HeaderName| {
+            headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string()
+        };
         let status = response.status();
         let content_length = read(&header::CONTENT_LENGTH).parse().unwrap_or(usize::MAX) as u64;
         let body = response.into_body();
@@ -571,17 +774,51 @@ mod tests {
         let digest = nexus_core::store::sha256_hex(&bytes);
         let path = object("full_stream", &bytes).await;
 
-        let served = drain(serve_artifact(&path, bytes.len() as u64, "application/octet-stream", Some(&digest), 0, bytes.len() as u64).await);
+        let served = drain(
+            serve_artifact(
+                &path,
+                bytes.len() as u64,
+                "application/octet-stream",
+                Some(&digest),
+                0,
+                bytes.len() as u64,
+            )
+            .await,
+        )
+        .await;
 
         assert_eq!(served.status, StatusCode::OK);
-        assert_eq!(served.content_length, 200_000, "the length header is the object length");
+        assert_eq!(
+            served.content_length, 200_000,
+            "the length header is the object length"
+        );
         assert_eq!(served.bytes, bytes, "every byte arrives, in order");
-        assert!(served.chunks.len() >= 4, "the body arrives as {} chunks, not one whole-object buffer", served.chunks.len());
-        assert!(served.chunks.iter().all(|chunk| *chunk <= STREAM_CHUNK_BYTES as usize), "no chunk exceeds the stream bound: {:?}", served.chunks);
+        assert!(
+            served.chunks.len() >= 4,
+            "the body arrives as {} chunks, not one whole-object buffer",
+            served.chunks.len()
+        );
+        assert!(
+            served
+                .chunks
+                .iter()
+                .all(|chunk| *chunk <= STREAM_CHUNK_BYTES as usize),
+            "no chunk exceeds the stream bound: {:?}",
+            served.chunks
+        );
         assert_eq!(served.accept_ranges, "bytes");
-        assert_eq!(served.digest, digest, "the whole-object digest is published");
-        assert_eq!(served.content_range, "", "a full read is not a partial response");
-        assert_eq!(served.error, None, "a matching digest must not abort the body");
+        assert_eq!(
+            served.digest, digest,
+            "the whole-object digest is published"
+        );
+        assert_eq!(
+            served.content_range, "",
+            "a full read is not a partial response"
+        );
+        assert_eq!(
+            served.error, None,
+            "a matching digest must not abort the body"
+        );
     }
 
     /// A partial read carries **only** the slice: the response body length is the
@@ -592,15 +829,37 @@ mod tests {
         let digest = nexus_core::store::sha256_hex(&bytes);
         let path = object("partial_slice", &bytes).await;
 
-        let served = drain(serve_artifact(&path, bytes.len() as u64, "application/octet-stream", Some(&digest), 100_000, 150_000).await);
+        let served = drain(
+            serve_artifact(
+                &path,
+                bytes.len() as u64,
+                "application/octet-stream",
+                Some(&digest),
+                100_000,
+                150_000,
+            )
+            .await,
+        )
+        .await;
 
         assert_eq!(served.status, StatusCode::PARTIAL_CONTENT);
         assert_eq!(served.content_length, 50_000);
-        assert_eq!(served.bytes, &bytes[100_000..150_000], "the window is exact, neither shifted nor padded");
+        assert_eq!(
+            served.bytes,
+            &bytes[100_000..150_000],
+            "the window is exact, neither shifted nor padded"
+        );
         assert_eq!(served.content_range, "bytes 100000-149999");
-        assert_eq!(served.digest, digest, "the header is the object digest, never a range digest");
+        assert_eq!(
+            served.digest, digest,
+            "the header is the object digest, never a range digest"
+        );
         assert_eq!(served.error, None);
-        assert_ne!(served.bytes.len(), bytes.len(), "the object itself was never read whole");
+        assert_ne!(
+            served.bytes.len(),
+            bytes.len(),
+            "the object itself was never read whole"
+        );
     }
 
     /// An inverted range and a range that starts past the end are both refused with
@@ -610,17 +869,62 @@ mod tests {
         let bytes = payload(1_000);
         let path = object("unsatisfiable", &bytes).await;
 
-        let backwards = drain(serve_artifact(&path, bytes.len() as u64, "application/octet-stream", None, 10, 4).await);
+        let backwards = drain(
+            serve_artifact(
+                &path,
+                bytes.len() as u64,
+                "application/octet-stream",
+                None,
+                10,
+                4,
+            )
+            .await,
+        )
+        .await;
         assert_eq!(backwards.status, StatusCode::RANGE_NOT_SATISFIABLE);
         assert_eq!(backwards.content_range, "bytes */1000");
-        assert!(backwards.text.contains("range_unsatisfiable"), "the error body names the code: {}", backwards.text);
-        assert!(backwards.bytes.len() < 200, "the answer is the error object, not the artifact: {} bytes", backwards.bytes.len());
+        assert!(
+            backwards.text.contains("range_unsatisfiable"),
+            "the error body names the code: {}",
+            backwards.text
+        );
+        assert!(
+            backwards.bytes.len() < 200,
+            "the answer is the error object, not the artifact: {} bytes",
+            backwards.bytes.len()
+        );
 
-        let past_end = drain(serve_artifact(&path, bytes.len() as u64, "application/octet-stream", None, 1_000, 1_010).await);
-        assert_eq!(past_end.status, StatusCode::RANGE_NOT_SATISFIABLE, "a range starting at or past EOF is unsatisfiable");
+        let past_end = drain(
+            serve_artifact(
+                &path,
+                bytes.len() as u64,
+                "application/octet-stream",
+                None,
+                1_000,
+                1_010,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            past_end.status,
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            "a range starting at or past EOF is unsatisfiable"
+        );
 
         // An *open-ended* range is satisfiable and clamps, per RFC 9110 §14.21.1.
-        let clamped = drain(serve_artifact(&path, bytes.len() as u64, "application/octet-stream", None, 900, 5_000).await);
+        let clamped = drain(
+            serve_artifact(
+                &path,
+                bytes.len() as u64,
+                "application/octet-stream",
+                None,
+                900,
+                5_000,
+            )
+            .await,
+        )
+        .await;
         assert_eq!(clamped.status, StatusCode::PARTIAL_CONTENT);
         assert_eq!(clamped.content_length, 100);
         assert_eq!(clamped.bytes, &bytes[900..1_000]);
@@ -628,10 +932,28 @@ mod tests {
         // A whole 64 KiB range of a 256 KiB object stays inside the stream bound.
         let big = payload(262_144);
         let big_path = object("unsatisfiable_big", &big).await;
-        let window = drain(serve_artifact(&big_path, big.len() as u64, "application/octet-stream", None, 131_072, 196_608).await);
+        let window = drain(
+            serve_artifact(
+                &big_path,
+                big.len() as u64,
+                "application/octet-stream",
+                None,
+                131_072,
+                196_608,
+            )
+            .await,
+        )
+        .await;
         assert_eq!(window.status, StatusCode::PARTIAL_CONTENT);
         assert_eq!(window.bytes, &big[131_072..196_608]);
-        assert!(window.chunks.iter().all(|chunk| *chunk <= STREAM_CHUNK_BYTES as usize), "{:?}", window.chunks);
+        assert!(
+            window
+                .chunks
+                .iter()
+                .all(|chunk| *chunk <= STREAM_CHUNK_BYTES as usize),
+            "{:?}",
+            window.chunks
+        );
     }
 
     /// The recorded size outrunning the bytes on disk (an interrupted assembly) is
@@ -641,11 +963,21 @@ mod tests {
         let bytes = payload(1_000);
         let path = object("short_object", &bytes).await;
 
-        let served = drain(serve_artifact(&path, 4_000, "application/octet-stream", None, 0, 4_000).await);
+        let served =
+            drain(serve_artifact(&path, 4_000, "application/octet-stream", None, 0, 4_000).await)
+                .await;
 
         assert_eq!(served.status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert!(served.text.contains("artifact_incomplete"), "the answer names the corruption: {}", served.text);
-        assert!(served.bytes.len() < 200, "the object was not streamed once its length was found wrong: {} bytes", served.bytes.len());
+        assert!(
+            served.text.contains("artifact_incomplete"),
+            "the answer names the corruption: {}",
+            served.text
+        );
+        assert!(
+            served.bytes.len() < 200,
+            "the object was not streamed once its length was found wrong: {} bytes",
+            served.bytes.len()
+        );
     }
 
     /// A stored object whose bytes disagree with its digest aborts the body after
@@ -656,25 +988,51 @@ mod tests {
         let bytes = payload(150_000);
         let path = object("digest_mismatch", &bytes).await;
 
-        let served = drain(serve_artifact(&path, bytes.len() as u64, "application/octet-stream", Some(&"0".repeat(64)), 0, bytes.len() as u64).await);
+        let served = drain(
+            serve_artifact(
+                &path,
+                bytes.len() as u64,
+                "application/octet-stream",
+                Some(&"0".repeat(64)),
+                0,
+                bytes.len() as u64,
+            )
+            .await,
+        )
+        .await;
 
-        assert_eq!(served.status, StatusCode::OK, "the digest is only knowable once the bytes have been read");
+        assert_eq!(
+            served.status,
+            StatusCode::OK,
+            "the digest is only knowable once the bytes have been read"
+        );
         assert_eq!(served.bytes, bytes, "the bytes are still delivered");
-        let error = served.error.expect("a mismatched digest must end the body with an error");
-        assert!(error.contains("digest"), "the abort reason is the digest: {error}");
+        let error = served
+            .error
+            .expect("a mismatched digest must end the body with an error");
+        assert!(
+            error.contains("digest"),
+            "the abort reason is the digest: {error}"
+        );
     }
 
     /// A missing file is a status, and a zero-length object is a valid empty answer.
     #[tokio::test]
     async fn missing_objects_answer_404_and_empty_ones_answer_200() {
         // A path under the scratch root that no test ever writes to.
-        let missing_path = test_scratch("nope").join("object.bin").display().to_string();
-        let missing = drain(serve_artifact(&missing_path, 10, "application/octet-stream", None, 0, 10).await);
+        let missing_path = test_scratch("nope")
+            .join("object.bin")
+            .display()
+            .to_string();
+        let missing =
+            drain(serve_artifact(&missing_path, 10, "application/octet-stream", None, 0, 10).await)
+                .await;
         assert_eq!(missing.status, StatusCode::NOT_FOUND);
         assert!(missing.text.contains("artifact_unavailable"));
 
         let path = object("empty_object", b"").await;
-        let empty = drain(serve_artifact(&path, 0, "application/octet-stream", None, 0, 0).await);
+        let empty =
+            drain(serve_artifact(&path, 0, "application/octet-stream", None, 0, 0).await).await;
         assert_eq!(empty.status, StatusCode::OK);
         assert_eq!(empty.content_length, 0);
         assert!(empty.bytes.is_empty());

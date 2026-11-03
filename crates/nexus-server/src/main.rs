@@ -1,3 +1,7 @@
+// Test builds may be blunt (workspace lint policy, see Cargo.toml): `io::tests`
+// and `runtime_e2e` assert with `expect`, which is what an assertion is.
+#![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
+
 mod consumer;
 mod io;
 #[cfg(test)]
@@ -33,8 +37,11 @@ const DEFAULT_BODY_LIMIT: usize = 64 << 20;
 async fn main() -> anyhow::Result<()> {
     // Structured logs; RUST_LOG wins, default keeps the hub quiet but useful.
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,nexus_server=info,nexus_core=warn")))
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new("info,nexus_server=info,nexus_core=warn")
+            }),
+        )
         .with_target(false)
         .init();
 
@@ -43,14 +50,18 @@ async fn main() -> anyhow::Result<()> {
     // that does not parse (a typo in a field name, a truncated document) must
     // stop the hub here rather than boot it on the built-in sample pools with no
     // credentials, which is what silently keeping the defaults used to do.
-    let mut cfg = BrokerConfig::from_values_checked(&values)
+    let cfg = BrokerConfig::from_values_checked(&values)
         .map_err(|e| anyhow::anyhow!("configuration refused startup: {e}"))?;
     cfg.validate()
         .map_err(|e| anyhow::anyhow!("configuration refused startup: {e}"))?;
     let listen: SocketAddr = values
         .get(LISTEN_ENV)
         .and_then(|v| v.parse().ok())
-        .unwrap_or_else(|| DEFAULT_LISTEN.parse().expect("built-in listen address parses"));
+        .unwrap_or_else(|| {
+            DEFAULT_LISTEN
+                .parse()
+                .expect("built-in listen address parses")
+        });
     let artifact_root = values
         .get(ARTIFACT_ROOT_ENV)
         .cloned()
@@ -99,14 +110,23 @@ pub fn app(hub: Arc<Hub>, body_limit: usize) -> Router {
         // ---- consumer surface (task §7.1) ----
         .route("/v1/chat/completions", post(consumer::chat_completions))
         .route("/v1/completions", post(consumer::completions))
-        .route("/v1/jobs", post(consumer::create_job).get(consumer::list_jobs))
-        .route("/v1/jobs/{id}", get(consumer::job_status).delete(consumer::cancel_job))
+        .route(
+            "/v1/jobs",
+            post(consumer::create_job).get(consumer::list_jobs),
+        )
+        .route(
+            "/v1/jobs/{id}",
+            get(consumer::job_status).delete(consumer::cancel_job),
+        )
         .route("/v1/jobs/{id}/events", get(consumer::job_events))
         .route("/v1/jobs/{id}/result", get(consumer::job_result))
         .route("/v1/models", get(consumer::models))
         // ---- payload and artifact bulk transfer (task §10) ----
         .route("/v1/payloads/{id}", get(io::fetch_payload))
-        .route("/v1/artifacts/{id}", get(io::get_artifact).put(io::put_artifact))
+        .route(
+            "/v1/artifacts/{id}",
+            get(io::get_artifact).put(io::put_artifact),
+        )
         // ---- operations: open on purpose, a load balancer has no API key ----
         .route("/healthz", get(consumer::healthz))
         .route("/metrics", get(consumer::metrics))

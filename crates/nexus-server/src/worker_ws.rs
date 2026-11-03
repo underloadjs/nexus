@@ -20,9 +20,9 @@ use futures_util::SinkExt;
 use futures_util::StreamExt;
 use nexus_core::auth::bearer;
 use nexus_core::ids::WorkerId;
-use nexus_core::protocol::ByeReason;
 use nexus_core::protocol::decode_worker_frame;
 use nexus_core::protocol::encode_line;
+use nexus_core::protocol::ByeReason;
 use nexus_core::protocol::WorkerFrame;
 use nexus_core::ActorMsg;
 use nexus_core::HubFrame;
@@ -44,7 +44,12 @@ const HANDSHAKE_TIMEOUT_SECS: u64 = 20;
 
 /// Upgrade handler: the pool token is checked **before** the upgrade, so an
 /// unauthenticated host never becomes a connection the hub has to track.
-pub async fn upgrade(State(hub): State<Arc<Hub>>, ws: WebSocketUpgrade, headers: axum::http::HeaderMap, uri: Uri) -> Response {
+pub async fn upgrade(
+    State(hub): State<Arc<Hub>>,
+    ws: WebSocketUpgrade,
+    headers: axum::http::HeaderMap,
+    uri: Uri,
+) -> Response {
     let token = bearer(
         headers
             .get(header::AUTHORIZATION)
@@ -63,7 +68,12 @@ pub async fn upgrade(State(hub): State<Arc<Hub>>, ws: WebSocketUpgrade, headers:
         Ok(label) => ws.on_upgrade(move |socket| session(socket, hub, label)),
         Err(err) => {
             tracing::warn!(%err, "worker upgrade refused");
-            (StatusCode::UNAUTHORIZED, [(header::WWW_AUTHENTICATE, "Bearer")], format!("{err}\n")).into_response()
+            (
+                StatusCode::UNAUTHORIZED,
+                [(header::WWW_AUTHENTICATE, "Bearer")],
+                format!("{err}\n"),
+            )
+                .into_response()
         }
     }
 }
@@ -73,7 +83,12 @@ async fn session(socket: axum::extract::ws::WebSocket, hub: Arc<Hub>, token_labe
     let (mut sink, mut stream) = socket.split();
 
     // 1. Handshake: the first frame must be a valid `Hello`.
-    let first = match tokio::time::timeout(std::time::Duration::from_secs(HANDSHAKE_TIMEOUT_SECS), stream.next()).await {
+    let first = match tokio::time::timeout(
+        std::time::Duration::from_secs(HANDSHAKE_TIMEOUT_SECS),
+        stream.next(),
+    )
+    .await
+    {
         Ok(Some(Ok(Message::Text(text)))) => text.to_string(),
         Ok(Some(Ok(Message::Binary(bytes)))) => String::from_utf8_lossy(&bytes).into_owned(),
         Ok(Some(Ok(Message::Close(_)))) | Ok(Some(Err(_))) | Ok(None) => return,
@@ -91,7 +106,10 @@ async fn session(socket: axum::extract::ws::WebSocket, hub: Arc<Hub>, token_labe
     let frame = match decode_worker_frame(first.trim(), &caps) {
         Ok(frame) => frame,
         Err(err) => {
-            let reject = HubFrame::Reject { code: err.code().to_string(), message: err.to_string() };
+            let reject = HubFrame::Reject {
+                code: err.code().to_string(),
+                message: err.to_string(),
+            };
             if let Ok(text) = encode_line(&reject, &hub.cfg.limits.hub_caps()) {
                 let _ = sink.send(Message::Text(text.into())).await;
             }
@@ -99,7 +117,10 @@ async fn session(socket: axum::extract::ws::WebSocket, hub: Arc<Hub>, token_labe
             return;
         }
     };
-    let WorkerFrame::Hello { worker_id, pools, .. } = &frame else {
+    let WorkerFrame::Hello {
+        worker_id, pools, ..
+    } = &frame
+    else {
         tracing::warn!(%token_label, "first worker frame was not a hello");
         return;
     };
@@ -149,16 +170,35 @@ async fn session(socket: axum::extract::ws::WebSocket, hub: Arc<Hub>, token_labe
         // to be closed here, from the registry entry that pointed at it.
         let previous = {
             let mut workers = handle.workers.lock().await;
-            workers.insert(worker.clone(), WorkerConn { conn, tx: out_tx.clone() })
+            workers.insert(
+                worker.clone(),
+                WorkerConn {
+                    conn,
+                    tx: out_tx.clone(),
+                },
+            )
         };
         if let Some(stale) = previous.filter(|previous| previous.conn != conn) {
-            if let Ok(line) = encode_line(&HubFrame::Bye { reason: ByeReason::Evicted }, &hub.cfg.limits.hub_caps()) {
+            if let Ok(line) = encode_line(
+                &HubFrame::Bye {
+                    reason: ByeReason::Evicted,
+                },
+                &hub.cfg.limits.hub_caps(),
+            ) {
                 let _ = stale.tx.send(WorkerWrite::Frame(line)).await;
             }
             let _ = stale.tx.send(WorkerWrite::Close).await;
             tracing::info!(%worker, stale_conn = stale.conn, conn, "a newer socket took over this worker id");
         }
-        let _ = state::send(handle.as_ref(), ActorMsg::Hello { worker: worker.clone(), conn, hello: nexus_core::HelloInput::from_frame(&frame).unwrap_or_default() }).await;
+        let _ = state::send(
+            handle.as_ref(),
+            ActorMsg::Hello {
+                worker: worker.clone(),
+                conn,
+                hello: nexus_core::HelloInput::from_frame(&frame).unwrap_or_default(),
+            },
+        )
+        .await;
     }
     tracing::info!(%worker, %token_label, conn, pools = handles.len(), "worker joined");
 
@@ -176,7 +216,11 @@ async fn session(socket: axum::extract::ws::WebSocket, hub: Arc<Hub>, token_labe
             Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
         };
         // A message may hold several lines; the codec enforces the caps either way.
-        let lines: Vec<String> = next.split('\n').map(str::to_string).filter(|l| !l.trim().is_empty()).collect();
+        let lines: Vec<String> = next
+            .split('\n')
+            .map(str::to_string)
+            .filter(|l| !l.trim().is_empty())
+            .collect();
         for line in lines {
             // A frame this hub cannot decode means the peer and the hub are out
             // of step (or someone is fuzzing the socket). Dropping the rest of
@@ -189,7 +233,17 @@ async fn session(socket: axum::extract::ws::WebSocket, hub: Arc<Hub>, token_labe
                 break 'read;
             };
             for handle in &handles {
-                if state::send(handle.as_ref(), ActorMsg::WorkerFrame { worker: worker.clone(), conn, frame: frame.clone() }).await.is_err() {
+                if state::send(
+                    handle.as_ref(),
+                    ActorMsg::WorkerFrame {
+                        worker: worker.clone(),
+                        conn,
+                        frame: frame.clone(),
+                    },
+                )
+                .await
+                .is_err()
+                {
                     tracing::error!(%worker, "pool actor mailbox closed");
                     break 'read;
                 }
@@ -201,10 +255,20 @@ async fn session(socket: axum::extract::ws::WebSocket, hub: Arc<Hub>, token_labe
     //    may already have replaced it (eviction).
     for handle in &handles {
         let mut workers = handle.workers.lock().await;
-        if workers.get(&worker).is_some_and(|existing| existing.conn == conn) {
+        if workers
+            .get(&worker)
+            .is_some_and(|existing| existing.conn == conn)
+        {
             workers.remove(&worker);
             drop(workers);
-            let _ = state::send(handle.as_ref(), ActorMsg::WorkerGone { worker: worker.clone(), conn }).await;
+            let _ = state::send(
+                handle.as_ref(),
+                ActorMsg::WorkerGone {
+                    worker: worker.clone(),
+                    conn,
+                },
+            )
+            .await;
         } else {
             tracing::debug!(%worker, "stale socket closing; leaving the live binding alone");
         }
@@ -213,7 +277,3 @@ async fn session(socket: axum::extract::ws::WebSocket, hub: Arc<Hub>, token_labe
     let _ = writer.await;
     tracing::info!(%worker, conn, "worker left");
 }
-
-/// Send one worker frame from outside the session (used by the artifact/payload
-/// handlers to nudge a worker after a failed upload).
-

@@ -24,7 +24,7 @@ consumer ──POST /v1/jobs (artifact)      ──▶│  nexus hub    │◀�
 | --- | --- |
 | `crates/nexus-core` | The spine: `protocol`, `actor` (pool_actor), `queue` (trait + in-memory), `relay`, `adapters`, `store`, `scheduler`, `auth`, `seq`, `metrics`, `limits`, `config`. Synchronous, IO-free, compiles for native **and** `wasm32-unknown-unknown`. |
 | `crates/nexus-server` | Native runtime: axum + tokio, worker WebSocket, consumer SSE, artifact spill to disk, metrics, graceful drain. Not wasm-buildable (tokio IO/time drivers do not exist there). |
-| `crates/nexus-server/src/runtime_e2e.rs` | Runtime tests: a real listener, a real worker WebSocket, real SSE/JSON responses (`§16.5`, `§16.6`, `§16.14`, `§9` tenancy, `/metrics` shape). A unit-test module of the bin, because this crate has no library target. Unexecuted, like everything else here. |
+| `crates/nexus-server/src/runtime_e2e.rs` | Runtime tests: a real listener, a real worker WebSocket, real SSE/JSON responses (`§16.5`, `§16.6`, `§16.14`, `§9` tenancy, `/metrics` shape). A unit-test module of the bin, because this crate has no library target. These now **run and pass** — all 12, against real loopback sockets, a real WebSocket handshake and real SSE bytes; see *Verification status*. |
 | `crates/nexus-wasm` | The **same** `PoolActor` re-exported to Node/browser via `wasm-bindgen`. |
 | `crates/nexus-worker-example` | Rust worker client that dials out and fronts a loopback engine (task §12). |
 | `examples/node-smoke.mjs` | Node smoke test that drives the WASM actor and asserts broker behaviour end-to-end. |
@@ -32,40 +32,128 @@ consumer ──POST /v1/jobs (artifact)      ──▶│  nexus hub    │◀�
 
 ## Verification status — read this first
 
-**No Rust toolchain exists on the machine this was written on, and none was
-installed here.** Re-checked in the review pass: `cargo`, `rustc`, `rustup` and
-`wasm-pack` are all absent from `PATH`, and the root `rust-toolchain.toml` pins
-`1.99.1`, which is therefore not installed. Consequences, stated plainly:
+**Compiled and executed on this host, on the pinned toolchain, 2026-11-03.** What is
+actually installed: `rustup 1.29.2`, active toolchain `1.99.1-x86_64-pc-windows-msvc`
+(the `1.99.1` pin in the root `rust-toolchain.toml`), `rustc 1.99.1 (58cf8f9c3)`,
+`cargo 1.99.1 (5f94df478)`, installed targets `x86_64-pc-windows-msvc` and
+`wasm32-unknown-unknown`. **`wasm-bindgen` / `wasm-bindgen-cli` / `wasm-pack` /
+`wasm-opt` are still absent from `PATH`** (checked against `PATH`, `~/.cargo/bin` and
+every `~/.rustup/toolchains/*/bin`), and that is the only remaining toolchain gap.
 
-* **nothing in this package has ever been compiled or executed.** No `cargo check`,
-  `test`, `clippy`, `fmt --check`, release build or wasm build has run, and
-  `examples/node-smoke.mjs` could not run because it needs the wasm artifact;
-* what *was* run is JS-only: `node --check` on `scripts/build-wasm.mjs` and
-  `examples/node-smoke.mjs` (both parse), and `package.json` parses;
-* the review pass fixed defects found by reading (see *Review pass* and *Second pass*
-  below), but a static review cannot prove compilation. Expect the first `cargo check
-  --workspace --all-targets` to surface further ordinary type errors, most likely in
-  `nexus-server`;
-* "covered" in the §16 matrix means *a test asserts it in Rust source*, not *it
-  passed*. Core tests exercise the actor with injected time; they are **not**
-  runtime tests, and the runtime tests added in the review pass
-  (`crates/nexus-server/src/runtime_e2e.rs`, a unit-test module of the bin because
-  `nexus-server` has no library target) are likewise unexecuted.
+Everything below was run from `packages/underload/nexus` with the repo-root
+`.cargo/config.toml` in force (`target-dir = .rust/target`, and `TMP`/`TEMP`/`TMPDIR`
+= `Temp/rust` for every child process). Exit codes are the command's own.
 
-The test inventory, as written (all of it unexecuted): 42 tests in
-`crates/nexus-core/tests/acceptance.rs`, 73 inline unit tests across `nexus-core/src`,
-and 12 in `nexus-server` — 6 artifact-download tests in `io.rs`, 4 runtime tests in
-`runtime_e2e.rs`, 2 in `state.rs`. `crates/nexus-wasm` and
-`crates/nexus-worker-example` contain no Rust tests: the wasm crate is exercised through
-`examples/node-smoke.mjs`, which cannot run without a wasm build.
+| Command | Result |
+| --- | --- |
+| `cargo fmt --all` → `cargo fmt --all -- --check` | **clean and idempotent** (the check is exit 0 after the format pass) |
+| `cargo check --workspace --all-targets` | **ok**, 0 errors, 0 warnings |
+| `cargo test --workspace --no-fail-fast` | **exit 0 — 128 passed / 0 failed**: `nexus-core` lib 74/74, `crates/nexus-core/tests/acceptance.rs` **42/42**, `nexus-server` bin (unit + `runtime_e2e`) **12/12**, `nexus-wasm` 0 tests, `nexus-worker-example` 0 tests, doc-tests 0 |
+| `cargo clippy --workspace --all-targets` | **exit 0** at the lint levels the workspace configures (`unwrap_used`/`expect_used` = `warn`): every crate is linted, and the run reports 17 findings in `nexus-core`, 22 in `nexus-server` and 2 in `nexus-wasm` — all on lines this pass did not touch |
+| `cargo clippy --workspace --all-targets -- -D warnings` (what `yarn clippy` runs) | **fails**: 17 denials, every one pre-existing `nexus-core` lint (`expect_used`, `field_reassign_with_default`, `too_many_arguments`, `unnecessary_map_or`, `large_enum_variant`, `derivable_impls`, `manual_clamp`, `useless_format`, `bool_comparison`). Because the crate fails to compile under `-D`, `nexus-server`, `nexus-wasm` and `nexus-worker-example` are never reached by **this** variant, and `yarn verify` therefore stops before `yarn test` |
+| `cargo build --workspace --release` | **ok** → `.rust/target/release/nexus-hub.exe` 2,796,544 bytes and `nexus-worker-example.exe` 785,920 bytes (fat LTO, `panic = abort`, symbols stripped) |
+| `cargo build --release --target wasm32-unknown-unknown -p nexus-wasm` | **ok** → `.rust/target/wasm32-unknown-unknown/release/nexus_wasm.wasm`, 984,056 bytes; Node's `WebAssembly.compile` accepts it — 112 exports (16 `nexusbroker_*` entry points + `memory`), 6 imports, all from the two `__wbindgen_*` shim modules the glue would supply |
+| `node --check scripts/build-wasm.mjs`, `node --check examples/node-smoke.mjs` | **ok** — syntax only; the two scripts are unchanged in this pass |
+| `node scripts/build-wasm.mjs` | **blocked**: exits 1 — `wasm-bindgen is not on PATH … cargo install wasm-bindgen-cli --locked --version 0.2.130` (the version is read from `Cargo.lock`) |
+| `node examples/node-smoke.mjs` | **blocked**: exits 2 — `[smoke] missing …\pkg\nexus_wasm.js`, because the glue step above could not run, so its 11 assertion blocks have still never executed |
 
-To verify for real: `rustup toolchain install`, `rustup target add
-wasm32-unknown-unknown`, `cargo install wasm-bindgen-cli --locked`, then
-`yarn verify`. `yarn fmt:check` inside `verify` may itself fail: the sources were
-hand-written and never passed through `rustfmt`.
+Two environment notes, because they will bite the next person:
+
+* **cargo cannot open a direct connection to `index.crates.io` on this host** — every
+  fetch dies with `curl error 28, "Connection timed out"` (or "transfer too slow:
+  transferred 0 bytes"), while `curl.exe`, PowerShell and Node reach the same URL in
+  ~200 ms. Builds in this pass ran with `HTTPS_PROXY=http://127.0.0.1:18080` pointing
+  at a throwaway loopback CONNECT proxy (`Temp/opencode/proxy.mjs`, IPv4-pinned
+  upstream). Nothing about the package requires it; the per-session env is the fix.
+* the registry cache was empty, so `Cargo.lock` is **new in this pass** (the repo-root
+  `.gitignore` says Cargo.lock is committed on purpose). Nothing else was added to the
+  dependency graph.
+
+The suite is green, so "covered" means *a test asserts it and that test passed on this
+host*. What is still unproven is listed in *Known gaps* rather than averaged away: the
+wasm glue and the Node smoke test that consumes it (a missing tool, not a code gap),
+the `clippy -D warnings` variant `yarn clippy` runs, and every §14 latency number
+(nothing has been benchmarked).
+
+The compile pass itself fixed roughly forty defects that a read-only review cannot
+catch. The classes, so the shape of the work is visible without re-reading the diff:
+
+* **vocabulary.** `PoolId::parse` rejected `llm.chat/qwen38` because the id alphabet
+  had no `/`. Pool ids are validated per segment now (`util::is_safe_pool_id` +
+  `ids.rs`); with the strict rule in force every `Hello` came back as
+  `pool_unavailable` and nothing anywhere dispatched.
+* **traits that were never derived.** `Effect` and `LogLevel` gained `Serialize` (the
+  WASM host is handed `Effect[]`), `JobView` gained `PartialEq` (`Effect::Snapshot`
+  compares), `TerminalReason` gained `Ord` (the §16 tests sort tuples of it), and
+  `limits.rs` was missing its `serde` import, which took `BrokerConfig` down with it.
+* **object safety across the async boundary.** `QueueBackend: Send + Sync` —
+  `Box<dyn QueueBackend>` inside `PoolActor` made `run_actor`'s future `!Send`, and
+  `tokio::spawn` refused the only actor loop the hub has.
+* **one real scheduling defect.** `PoolActor::fulfil_claims` parked a claim's
+  remaining slots in a side list that was merged back only *after* the loop, so the
+  next `pop_front` saw an empty mailbox and broke: a 4-slot worker with four queued
+  jobs took exactly one lease (§16 test 12). The remainder is re-queued into the live
+  mailbox, still behind the other claimants.
+* **dependency API drift.** `axum 0.8` (`Message::Text`/`Utf8Bytes`, no
+  `header::LAST_EVENT_ID`), `tungstenite 0.26` (`Message::Frame` in the match),
+  `Result` is not an iterator (`timeout(..).ok().ok().flatten()`), a `MutexGuard`
+  temporary outliving the `JobRelay` it borrowed (a tail-position `match` without `;`),
+  an orphan doc comment at the end of `worker_ws.rs`, and `JsonLines::push`'s nested
+  `split_last` whose arms disagreed on `&[u8]` vs `[u8]`.
+* **tests that encoded arithmetic the code never had.** The metrics `# HELP` line, a
+  13-vs-14-byte delta length, a replay ring sized below its own 1 KiB floor, a payload
+  TTL boundary read from the wrong origin, an api key naming an undeclared tenant,
+  `Claim`s stamped with another socket's connection id, ten `drain(..)` calls that were
+  never awaited, a tenant-concurrency cap that contradicted the test it lived in, and a
+  WASM smoke config with no pools, kinds or tenants — which
+  `BrokerConfig::from_json_str` refuses, so the smoke would have died in the
+  constructor.
+* **`FlushGate::force` was a no-op**: it moved a timestamp that `should_flush` never
+  read. A `forced` flag now carries the "a terminal or cancelled job never holds bytes
+  behind a batching window" rule the tests document.
+* **the runtime test hub now runs with `allow_anonymous = false`**, which is what makes
+  `job_reads_require_an_api_key_and_operational_routes_do_not` mean anything; every
+  request in that file already carries `API_KEY` or `?token=`.
+
+### Fixed in this pass — all fourteen failures, with their real causes
+
+The previous draft listed fourteen failing tests and left several of them as open
+semantic questions. Every one is now resolved, and the diagnosis in a few rows
+corrects what this README previously guessed. Read it as: *which side was wrong*, and
+*what the rule now is*.
+
+| Test | Which side was wrong | Resolution |
+| --- | --- | --- |
+| `t02_concurrent_claims_resolve_deterministically_in_mailbox_order` | test | Each `Claim` now carries the connection it arrived on. The `("w-b","w-a")` permutation had stamped `w-b`'s claim with `w-a`'s generation, so the actor correctly dropped it as a stale frame and the "lost dispatch" was the §11 rule working. |
+| `t03_worker_killed_before_any_output_is_requeued_and_completes_elsewhere` | test | The expected length was `2 400`; the two attempt-2 deltas are 1 800 + 1 200 chars. The test now asserts the delta **texts** verbatim as well as the 3 000-char total, so "one coherent stream" is pinned by content and not only by length. |
+| `t09_consumer_reconnect_with_last_event_id_replays_without_a_gap` | test | §7.2's age flush is a timer, so the third delta leaves on the next `Tick` (the same rule `deltas_are_batched_by_size_and_age_not_per_token` pins). The test now advances the clock one flush interval before asserting the three live deltas, and the attach/replay assertions keep their original values — the ring held all three frames the whole time. |
+| `t12_declared_capacity_is_respected_per_worker` | test fixture | Five jobs have to be admitted for the fifth to stay queued; the shared fixture's 4-job tenant cap answered the fifth `Submit` with `429`. The test raises its own cap (the tenant-limit test keeps the shared number). |
+| `t15_artifact_upload_is_measured_not_trusted_and_survives_a_resume` | test fixture | The ComfyUI worker's `Hello` named `llm.chat/qwen38`, a pool this actor does not own, so it joined nothing, the pool had zero capacity, and the image job was refused `400 capability_unsatisfied` before anything was dispatched. It now declares `image.render/comfyui`. |
+| `t15` (digest-mismatch half) | test sequencing | The mismatched declaration was uploaded **after** the artifact had completed, and `ArtifactBook::record_chunk` refuses chunk writes to a completed artifact, so the mismatch path was never reached. It is now the first completion attempt: the refusal is surfaced in band, the slot stays open (`complete` is still false), and the honest retry completes normally. |
+| `t15` (foreign-writer half) | test | `w-other` had no live socket at all, so the upload was refused `401 stale_connection` by the §11 generation rule one step before the ownership rule under test. `w-other` now connects, and the refusal is the `409 stale_attempt` the row is about. |
+| `session_affinity_keeps_a_conversation_on_one_worker` | test, twice | Only three of the six turns were ever dispatched, and two of the six were refused outright: every turn stayed in flight, so the fourth filled the rendezvous target's 4 slots and turns five and six hit the shared fixture's 4-job tenant cap (`429 tenant_limit`) — neither of which is what the row tests. A conversation is also sequential, so each turn is now answered with `Done` before the next is submitted. And `seen` only collected the `Submit` effects, which missed the turn the first `Claim` dispatched (no authority exists at that instant); all three messages are counted now, and each turn asserts exactly one dispatch of its own job at attempt 1. |
+| `stale_connection_frames_and_closes_are_ignored` | **implementation** | An evicting `Hello` replaced the `WorkerRecord` wholesale: `in_flight` (the actor's own slot accounting) and the engine state vanished, the held leases kept the retired `epoch`, heartbeat-driven lease renewal silently stopped renewing them, and the resume-grace timer `orphan_worker` had armed then deleted a **live** worker at `now + resume_grace_ms`. `on_hello` re-attaches in place now: only the replaced socket's claim authority is voided, the leases move to the new generation, the orphan timer is cancelled, and the engine state carries over only when the previous socket was still live (after a death, readiness must be re-declared — §8). |
+| `resume_for_a_moved_or_finished_lease_is_nacked` | test | The stale `Resume` was sent on the connection the hub had already retired, and stale frames are dropped without a reply. The worker now reconnects first and the nack lands on the live generation, which is the race the row is about. |
+| `heartbeats_renew_the_lease_and_missing_heartbeats_pause_dispatch_only` | test, twice | The lease deadline is granted at dispatch (`10 + lease_ms` = 60 010); the expected 60 001 anchored it on the worker's last heartbeat, which would shorten a lease by however long the worker had been idle — and the same test's renewal assertion already agreed with the dispatch anchor. Separately, 3 × `heartbeat_ms` equals `lease_ms` at the reference 20 s cadence, so "dispatch paused, still leased" and "lease expired" land on the same tick and the state is unobservable: the test now runs a 5 s cadence, which `Limits::validate`'s `lease_ms >= 2 × heartbeat_ms` rule accepts. §5.1's state is now asserted rather than deferred. |
+| `hard_deadline_terminates_a_stalled_job_and_cancels_the_worker` | test | `job_hard_cap_ms` is measured from accept (10 + 5 000 = 5 010), the same origin `Limits` documents for the queue and grace windows. The deadline `Cancel` + `DeadlineExceeded` terminal fire on the tick at 5 010 exactly as asserted, and the 60 s lease still does not double-fire. |
+| `prompt_retention_lapses_by_ttl_and_terminal_retention_bounds_the_job_map` | **implementation** + test timing | A requeued job with no *ready* worker was parked as `Pending`, and `Pending` is the phase §7.2 still allows a `503 + Retry-After` for — so a job whose SSE body had already been opened came out of the queue-timeout path with an HTTP status nobody could deliver, ending the stream with no explanation. A requeue is now always `Queued`. Two timing expectations also moved onto the events that actually carry them: the dispatch failure lands on the `Ready` heartbeat that drains the worker's retained claim authority (exactly what `t11` asserts), and retention is measured from the terminal (20 + 30 000), so the sweep is asserted at the 30 020 boundary. The test now also pins the in-band retryable `Error` and that the later `Claim` does not re-fail the job. |
+| `io::tests::full_object_read_streams_bounded_chunks_and_verifies_the_digest` | **implementation** — and the earlier diagnosis here was wrong | This README blamed "`sha2 0.10.9` incremental hashing" and advised re-testing on another host. The streaming task was feeding the *already-final* digest into `store::sha256_hex`, which digests its input, so it compared `sha256(sha256(body))` against the recorded `sha256(body)` and aborted **every** correct whole-object download (the mismatch test passed only because any disagreement aborts). It now hex-encodes the 32 digest bytes; `Get-FileHash`, `store::sha256_hex` and the streaming chain now all agree, and the mismatch-aborts test still proves the check bites. No dependency fault, no host caveat. |
+| `runtime_e2e::loading_worker_answers_503_with_retry_after_before_any_body` | **implementation** (runtime) | The actor emits `Accepted` for a job that is still `Pending` inside the no-worker grace, and the dispatcher resolved the first-answer gate on it, so the handler wrote SSE headers and answered `200` before the grace could expire. The gate now stays unresolved while the job is `Pending`, and the `Assigned` frame is what opens the body — which is §7.2's "the 503 is still free until the first byte", with the core's `t06` unchanged. |
+| `runtime_e2e::worker_relay_reaches_the_consumer_verbatim_over_sse` | test | An OpenAI stream is **three** chunks plus the sentinel: the role delta, the relayed frame, and the finish chunk carrying `usage`. The expected 2 had forgotten the terminal chunk. The count is kept and every chunk is now also asserted field by field (role, the half-written tool argument, `chatcmpl-x`, `finish_reason`, `usage`, the `id:` replay cursors). |
+| `runtime_e2e::consumer_disconnect_reaches_the_worker_as_cancel` | **implementation** (runtime) | `pump_sse` drains the submission's private replay queue before it starts watching the fan-out, and for a fresh (non-attaching) submission nothing ever closed that queue: the pump sat in a receive loop that would not end until the job reached a terminal, so deltas were withheld until then **and** a hung-up consumer was never noticed, so §6's `Detach` → `Cancel` never fired. A non-attached `Accepted` now closes the queue, the same way the `Reject` path already did. |
+
+Outstanding work, in order: install `wasm-bindgen-cli` at the locked version
+(`cargo install wasm-bindgen-cli --locked --version 0.2.130`) so `yarn wasm:glue`,
+`yarn build:wasm` and `yarn smoke:wasm` can run — the wasm artifact itself builds and
+validates; settle the 17 pre-existing `nexus-core` lints that
+`cargo clippy -- -D warnings` denies (or move `yarn clippy` back to the levels the
+workspace lints actually configure), since that is the step `yarn verify` stops on; and
+take §14's latency numbers by running the hub, which nobody has done yet.
 
 No performance claim is made anywhere in this README that has not been measured by
-a human running the binary; §14's 30–60 ms is the task's own budget, restated.
+a human running the binary; §14's 30–60 ms is the task's own budget, restated, and
+**no measurement of it has been taken** (the hub binary exists now, so `yarn start` +
+`yarn worker` can produce one).
 
 ## Running it
 
@@ -96,7 +184,7 @@ an empty pool-token set, an empty API-key set, or an empty attestation allowlist
 | --- | --- | --- |
 | `NEXUS_LISTEN` | `127.0.0.1:8085` | Consumer + worker surface. Keep it loopback unless you terminate TLS elsewhere. |
 | `NEXUS_POOL_TOKENS` | — | Comma-separated worker tokens; stored as SHA-256 digests. |
-| `NEXUS_API_KEYS` | — | `secret=tenant` pairs; a bare secret maps to `default`. |
+| `NEXUS_API_KEYS` | — | `secret=tenant` pairs; a bare secret maps to `default`. The tenant must also exist in the config's `tenants` map (only `default` ships in the built-in defaults): `validate()` refuses a key that names an undeclared tenant, so a multi-tenant deployment supplies `NEXUS_CONFIG_JSON`. |
 | `NEXUS_MODEL_SHAS` | — | Attestation allowlist. Seed it from `SHARD_TABLE` in `services/molab/molab-strata-runtime.py:94-99`. |
 | `NEXUS_ALLOW_ANONYMOUS` | `0` | Local smoke only. |
 | `NEXUS_ARTIFACT_ROOT` | `Temp/nexus/artifacts` | Artifact spill directory (repo-root `Temp/`, per root `AGENTS.md`). |
@@ -212,7 +300,17 @@ Two documented deviations from a literal reading of the task:
   terminal, or continuation). `resume_grace_ms = 0` reproduces the strict wording at the
   cost of making `Resume` unreachable. A `Resume` after grace, on a stale attempt, or for
   a moved lease is refused with `ResumeNack` and never applied twice. Stale-connection
-  frames are dropped by connection generation, and an evicted socket's close is a no-op.
+  frames are dropped by connection generation, and an evicted socket's close is a no-op —
+  which is also why a nack can only reach a worker that has a **live** socket: a `Resume`
+  stamped with the retired generation is dropped like any other stale frame, so a
+  reconnecting client is re-attached first and refused second.
+  A re-`Hello` for a known worker id is a socket swap, not a death: the record is updated
+  in place, so `in_flight` (which is what §4's capacity cap and the heartbeat-driven lease
+  renewal both read), the held leases' `epoch` and — when the previous socket was still
+  live — the engine state survive, while the replaced socket's unfulfilled `Claim`
+  authority is voided and any pending resume-grace timer is cancelled. After a death the
+  `Degraded` demotion stays, so a reconnecting worker must report `Ready` again before it
+  is dispatched to (§8).
 * **`payload_ref` byte ownership.** Task §10 says the *worker* `GET`s the payload; the hub
   must therefore hold the prompt bytes somewhere. They are held in **memory only**
   (`payload_ttl_ms`, bounded by entry count and total bytes), never on disk, per §9's
@@ -292,12 +390,12 @@ Two documented deviations from a literal reading of the task:
 Two words carry precise meaning in this table:
 
 * **core** — `crates/nexus-core/tests/acceptance.rs` asserts the actor's decision
-  with injected time. That file has never been *run*, so "core" means "a test
-  exists and states the exact expected value", not "it passed";
+  with injected time. That file has been **run and is green** (42/42), so "core" now
+  means "a test states the exact expected value *and that value was observed*";
 * **runtime** — the behaviour needs the native handlers (`crates/nexus-server`)
   and a live socket. Since the review pass these are asserted by
   `crates/nexus-server/src/runtime_e2e.rs` (real listener, real worker WebSocket,
-  real SSE bytes) — **also never executed**.
+  real SSE bytes) — **also run and green** (12/12, including the six `io::tests`).
 
 | # | Requirement | Status | Where |
 | --- | --- | --- | --- |
@@ -356,15 +454,34 @@ child process cargo spawns, which is the root `AGENTS.md` scratch rule.
 
 **Blocking, and not fixable from here:**
 
-* **nothing has been compiled** (see *Verification status*). Expect the first
-  `cargo check --workspace --all-targets` to surface ordinary type errors, most
-  likely in `nexus-server` and in the new `runtime_e2e` module.
-* the dependency graph has never been resolved on this machine: no `.rust/target`,
-  no vendored crates, no `Cargo.lock`. Offline builds will fail until a registry
-  cache exists, and the pinned versions in `Cargo.toml` are stated floors that have
-  not been resolved against a real index. The second pass added one dev-dependency,
-  `http-body-util` (test-only, for draining a streamed body frame by frame); it has
-  the same never-resolved caveat as everything else.
+* **the Node glue cannot be generated on this host.** The wasm module itself builds
+  (`yarn wasm` → `.rust/target/wasm32-unknown-unknown/release/nexus_wasm.wasm`,
+  984,056 bytes, accepted by Node's `WebAssembly.compile` with the repo's
+  `+simd128` rustflags), but `wasm-bindgen`/`wasm-bindgen-cli` are not installed,
+  so `yarn wasm:glue` — and with it `yarn smoke:wasm` — cannot run. `scripts/build-wasm.mjs`
+  now fails with the exact version `Cargo.lock` pins:
+  `cargo install wasm-bindgen-cli --locked --version 0.2.130`. Installing it is a
+  host change, which this pass was scoped not to make.
+* **`yarn verify` stops before the tests.** `yarn clippy` is `cargo clippy --workspace
+  --all-targets -- -D warnings`, and 17 pre-existing `nexus-core` findings are denied by
+  that flag, so the script chain aborts even though the configured lint levels
+  (`unwrap_used`/`expect_used` = `warn`, which is what `cargo clippy --workspace
+  --all-targets` uses) pass with exit 0. Either the findings get cleaned up or the
+  script drops `-D warnings`; neither is a behaviour change, and neither was done here
+  because it would touch ~17 unrelated lines while the tests were the thing in flight.
+* **the suite is green on this host, and only on this host.** 128/128 with the pinned
+  `1.99.1` MSVC toolchain; the wasm smoke test and §14's latency budgets remain
+  unmeasured, so nothing in this README claims them.
+
+**Resolved since the first draft of this package:**
+
+* the dependency graph is resolved and locked: `Cargo.lock` is committed in this
+  package (the repo-root `.gitignore` says Cargo.lock is committed on purpose), and
+  every version stated in `Cargo.toml` resolved — `axum 0.8.9`, `tokio 1.54.1`,
+  `tower-http 0.6.11`, `tokio-tungstenite 0.26.2`, `reqwest 0.12.28`,
+  `wasm-bindgen 0.2.130`, `sha2 0.10.9`, `serde 1.0.229`.
+* `cargo check --workspace --all-targets` and a release build now pass; the sources
+  have been through `rustfmt`.
 
 **Real limitations of the current implementation:**
 
@@ -515,8 +632,11 @@ Correctness against the task:
 ## Second pass — the six bounded corrections
 
 A follow-up pass took the six correctness items that the first pass had found but left
-open. Same rules: only this package, nothing compiled, every claim below is from reading
-code and tests that have never been executed.
+open. Same rules: only this package, nothing compiled, and at the time every claim below
+was from reading code and tests that had never been executed. The verification pass above
+has since executed them: the claims held (the suite is 128/128 on this host), with the
+fourteen exceptions itemised in *Fixed in this pass* — three of which were this document
+being confidently wrong, notably the `sha2` diagnosis for the streamed artifact digest.
 
 1. **The contradictory phase assertion was fixed in the test, not in the actor**
    (`tests/acceptance.rs:1095`, in `heartbeats_renew_the_lease_and_missing_heartbeats_pause_dispatch_only`).

@@ -9,7 +9,7 @@
 //   nexus_wasm.js / nexus_wasm.d.ts / nexus_wasm_bg.wasm   (--target nodejs)
 // which is exactly what `examples/node-smoke.mjs` requires()s.
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -37,6 +37,19 @@ function have(binary, args = ["--version"]) {
     }
 }
 
+// The `wasm-bindgen` **library** version in `Cargo.lock` and the `wasm-bindgen-cli`
+// **binary** version have to match exactly: the generated glue embeds a version
+// check and panics on any drift. Reading the pin out of the lock keeps this
+// instruction correct instead of hardcoding a number that goes stale.
+function lockedBindgenVersion() {
+    const lock = join(root, "Cargo.lock");
+    if (!existsSync(lock)) {
+        return null;
+    }
+    const entry = /name = "wasm-bindgen"\r?\nversion = "([^"]+)"/.exec(readFileSync(lock, "utf8"));
+    return entry ? entry[1] : null;
+}
+
 if (!existsSync(wasmOut)) {
     fail(
         `no wasm module at ${wasmOut}`,
@@ -47,13 +60,24 @@ if (!existsSync(wasmOut)) {
 // --target nodejs keeps the smoke test a plain require() with no bundler and no
 // top-level await; the web build (--target web) is a separate, opt-in step.
 const binary = have("wasm-bindgen") === null ? (have("wasm-bindgen-cli") === null ? null : "wasm-bindgen-cli") : "wasm-bindgen";
+const pinned = lockedBindgenVersion();
 if (binary === null) {
     // There is no cargo subcommand for this: `cargo run -p wasm-bindgen-cli`
     // only resolves a workspace member, and this crate is not one, so the
     // honest failure is a named install step rather than a second error.
     fail(
         "wasm-bindgen is not on PATH",
-        "install the CLI that matches the wasm-bindgen dependency: `cargo install wasm-bindgen-cli --locked`",
+        `install the CLI at the version Cargo.lock pins the library at${pinned ? ` (${pinned})` : ""}: ` +
+            `\`cargo install wasm-bindgen-cli --locked${pinned ? ` --version ${pinned}` : ""}\``,
+    );
+}
+// A CLI that is present but a different version fails later, inside the loader,
+// with a message nobody connects back to this script. Say it here instead.
+const found = ((have(binary) ?? "").match(/\d+\.\d+\.\d+/) ?? [null])[0];
+if (pinned && found && found !== pinned) {
+    fail(
+        `${binary} ${found} is on PATH, but Cargo.lock pins the wasm-bindgen library at ${pinned}`,
+        `the two must match exactly: \`cargo install wasm-bindgen-cli --locked --version ${pinned}\``,
     );
 }
 const args = ["--target", "nodejs", "--out-dir", pkg, "--out-name", "nexus_wasm", wasmOut];

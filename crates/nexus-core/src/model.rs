@@ -215,7 +215,10 @@ impl WorkerRecord {
 
 /// Why a job left the running set. Distinguishing these matters because the
 /// requeue policy differs per task §5.1/§5.3.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Ord` follows declaration order, which is what lets the acceptance tests sort a
+/// `(job, reason, retryable)` list into a stable, byte-exact expectation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TerminalReason {
     /// Worker reported `Done{finish}` and the consumer saw a finish_reason.
@@ -487,7 +490,11 @@ pub struct JobTimings {
 /// Derived consumer-facing view of one job. Built by
 /// [`crate::actor::PoolActor::job_view`]; it is derived state, never a second
 /// authority.
-#[derive(Debug, Clone, Serialize)]
+///
+/// `PartialEq` (not `Eq`): `usage` is a `serde_json::Value`, which is only
+/// partially equal (floats). `Effect::Snapshot` derives `PartialEq` and carries
+/// this type, so the actor's effects stay comparable in tests.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct JobView {
     /// Job identity.
     pub id: JobId,
@@ -666,7 +673,10 @@ impl JobRecord {
             bytes_delivered: false,
             cancel_sent_ms: None,
             artifact: None,
-            timings: JobTimings { accept_ms: now_ms, ..JobTimings::default() },
+            timings: JobTimings {
+                accept_ms: now_ms,
+                ..JobTimings::default()
+            },
             deadline_ms: hard_deadline_ms,
             dispatch_deadline_ms,
             queue_seq: None,
@@ -755,6 +765,9 @@ mod tests {
         assert_eq!(Priority::Bulk.as_str(), "bulk");
         assert!(TerminalReason::NoReadyWorker.retryable());
         assert!(TerminalReason::WorkerGonePartial.retryable() == false);
-        assert_eq!(TerminalReason::LeaseExpiredPartial.as_str(), "lease_expired_partial");
+        assert_eq!(
+            TerminalReason::LeaseExpiredPartial.as_str(),
+            "lease_expired_partial"
+        );
     }
 }

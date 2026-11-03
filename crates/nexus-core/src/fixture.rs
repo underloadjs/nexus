@@ -8,7 +8,9 @@ use serde_json::json;
 
 use crate::config::BrokerConfig;
 use crate::ids::{JobId, PoolId, TenantId, WorkerId};
-use crate::model::{EngineState, JobRecord, LinkState, Priority, Submission, WorkerRecord, WorkerTier};
+use crate::model::{
+    EngineState, JobRecord, LinkState, Priority, Submission, WorkerRecord, WorkerTier,
+};
 use crate::protocol::{Attestation, Requires};
 use crate::time::Timestamp;
 
@@ -90,7 +92,11 @@ pub fn worker(
     );
     rec.free_slots = free_slots;
     rec.free_kv_tokens = free_kv;
-    rec.engine = if ready { EngineState::Ready } else { EngineState::Loading };
+    rec.engine = if ready {
+        EngineState::Ready
+    } else {
+        EngineState::Loading
+    };
     rec.link = LinkState::Live;
     rec
 }
@@ -103,7 +109,14 @@ pub const SHARD_2: &str = "316b46f3a2dbd68c900f43136ab9449f9dcc3725dfd8c794847c2
 /// A ready dedicated worker with full capacity.
 #[must_use]
 pub fn ready_worker(id: &str, capacity: u32) -> WorkerRecord {
-    worker(id, WorkerTier::Dedicated, capacity, capacity, Some(524_288), true)
+    worker(
+        id,
+        WorkerTier::Dedicated,
+        capacity,
+        capacity,
+        Some(524_288),
+        true,
+    )
 }
 
 /// An attestation carrying the reference shard digests.

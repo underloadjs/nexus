@@ -46,8 +46,8 @@ use nexus_core::ActorMsg;
 use nexus_core::ConsumerEvent;
 use nexus_core::Submission;
 use serde::Deserialize;
-use serde_json::Value;
 use serde_json::json;
+use serde_json::Value;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -64,8 +64,11 @@ use crate::state::RelayItem;
 const SESSION_HEADER: &str = "x-session-id";
 /// Explicit idempotency key (task §5.2).
 const IDEMPOTENCY_HEADER: &str = "idempotency-key";
-/// Pool override for the generic job API.
-const POOL_QUERY: &str = "pool";
+// The `?pool=` override has no constant here on purpose: its wire name is the
+// `ConsumerQuery::pool` field name, so a second spelling could only drift.
+/// The SSE replay cursor (`task §7.5`). `http::header` ships no constant for it,
+/// so the name is declared once here instead of being re-typed at every read.
+const LAST_EVENT_ID: axum::http::HeaderName = axum::http::HeaderName::from_static("last-event-id");
 
 /// How long a non-streaming request waits for its answer before giving up.
 const AGGREGATE_TIMEOUT_SECS: u64 = 300;
@@ -103,7 +106,11 @@ pub struct JobRequest {
 }
 
 /// `POST /v1/chat/completions`.
-pub async fn chat_completions(State(hub): State<Arc<Hub>>, headers: HeaderMap, body: Bytes) -> Response {
+pub async fn chat_completions(
+    State(hub): State<Arc<Hub>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
     openai_endpoint(hub, &headers, &body, adapters::KIND_CHAT).await
 }
 
@@ -119,17 +126,33 @@ async fn openai_endpoint(hub: Arc<Hub>, headers: &HeaderMap, raw: &[u8], kind: &
         Err(response) => return response,
     };
     let Ok(body) = serde_json::from_slice::<Value>(raw) else {
-        return json_error(StatusCode::BAD_REQUEST, "bad_json", "the request body is not valid JSON", false);
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "bad_json",
+            "the request body is not valid JSON",
+            false,
+        );
     };
     let Ok(request) = adapters::ChatRequest::parse(&body, kind) else {
-        return json_error(StatusCode::BAD_REQUEST, "invalid_request", "the body is not a usable chat or completions request", false);
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "the body is not a usable chat or completions request",
+            false,
+        );
     };
     let Some(pool_id) = pool_for_kind(&hub, kind) else {
-        return json_error(StatusCode::INTERNAL_SERVER_ERROR, "pool_unconfigured", "this kind has no pool in the configuration", true);
+        return json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "pool_unconfigured",
+            "this kind has no pool in the configuration",
+            true,
+        );
     };
     let session = header_value(headers, SESSION_HEADER).map(str::to_string);
     // Tenant-namespaced, for the reason given in `create_job`.
-    let idempotency = header_value(headers, IDEMPOTENCY_HEADER).map(|key| format!("{}:{key}", tenant.as_ref()));
+    let idempotency =
+        header_value(headers, IDEMPOTENCY_HEADER).map(|key| format!("{}:{key}", tenant.as_ref()));
     let submission = request.to_submission(
         &hub.cfg,
         &tenant,
@@ -140,25 +163,48 @@ async fn openai_endpoint(hub: Arc<Hub>, headers: &HeaderMap, raw: &[u8], kind: &
     );
     let stream = request.stream;
     let model = request.model.clone();
-    let (job, consumer, handle, _relay, gate, live, replay) = submit(&hub, &pool_id, submission).await;
+    let (job, consumer, handle, _relay, gate, live, replay) =
+        submit(&hub, &pool_id, submission).await;
 
     // Await the actor's first verdict before writing anything (task §7.2).
-    let verdict = tokio::time::timeout(Duration::from_millis(hub.cfg.limits.no_worker_grace_ms + 500), gate).await;
+    let verdict = tokio::time::timeout(
+        Duration::from_millis(hub.cfg.limits.no_worker_grace_ms + 500),
+        gate,
+    )
+    .await;
     match verdict {
         Ok(Ok(Gate::Accepted)) => {}
-        Ok(Ok(Gate::Reject { status, code, message, retry_after_secs })) => {
+        Ok(Ok(Gate::Reject {
+            status,
+            code,
+            message,
+            retry_after_secs,
+        })) => {
             let mut response = json_error(status, &code, &message, retry_after_secs.is_some());
             if let Some(secs) = retry_after_secs {
-                response.headers_mut().insert(header::RETRY_AFTER, secs.to_string().parse().expect("seconds parse"));
+                response.headers_mut().insert(
+                    header::RETRY_AFTER,
+                    secs.to_string().parse().expect("seconds parse"),
+                );
             }
-            response.headers_mut().insert("x-nexus-job", job.as_ref().parse().expect("job id is a header value"));
+            response.headers_mut().insert(
+                "x-nexus-job",
+                job.as_ref().parse().expect("job id is a header value"),
+            );
             return response;
         }
         // A timeout here is not "the worker is slow": it is the hub failing to
         // answer, and the honest answer is a retryable 503, not a hung stream.
         Ok(Ok(Gate::Closed)) | Ok(Err(_)) | Err(_) => {
-            let mut response = json_error(StatusCode::SERVICE_UNAVAILABLE, "hub_unavailable", "the hub did not answer in time; retry", true);
-            response.headers_mut().insert(header::RETRY_AFTER, "2");
+            let mut response = json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "hub_unavailable",
+                "the hub did not answer in time; retry",
+                true,
+            );
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("2"));
             return response;
         }
     }
@@ -167,13 +213,29 @@ async fn openai_endpoint(hub: Arc<Hub>, headers: &HeaderMap, raw: &[u8], kind: &
     }
 
     let created = hub.wall_ms();
-    let (out_tx, out_rx) = mpsc::channel::<Result<Event, Infallible>>(hub.cfg.limits.consumer_backpressure_frames);
+    let (out_tx, out_rx) =
+        mpsc::channel::<Result<Event, Infallible>>(hub.cfg.limits.consumer_backpressure_frames);
     // Headers first, then the role delta, then a keepalive while queued (§7.2).
-    let role = Event::default().json_data(adapters::role_chunk(&job, &model, created)).expect("chunk serializes");
+    let role = Event::default()
+        .json_data(adapters::role_chunk(&job, &model, created))
+        .expect("chunk serializes");
     let _ = out_tx.send(Ok(role)).await;
-    tokio::spawn(pump_sse(handle, consumer, job.clone(), model, created, live, replay, out_tx));
+    tokio::spawn(pump_sse(
+        handle,
+        consumer,
+        job.clone(),
+        model,
+        created,
+        live,
+        replay,
+        out_tx,
+    ));
     let mut response = Sse::new(ReceiverStream::new(out_rx))
-        .keep_alive(KeepAlive::new().interval(Duration::from_secs(1)).text("ping"))
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(1))
+                .text("ping"),
+        )
         .into_response();
     add_stream_headers(&mut response);
     response_headers(&job, &mut response);
@@ -189,7 +251,15 @@ fn response_headers(job: &JobId, response: &mut Response) {
 }
 
 /// Collect the whole stream and answer once, for `stream: false` (test 17).
-async fn aggregate_response(hub: &Arc<Hub>, job: JobId, consumer: ConsumerId, handle: Arc<state::PoolHandle>, live: broadcast::Receiver<RelayItem>, replay: mpsc::Receiver<RelayItem>, model: &str) -> Response {
+async fn aggregate_response(
+    hub: &Arc<Hub>,
+    job: JobId,
+    consumer: ConsumerId,
+    handle: Arc<state::PoolHandle>,
+    live: broadcast::Receiver<RelayItem>,
+    replay: mpsc::Receiver<RelayItem>,
+    model: &str,
+) -> Response {
     let mut events: Vec<ConsumerEvent> = Vec::new();
     let mut chunks: Vec<String> = Vec::new();
     // A joiner's buffered prefix arrives on its private queue, so the assembled
@@ -235,44 +305,98 @@ async fn aggregate_response(hub: &Arc<Hub>, job: JobId, consumer: ConsumerId, ha
     // §6: the request socket was the subscription. Whether or not an answer
     // arrived, the actor has to learn it closed, or a `stream: false` client
     // that gave up leaves the job occupying a worker slot.
-    let _ = state::send(handle.as_ref(), ActorMsg::Detach { job: job.clone(), consumer }).await;
+    let _ = state::send(
+        handle.as_ref(),
+        ActorMsg::Detach {
+            job: job.clone(),
+            consumer,
+        },
+    )
+    .await;
     handle.forget_relay(&job).await;
-    if events.iter().any(|e| matches!(e, ConsumerEvent::Error { .. })) {
-        return json_error(StatusCode::BAD_GATEWAY, "stream_incomplete", "the worker stopped before finishing", false);
+    if events
+        .iter()
+        .any(|e| matches!(e, ConsumerEvent::Error { .. }))
+    {
+        return json_error(
+            StatusCode::BAD_GATEWAY,
+            "stream_incomplete",
+            "the worker stopped before finishing",
+            false,
+        );
     }
     if outcome != "terminal" {
-        return json_error(StatusCode::SERVICE_UNAVAILABLE, "no_ready_worker", "the hub produced no answer in time; retry", true);
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no_ready_worker",
+            "the hub produced no answer in time; retry",
+            true,
+        );
     }
     let assembled = adapters::assemble_completion(&job, model, hub.wall_ms(), &events);
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/json")
         .header("x-nexus-chunks", chunks.len().to_string())
-        .body(axum::body::Body::from(serde_json::to_string(&assembled).expect("assembled object serializes")))
+        .body(axum::body::Body::from(
+            serde_json::to_string(&assembled).expect("assembled object serializes"),
+        ))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 /// `POST /v1/jobs` — the generic async job API (task §7.1, §7.3).
-pub async fn create_job(State(hub): State<Arc<Hub>>, headers: HeaderMap, Query(query): Query<ConsumerQuery>, body: Bytes) -> Response {
+pub async fn create_job(
+    State(hub): State<Arc<Hub>>,
+    headers: HeaderMap,
+    Query(query): Query<ConsumerQuery>,
+    body: Bytes,
+) -> Response {
     let tenant = match tenant_of(&hub, &headers) {
         Ok(tenant) => tenant,
         Err(response) => return response,
     };
     let Ok(request) = serde_json::from_slice::<JobRequest>(&body) else {
-        return json_error(StatusCode::BAD_REQUEST, "bad_json", "expected {kind, payload}", false);
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "bad_json",
+            "expected {kind, payload}",
+            false,
+        );
     };
     let Some(kind_cfg) = hub.cfg.kind(&request.kind).cloned() else {
-        return json_error(StatusCode::BAD_REQUEST, "unknown_kind", &format!("kind {:?} is not registered", request.kind), false);
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "unknown_kind",
+            &format!("kind {:?} is not registered", request.kind),
+            false,
+        );
     };
-    let pool_name = request.pool.as_deref().or(query.pool.as_deref()).unwrap_or(&kind_cfg.pool);
+    let pool_name = request
+        .pool
+        .as_deref()
+        .or(query.pool.as_deref())
+        .unwrap_or(&kind_cfg.pool);
     if pool_name != kind_cfg.pool {
-        return json_error(StatusCode::BAD_REQUEST, "wrong_pool", "the pool does not serve this kind", false);
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "wrong_pool",
+            "the pool does not serve this kind",
+            false,
+        );
     }
     let Ok(pool_id) = PoolId::parse(pool_name) else {
-        return json_error(StatusCode::BAD_REQUEST, "invalid_pool", "the pool name is not in the safe alphabet", false);
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_pool",
+            "the pool name is not in the safe alphabet",
+            false,
+        );
     };
     let payload_bytes = serde_json::to_vec(&request.payload).unwrap_or_default();
-    let mut requires = request.requires.clone().unwrap_or_else(|| kind_cfg.requires.clone());
+    let mut requires = request
+        .requires
+        .clone()
+        .unwrap_or_else(|| kind_cfg.requires.clone());
     if requires.kv_estimate_tokens.is_none() {
         requires.kv_estimate_tokens = Some(adapters::estimate_tokens(&request.payload));
     }
@@ -281,7 +405,11 @@ pub async fn create_job(State(hub): State<Arc<Hub>>, headers: HeaderMap, Query(q
     // their job and stream their prompt's answer back (§9 tenancy).
     let idempotency = match header_value(&headers, IDEMPOTENCY_HEADER) {
         Some(key) => format!("{}:{key}", tenant.as_ref()),
-        None => nexus_core::store::content_idempotency_key(tenant.as_ref(), &request.kind, &payload_bytes),
+        None => nexus_core::store::content_idempotency_key(
+            tenant.as_ref(),
+            &request.kind,
+            &payload_bytes,
+        ),
     };
     let submission = Submission {
         kind: request.kind.clone(),
@@ -292,33 +420,63 @@ pub async fn create_job(State(hub): State<Arc<Hub>>, headers: HeaderMap, Query(q
         content_type: "application/json".to_string(),
         idempotency_key: idempotency,
         session_hint: header_value(&headers, SESSION_HEADER).map(str::to_string),
-        priority: request.priority.as_deref().map(Priority::from_name).unwrap_or_else(|| hub.cfg.tenant_priority(&tenant)),
+        priority: request
+            .priority
+            .as_deref()
+            .map(Priority::from_name)
+            .unwrap_or_else(|| hub.cfg.tenant_priority(&tenant)),
         idempotent: kind_cfg.idempotent,
         streaming: kind_cfg.streaming,
         // A job API submission is detached on purpose: the client may poll later
         // (task §7.3), so losing the submitting socket is not a cancellation.
         cancel_on_consumer_gone: false,
     };
-    let (job, _consumer, _handle, relay, gate, _live, _replay) = submit(&hub, &pool_id, submission).await;
-    match tokio::time::timeout(Duration::from_millis(hub.cfg.limits.no_worker_grace_ms + 500), gate).await {
+    let (job, _consumer, _handle, relay, gate, _live, _replay) =
+        submit(&hub, &pool_id, submission).await;
+    match tokio::time::timeout(
+        Duration::from_millis(hub.cfg.limits.no_worker_grace_ms + 500),
+        gate,
+    )
+    .await
+    {
         Ok(Ok(Gate::Accepted)) => {}
-        Ok(Ok(Gate::Reject { status, code, message, retry_after_secs })) => {
+        Ok(Ok(Gate::Reject {
+            status,
+            code,
+            message,
+            retry_after_secs,
+        })) => {
             let mut response = json_error(status, &code, &message, retry_after_secs.is_some());
             if let Some(secs) = retry_after_secs {
-                response.headers_mut().insert(header::RETRY_AFTER, secs.to_string().parse().expect("seconds parse"));
+                response.headers_mut().insert(
+                    header::RETRY_AFTER,
+                    secs.to_string().parse().expect("seconds parse"),
+                );
             }
             return response;
         }
         _ => {
-            let mut response = json_error(StatusCode::SERVICE_UNAVAILABLE, "hub_unavailable", "the hub did not answer in time; retry", true);
-            response.headers_mut().insert(header::RETRY_AFTER, "2");
+            let mut response = json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "hub_unavailable",
+                "the hub did not answer in time; retry",
+                true,
+            );
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("2"));
             return response;
         }
     }
     let _ = relay;
     let view = hub.job_snapshot(&job).await;
     let artifact_path = view.as_ref().map(|_| format!("/v1/artifacts/art-{}", job));
-    let body = adapters::accepted_body(&view.unwrap_or_else(|| placeholder_view(job.clone(), pool_id.clone(), request.kind.clone())), artifact_path);
+    let body = adapters::accepted_body(
+        &view.unwrap_or_else(|| {
+            placeholder_view(job.clone(), pool_id.clone(), request.kind.clone())
+        }),
+        artifact_path,
+    );
     // `handle` stays alive through the hub; the client polls `/events`.
     json_response(StatusCode::ACCEPTED, &body)
 }
@@ -345,31 +503,61 @@ pub async fn list_jobs(State(hub): State<Arc<Hub>>, headers: HeaderMap) -> Respo
 }
 
 /// `GET /v1/jobs/{id}` — authoritative state, read through the actor.
-pub async fn job_status(State(hub): State<Arc<Hub>>, headers: HeaderMap, Path(id): Path<String>) -> Response {
+pub async fn job_status(
+    State(hub): State<Arc<Hub>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
     let tenant = match tenant_of(&hub, &headers) {
         Ok(tenant) => tenant,
         Err(response) => return response,
     };
     let Ok(job) = JobId::parse(&id) else {
-        return json_error(StatusCode::BAD_REQUEST, "invalid_id", "job id is not in the safe alphabet", false);
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_id",
+            "job id is not in the safe alphabet",
+            false,
+        );
     };
     match hub.job_snapshot(&job).await {
-        Some(view) if view.tenant == tenant => json_response(StatusCode::OK, &adapters::job_status_body(&view)),
+        Some(view) if view.tenant == tenant => {
+            json_response(StatusCode::OK, &adapters::job_status_body(&view))
+        }
         // A foreign job reads as `404`, not `403`: job ids are otherwise
         // enumerable across tenants by probing statuses.
-        Some(_) => json_error(StatusCode::NOT_FOUND, "unknown_job", "no such job for this tenant", false),
-        None => json_error(StatusCode::NOT_FOUND, "unknown_job", "no such job, or its retention window passed", false),
+        Some(_) => json_error(
+            StatusCode::NOT_FOUND,
+            "unknown_job",
+            "no such job for this tenant",
+            false,
+        ),
+        None => json_error(
+            StatusCode::NOT_FOUND,
+            "unknown_job",
+            "no such job, or its retention window passed",
+            false,
+        ),
     }
 }
 
 /// `DELETE /v1/jobs/{id}` — cancel (task §6).
-pub async fn cancel_job(State(hub): State<Arc<Hub>>, headers: HeaderMap, Path(id): Path<String>) -> Response {
+pub async fn cancel_job(
+    State(hub): State<Arc<Hub>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
     let tenant = match tenant_of(&hub, &headers) {
         Ok(tenant) => tenant,
         Err(response) => return response,
     };
     let Ok(job) = JobId::parse(&id) else {
-        return json_error(StatusCode::BAD_REQUEST, "invalid_id", "job id is not in the safe alphabet", false);
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_id",
+            "job id is not in the safe alphabet",
+            false,
+        );
     };
     let Some(handle) = hub.route_job(&job).await else {
         return json_error(StatusCode::NOT_FOUND, "unknown_job", "no such job", false);
@@ -379,13 +567,37 @@ pub async fn cancel_job(State(hub): State<Arc<Hub>>, headers: HeaderMap, Path(id
     // because the view comes back through the actor that owns the job.
     match hub.job_snapshot(&job).await {
         Some(view) if view.tenant == tenant => {}
-        Some(_) => return json_error(StatusCode::NOT_FOUND, "unknown_job", "no such job for this tenant", false),
+        Some(_) => {
+            return json_error(
+                StatusCode::NOT_FOUND,
+                "unknown_job",
+                "no such job for this tenant",
+                false,
+            )
+        }
         None => return json_error(StatusCode::NOT_FOUND, "unknown_job", "no such job", false),
     }
-    if state::send(handle.as_ref(), ActorMsg::Cancel { job: job.clone(), reason: CancelReason::ConsumerGone }).await.is_err() {
-        return json_error(StatusCode::SERVICE_UNAVAILABLE, "hub_unavailable", "the pool actor is draining", true);
+    if state::send(
+        handle.as_ref(),
+        ActorMsg::Cancel {
+            job: job.clone(),
+            reason: CancelReason::ConsumerGone,
+        },
+    )
+    .await
+    .is_err()
+    {
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "hub_unavailable",
+            "the pool actor is draining",
+            true,
+        );
     }
-    json_response(StatusCode::OK, &json!({ "job_id": job.to_string(), "cancelling": true }))
+    json_response(
+        StatusCode::OK,
+        &json!({ "job_id": job.to_string(), "cancelling": true }),
+    )
 }
 
 /// `GET /v1/jobs/{id}/events` — SSE progress for any kind (task §7.1).
@@ -400,36 +612,77 @@ pub async fn job_events(
         Err(response) => return response,
     };
     let Ok(job) = JobId::parse(&id) else {
-        return json_error(StatusCode::BAD_REQUEST, "invalid_id", "job id is not in the safe alphabet", false);
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_id",
+            "job id is not in the safe alphabet",
+            false,
+        );
     };
     let Some(handle) = hub.route_job(&job).await else {
         return json_error(StatusCode::NOT_FOUND, "unknown_job", "no such job", false);
     };
     match hub.job_snapshot(&job).await {
         Some(view) if view.tenant == tenant => {}
-        Some(_) => return json_error(StatusCode::NOT_FOUND, "unknown_job", "no such job for this tenant", false),
+        Some(_) => {
+            return json_error(
+                StatusCode::NOT_FOUND,
+                "unknown_job",
+                "no such job for this tenant",
+                false,
+            )
+        }
         None => return json_error(StatusCode::NOT_FOUND, "unknown_job", "no such job", false),
     }
     let from_seq = parse_resume_seq(
         headers
-            .get(header::LAST_EVENT_ID)
+            .get(&LAST_EVENT_ID)
             .and_then(|v| v.to_str().ok())
             .or(query.from_seq.as_deref())
             .or(query.last_event_id.as_deref()),
     );
-    let relay = handle.relay(&job, hub.cfg.limits.consumer_backpressure_frames).await;
+    let relay = handle
+        .relay(&job, hub.cfg.limits.consumer_backpressure_frames)
+        .await;
     // The replay lands in this consumer's private queue, then the live fan-out
     // takes over: a joiner's buffer must not be broadcast to everyone.
     let (replay_tx, replay_rx) = mpsc::channel::<RelayItem>(hub.cfg.limits.replay_frames.max(16));
     *relay.replay_target.lock().await = Some(replay_tx);
     let consumer = hub.ids.consumer_id();
-    if state::send(handle.as_ref(), ActorMsg::Attach { job: job.clone(), consumer: consumer.clone(), from_seq }).await.is_err() {
-        return json_error(StatusCode::SERVICE_UNAVAILABLE, "hub_unavailable", "the pool actor is draining", true);
+    if state::send(
+        handle.as_ref(),
+        ActorMsg::Attach {
+            job: job.clone(),
+            consumer: consumer.clone(),
+            from_seq,
+        },
+    )
+    .await
+    .is_err()
+    {
+        return json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "hub_unavailable",
+            "the pool actor is draining",
+            true,
+        );
     }
-    let (out_tx, out_rx) = mpsc::channel::<Result<Event, Infallible>>(hub.cfg.limits.consumer_backpressure_frames);
-    tokio::spawn(pump_relay(handle, consumer, job.clone(), relay.events.subscribe(), replay_rx, out_tx));
+    let (out_tx, out_rx) =
+        mpsc::channel::<Result<Event, Infallible>>(hub.cfg.limits.consumer_backpressure_frames);
+    tokio::spawn(pump_relay(
+        handle,
+        consumer,
+        job.clone(),
+        relay.events.subscribe(),
+        replay_rx,
+        out_tx,
+    ));
     let mut response = Sse::new(ReceiverStream::new(out_rx))
-        .keep_alive(KeepAlive::new().interval(Duration::from_secs(1)).text("ping"))
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(1))
+                .text("ping"),
+        )
         .into_response();
     add_stream_headers(&mut response);
     response_headers(&job, &mut response);
@@ -437,23 +690,42 @@ pub async fn job_events(
 }
 
 /// `GET /v1/jobs/{id}/result` — the produced artifact bytes, resumable (test 15).
-pub async fn job_result(State(hub): State<Arc<Hub>>, headers: HeaderMap, Path(id): Path<String>, Query(range): Query<crate::io::RangeQuery>) -> Response {
+pub async fn job_result(
+    State(hub): State<Arc<Hub>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(range): Query<crate::io::RangeQuery>,
+) -> Response {
     let tenant = match tenant_of(&hub, &headers) {
         Ok(tenant) => tenant,
         Err(response) => return response,
     };
     let Ok(job) = JobId::parse(&id) else {
-        return json_error(StatusCode::BAD_REQUEST, "invalid_id", "job id is not in the safe alphabet", false);
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_id",
+            "job id is not in the safe alphabet",
+            false,
+        );
     };
     let Some(view) = hub.job_snapshot(&job).await else {
         return json_error(StatusCode::NOT_FOUND, "unknown_job", "no such job", false);
     };
     if view.tenant != tenant {
-        return json_error(StatusCode::NOT_FOUND, "unknown_job", "no such job for this tenant", false);
+        return json_error(
+            StatusCode::NOT_FOUND,
+            "unknown_job",
+            "no such job for this tenant",
+            false,
+        );
     }
     let Some(artifact) = view.artifact.clone() else {
         return json_error(
-            if view.terminal.map(|t| t.retryable()).unwrap_or(true) { StatusCode::CONFLICT } else { StatusCode::NOT_FOUND },
+            if view.terminal.map(|t| t.retryable()).unwrap_or(true) {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::NOT_FOUND
+            },
             "artifact_unavailable",
             "this job has not produced a complete artifact",
             true,
@@ -461,14 +733,25 @@ pub async fn job_result(State(hub): State<Arc<Hub>>, headers: HeaderMap, Path(id
     };
     let from = range.from.unwrap_or(0);
     let to = range.to.unwrap_or(artifact.size_bytes);
-    crate::io::serve_artifact(&artifact.path, artifact.size_bytes, &artifact.content_type, artifact.stored_sha256.as_deref(), from, to).await
+    crate::io::serve_artifact(
+        &artifact.path,
+        artifact.size_bytes,
+        &artifact.content_type,
+        artifact.stored_sha256.as_deref(),
+        from,
+        to,
+    )
+    .await
 }
 
 /// `GET /v1/models` — live, from ready workers only (task §7.1).
 pub async fn models(State(hub): State<Arc<Hub>>) -> Response {
     let readiness = hub.readiness().await;
     let models: std::collections::BTreeSet<String> = readiness.models.iter().cloned().collect();
-    json_response(StatusCode::OK, &adapters::models_document(&models, hub.wall_ms()))
+    json_response(
+        StatusCode::OK,
+        &adapters::models_document(&models, hub.wall_ms()),
+    )
 }
 
 /// `GET /healthz` — degraded capacity is reported, never hidden (task §8, §11).
@@ -484,7 +767,14 @@ pub async fn healthz(State(hub): State<Arc<Hub>>) -> Response {
         "capacity_signal": if readiness.ready_workers == 0 && readiness.loading_workers > 0 { "cold_start" } else if readiness.ready_workers == 0 { "no_workers" } else { "warm" },
         "protocol": nexus_core::PROTOCOL_VERSION,
     });
-    json_response(if readiness.ready_workers == 0 { StatusCode::SERVICE_UNAVAILABLE } else { StatusCode::OK }, &body)
+    json_response(
+        if readiness.ready_workers == 0 {
+            StatusCode::SERVICE_UNAVAILABLE
+        } else {
+            StatusCode::OK
+        },
+        &body,
+    )
 }
 
 /// `GET /metrics` — Prometheus text (task §13's mandatory set).
@@ -503,11 +793,20 @@ pub async fn metrics(State(hub): State<Arc<Hub>>) -> Response {
 /// API key per consumer, never one secret shared across both directions).
 /// Returns the response to send when the key is missing or unknown.
 pub(crate) fn tenant_of(hub: &Arc<Hub>, headers: &HeaderMap) -> Result<TenantId, Response> {
-    let key = bearer(headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()))
-        .or_else(|| header_value(headers, "x-api-key"));
-    hub.api_keys
-        .verify(key)
-        .map_err(|err| json_error(StatusCode::UNAUTHORIZED, "unauthorized", &err.to_string(), false))
+    let key = bearer(
+        headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok()),
+    )
+    .or_else(|| header_value(headers, "x-api-key"));
+    hub.api_keys.verify(key).map_err(|err| {
+        json_error(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            &err.to_string(),
+            false,
+        )
+    })
 }
 
 /// Pool that serves a kind.
@@ -517,7 +816,10 @@ fn pool_for_kind(hub: &Arc<Hub>, kind: &str) -> Option<PoolId> {
 
 /// A header value as `&str`.
 fn header_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
-    headers.get(name).and_then(|value| value.to_str().ok()).filter(|v| !v.trim().is_empty())
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .filter(|v| !v.trim().is_empty())
 }
 
 /// Send a submission and register everything its answer needs **before** the
@@ -539,11 +841,27 @@ fn header_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 /// has written the buffered prefix, which is what closes this channel and lets
 /// the pumps fall through to live events.
 #[allow(clippy::type_complexity)]
-async fn submit(hub: &Arc<Hub>, pool: &PoolId, submission: Submission) -> (JobId, ConsumerId, Arc<state::PoolHandle>, Arc<JobRelay>, oneshot::Receiver<Gate>, broadcast::Receiver<RelayItem>, mpsc::Receiver<RelayItem>) {
+async fn submit(
+    hub: &Arc<Hub>,
+    pool: &PoolId,
+    submission: Submission,
+) -> (
+    JobId,
+    ConsumerId,
+    Arc<state::PoolHandle>,
+    Arc<JobRelay>,
+    oneshot::Receiver<Gate>,
+    broadcast::Receiver<RelayItem>,
+    mpsc::Receiver<RelayItem>,
+) {
     let job = hub.ids.job_id();
     let consumer = hub.ids.consumer_id();
-    let handle = hub.pool(pool).expect("pool handle exists for a configured pool");
-    let relay = handle.relay(&job, hub.cfg.limits.consumer_backpressure_frames).await;
+    let handle = hub
+        .pool(pool)
+        .expect("pool handle exists for a configured pool");
+    let relay = handle
+        .relay(&job, hub.cfg.limits.consumer_backpressure_frames)
+        .await;
     let (gate_tx, gate_rx) = oneshot::channel();
     *relay.gate.lock().await = Some(gate_tx);
     let live = relay.events.subscribe();
@@ -552,12 +870,30 @@ async fn submit(hub: &Arc<Hub>, pool: &PoolId, submission: Submission) -> (JobId
     // The §5 read-mostly index is written here, once, so a later `GET
     // /v1/jobs/{id}` can be routed without a second source of job state.
     hub.bind_job(&job, pool).await;
-    if state::send(handle.as_ref(), ActorMsg::Submit { job: job.clone(), submission, consumer: consumer.clone() }).await.is_err() {
+    if state::send(
+        handle.as_ref(),
+        ActorMsg::Submit {
+            job: job.clone(),
+            submission,
+            consumer: consumer.clone(),
+        },
+    )
+    .await
+    .is_err()
+    {
         // The actor is gone: resolve the gate ourselves so the caller answers 503
         // instead of waiting for the timeout.
         relay.resolve(Gate::Closed).await;
     }
-    (job, consumer, Arc::clone(handle), relay, gate_rx, live, replay_rx)
+    (
+        job,
+        consumer,
+        Arc::clone(handle),
+        relay,
+        gate_rx,
+        live,
+        replay_rx,
+    )
 }
 
 /// Translate relay items into SSE blocks for the OpenAI surface.
@@ -590,7 +926,10 @@ async fn pump_sse(
             }
             RelayItem::Comment(_) => {}
             RelayItem::Event(event) => {
-                let terminal = matches!(event, ConsumerEvent::Finish { .. } | ConsumerEvent::Error { .. });
+                let terminal = matches!(
+                    event,
+                    ConsumerEvent::Finish { .. } | ConsumerEvent::Error { .. }
+                );
                 if !send_block(&job, &model, created, event, &mut through, &tx).await {
                     finished = true;
                     break;
@@ -611,8 +950,17 @@ async fn pump_sse(
                 // A lagging consumer: end the stream in band rather than pretend
                 // the text continued (task §7.5).
                 Err(broadcast::error::RecvError::Lagged(missed)) => {
-                    let payload = adapters::in_band_error("consumer_lagged", &format!("{missed} frames were dropped by the fan-out"), false);
-                    let _ = tx.send(Ok(Event::default().event("error").json_data(payload).expect("error object serializes"))).await;
+                    let payload = adapters::in_band_error(
+                        "consumer_lagged",
+                        &format!("{missed} frames were dropped by the fan-out"),
+                        false,
+                    );
+                    let _ = tx
+                        .send(Ok(Event::default()
+                            .event("error")
+                            .json_data(payload)
+                            .expect("error object serializes")))
+                        .await;
                     break;
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
@@ -624,7 +972,10 @@ async fn pump_sse(
                 }
                 RelayItem::End => break,
                 RelayItem::Event(event) => {
-                    let terminal = matches!(event, ConsumerEvent::Finish { .. } | ConsumerEvent::Error { .. });
+                    let terminal = matches!(
+                        event,
+                        ConsumerEvent::Finish { .. } | ConsumerEvent::Error { .. }
+                    );
                     if !send_block(&job, &model, created, event, &mut through, &tx).await {
                         break;
                     }
@@ -637,7 +988,14 @@ async fn pump_sse(
             }
         }
     }
-    let _ = state::send(handle.as_ref(), ActorMsg::Detach { job: job.clone(), consumer }).await;
+    let _ = state::send(
+        handle.as_ref(),
+        ActorMsg::Detach {
+            job: job.clone(),
+            consumer,
+        },
+    )
+    .await;
 }
 
 /// Write one consumer event as an OpenAI chunk. Returns false once the client is
@@ -652,10 +1010,10 @@ async fn send_block(
     tx: &mpsc::Sender<Result<Event, Infallible>>,
 ) -> bool {
     let seq = match &event {
-        ConsumerEvent::Delta { seq }
-        | ConsumerEvent::Event { seq }
-        | ConsumerEvent::Log { seq }
-        | ConsumerEvent::Artifact { seq }
+        ConsumerEvent::Delta { seq, .. }
+        | ConsumerEvent::Event { seq, .. }
+        | ConsumerEvent::Log { seq, .. }
+        | ConsumerEvent::Artifact { seq, .. }
         | ConsumerEvent::Finish { seq, .. } => Some(*seq),
         _ => None,
     };
@@ -669,8 +1027,15 @@ async fn send_block(
         ConsumerEvent::Delta { text, seq } => Event::default()
             .id(seq.to_string())
             .data(adapters::openai_delta_payload(text, job, model, created)),
-        ConsumerEvent::Event { seq, payload } => Event::default().id(seq.to_string()).event("event").json_data(payload.clone()).expect("event data serializes"),
-        ConsumerEvent::Log { seq, text } => Event::default().id(seq.to_string()).event("log").data(text.clone()),
+        ConsumerEvent::Event { seq, payload } => Event::default()
+            .id(seq.to_string())
+            .event("event")
+            .json_data(payload.clone())
+            .expect("event data serializes"),
+        ConsumerEvent::Log { seq, text } => Event::default()
+            .id(seq.to_string())
+            .event("log")
+            .data(text.clone()),
         ConsumerEvent::Artifact { seq, manifest } => Event::default()
             .id(seq.to_string())
             .event("artifact")
@@ -682,13 +1047,26 @@ async fn send_block(
             .expect("gap object serializes"),
         ConsumerEvent::Finish { seq, finish, usage } => Event::default()
             .id(seq.to_string())
-            .json_data(adapters::finish_chunk(job, model, created, *finish, usage.as_ref()))
+            .json_data(adapters::finish_chunk(
+                job,
+                model,
+                created,
+                *finish,
+                usage.as_ref(),
+            ))
             .expect("finish chunk serializes"),
-        ConsumerEvent::Error { code, message, retryable, .. } => Event::default()
+        ConsumerEvent::Error {
+            code,
+            message,
+            retryable,
+            ..
+        } => Event::default()
             .event("error")
             .json_data(adapters::in_band_error(code, message, *retryable))
             .expect("error object serializes"),
-        other => Event::default().json_data(other.clone()).expect("event serializes"),
+        other => Event::default()
+            .json_data(other.clone())
+            .expect("event serializes"),
     };
     tx.send(Ok(block)).await.is_ok()
 }
@@ -697,8 +1075,12 @@ async fn send_block(
 /// from axum's `Sse`; without these two headers a proxy (or nginx's default)
 /// holds the deltas back and the "streaming" API is not streaming.
 fn add_stream_headers(response: &mut Response) {
-    response.headers_mut().insert("x-accel-buffering", HeaderValue::from_static("no"));
-    response.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    response
+        .headers_mut()
+        .insert("x-accel-buffering", HeaderValue::from_static("no"));
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
 }
 
 /// Translate relay items for the generic job API: one `event:` name per kind, and
@@ -730,7 +1112,10 @@ async fn pump_relay(
             Ok(item) => item,
             Err(broadcast::error::RecvError::Lagged(missed)) => {
                 let _ = tx
-                    .send(Ok(Event::default().event("gap").json_data(json!({ "dropped": missed })).expect("gap serializes")))
+                    .send(Ok(Event::default()
+                        .event("gap")
+                        .json_data(json!({ "dropped": missed }))
+                        .expect("gap serializes")))
                     .await;
                 break;
             }
@@ -747,7 +1132,11 @@ async fn pump_relay(
 /// reached a terminal event. `through` de-duplicates the live fan-out against a
 /// replay that overlapped it; `Gap` and `Error` carry no content seq, so they are
 /// never suppressed.
-async fn forward(item: RelayItem, tx: &mpsc::Sender<Result<Event, Infallible>>, through: &mut u64) -> bool {
+async fn forward(
+    item: RelayItem,
+    tx: &mpsc::Sender<Result<Event, Infallible>>,
+    through: &mut u64,
+) -> bool {
     match item {
         RelayItem::End => false,
         RelayItem::Comment(_text) => {
@@ -757,10 +1146,10 @@ async fn forward(item: RelayItem, tx: &mpsc::Sender<Result<Event, Infallible>>, 
         }
         RelayItem::Event(event) => {
             let seq = match &event {
-                ConsumerEvent::Delta { seq }
-                | ConsumerEvent::Event { seq }
-                | ConsumerEvent::Log { seq }
-                | ConsumerEvent::Artifact { seq }
+                ConsumerEvent::Delta { seq, .. }
+                | ConsumerEvent::Event { seq, .. }
+                | ConsumerEvent::Log { seq, .. }
+                | ConsumerEvent::Artifact { seq, .. }
                 | ConsumerEvent::Finish { seq, .. } => Some(*seq),
                 _ => None,
             };
@@ -771,8 +1160,14 @@ async fn forward(item: RelayItem, tx: &mpsc::Sender<Result<Event, Infallible>>, 
                 *through = seq;
             }
             let name = event.event_name().to_string();
-            let terminal = matches!(event, ConsumerEvent::Finish { .. } | ConsumerEvent::Error { .. });
-            let mut builder = Event::default().event(&name).json_data(event).expect("event serializes");
+            let terminal = matches!(
+                event,
+                ConsumerEvent::Finish { .. } | ConsumerEvent::Error { .. }
+            );
+            let mut builder = Event::default()
+                .event(&name)
+                .json_data(event)
+                .expect("event serializes");
             if let Some(seq) = seq {
                 builder = builder.id(seq.to_string());
             }
@@ -790,7 +1185,9 @@ fn json_response(status: StatusCode, body: &Value) -> Response {
     Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, "application/json")
-        .body(axum::body::Body::from(serde_json::to_string(body).expect("value serializes")))
+        .body(axum::body::Body::from(
+            serde_json::to_string(body).expect("value serializes"),
+        ))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 

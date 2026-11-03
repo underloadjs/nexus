@@ -51,7 +51,16 @@ pub struct QueueSnapshot {
 }
 
 /// A pool's queue. One instance per [`crate::actor::PoolActor`].
-pub trait QueueBackend {
+///
+/// `Send + Sync` is part of the contract, not an implementation detail: the backend
+/// is boxed inside the actor, and the native runtime spawns that actor as a tokio
+/// task on a multi-thread runtime. The task holds `Box<dyn QueueBackend>` across
+/// await points (so it must be `Send`), and the effect dispatcher borrows
+/// `&PoolActor` across awaits (so the actor, and therefore the box, must also be
+/// `Sync`). A single-threaded WASM host satisfies both trivially, and a
+/// Redis/Postgres/NATS backend client is `Send + Sync` anyway; an exotic backend
+/// that is neither has to be wrapped before it can be plugged in.
+pub trait QueueBackend: Send + Sync {
     /// Add a job. Implementations must reject when full and when duplicated.
     ///
     /// `seq` is the arrival sequence the actor assigns, so FIFO order is
@@ -115,7 +124,11 @@ impl InMemoryQueue {
     /// Queue with a hard depth of `limit`.
     #[must_use]
     pub fn new(limit: usize) -> Self {
-        Self { entries: BTreeMap::new(), index: BTreeMap::new(), limit: limit.max(1) }
+        Self {
+            entries: BTreeMap::new(),
+            index: BTreeMap::new(),
+            limit: limit.max(1),
+        }
     }
 
     /// Configured bound.
@@ -139,7 +152,8 @@ impl InMemoryQueue {
         }
         let key = (priority as u8, seq);
         self.entries.insert(key, job.clone());
-        self.index.insert(job.clone(), (priority as u8, seq, deadline_ms));
+        self.index
+            .insert(job.clone(), (priority as u8, seq, deadline_ms));
         Ok(())
     }
 }
@@ -198,9 +212,11 @@ impl QueueBackend for InMemoryQueue {
     fn snapshot(&self, _now_ms: Timestamp) -> QueueSnapshot {
         let mut by_class: BTreeMap<Priority, usize> = BTreeMap::new();
         let mut oldest: Option<Timestamp> = None;
-        for (_, seq_deadline) in self.index.values() {
+        // Index values are `(priority, seq, deadline)`; only the deadline matters
+        // for the oldest-deadline gauge, so the other two are skipped by name.
+        for (_, _, deadline) in self.index.values() {
             // class is recovered from the entry key below; deadlines scanned here
-            oldest = Some(oldest.map_or(*seq_deadline, |o: Timestamp| o.min(*seq_deadline)));
+            oldest = Some(oldest.map_or(*deadline, |o: Timestamp| o.min(*deadline)));
         }
         for (class, _seq) in self.entries.keys() {
             let priority = match class {
@@ -210,7 +226,12 @@ impl QueueBackend for InMemoryQueue {
             };
             *by_class.entry(priority).or_insert(0) += 1;
         }
-        QueueSnapshot { depth: self.entries.len(), by_class, oldest_deadline_ms: oldest, limit: self.limit }
+        QueueSnapshot {
+            depth: self.entries.len(),
+            by_class,
+            oldest_deadline_ms: oldest,
+            limit: self.limit,
+        }
     }
 
     fn purge_expired(&mut self, now_ms: Timestamp) -> Vec<JobId> {
@@ -247,10 +268,13 @@ mod tests {
     fn order_is_class_then_fifo_exactly() {
         let mut q = InMemoryQueue::new(8);
         // Arrival order deliberately interleaves classes.
-        q.enqueue(&job("a"), Priority::Default, 1, 1_000).expect("ok");
+        q.enqueue(&job("a"), Priority::Default, 1, 1_000)
+            .expect("ok");
         q.enqueue(&job("b"), Priority::Bulk, 2, 1_000).expect("ok");
-        q.enqueue(&job("c"), Priority::Realtime, 3, 1_000).expect("ok");
-        q.enqueue(&job("d"), Priority::Default, 4, 1_000).expect("ok");
+        q.enqueue(&job("c"), Priority::Realtime, 3, 1_000)
+            .expect("ok");
+        q.enqueue(&job("d"), Priority::Default, 4, 1_000)
+            .expect("ok");
         let order = std::iter::from_fn(|| q.claim()).collect::<Vec<_>>();
         assert_eq!(
             order,
@@ -265,7 +289,10 @@ mod tests {
         let mut q = InMemoryQueue::new(2);
         assert_eq!(q.enqueue(&job("a"), Priority::Default, 1, 0), Ok(()));
         assert_eq!(q.enqueue(&job("b"), Priority::Default, 2, 0), Ok(()));
-        assert_eq!(q.enqueue(&job("c"), Priority::Default, 3, 0), Err(QueueError::Full { limit: 2 }));
+        assert_eq!(
+            q.enqueue(&job("c"), Priority::Default, 3, 0),
+            Err(QueueError::Full { limit: 2 })
+        );
         assert_eq!(q.depth(), 2);
     }
 
@@ -273,26 +300,39 @@ mod tests {
     fn duplicate_enqueue_is_refused() {
         let mut q = InMemoryQueue::new(4);
         q.enqueue(&job("a"), Priority::Default, 1, 0).expect("ok");
-        assert_eq!(q.enqueue(&job("a"), Priority::Default, 2, 0), Err(QueueError::Duplicate));
-        assert_eq!(q.requeue(&job("a"), Priority::Default, 3, 0), Err(QueueError::Duplicate));
+        assert_eq!(
+            q.enqueue(&job("a"), Priority::Default, 2, 0),
+            Err(QueueError::Duplicate)
+        );
+        assert_eq!(
+            q.requeue(&job("a"), Priority::Default, 3, 0),
+            Err(QueueError::Duplicate)
+        );
         assert_eq!(q.depth(), 1, "the refusal must not have added anything");
     }
 
     #[test]
     fn requeue_appends_behind_older_same_class_work() {
         let mut q = InMemoryQueue::new(4);
-        q.enqueue(&job("first"), Priority::Default, 1, 0).expect("ok");
+        q.enqueue(&job("first"), Priority::Default, 1, 0)
+            .expect("ok");
         // "second" was dispatched (never in the queue), then requeued with a
         // later seq than "first": it must land behind it.
-        q.requeue(&job("second"), Priority::Default, 2, 0).expect("ok");
-        assert_eq!(std::iter::from_fn(|| q.claim()).collect::<Vec<_>>(), vec![job("first"), job("second")]);
+        q.requeue(&job("second"), Priority::Default, 2, 0)
+            .expect("ok");
+        assert_eq!(
+            std::iter::from_fn(|| q.claim()).collect::<Vec<_>>(),
+            vec![job("first"), job("second")]
+        );
     }
 
     #[test]
     fn purge_and_remove_and_snapshot() {
         let mut q = InMemoryQueue::new(4);
-        q.enqueue(&job("soon"), Priority::Realtime, 1, 100).expect("ok");
-        q.enqueue(&job("later"), Priority::Bulk, 2, 5_000).expect("ok");
+        q.enqueue(&job("soon"), Priority::Realtime, 1, 100)
+            .expect("ok");
+        q.enqueue(&job("later"), Priority::Bulk, 2, 5_000)
+            .expect("ok");
         assert_eq!(q.purge_expired(200), vec![job("soon")]);
         assert_eq!(q.depth(), 1);
         assert!(q.contains(&job("later")));
@@ -300,7 +340,12 @@ mod tests {
         assert!(!q.remove(&job("later")));
         assert_eq!(
             q.snapshot(0),
-            QueueSnapshot { depth: 0, by_class: BTreeMap::new(), oldest_deadline_ms: None, limit: 4 }
+            QueueSnapshot {
+                depth: 0,
+                by_class: BTreeMap::new(),
+                oldest_deadline_ms: None,
+                limit: 4
+            }
         );
 
         // Snapshot with content, exactly.
@@ -312,7 +357,12 @@ mod tests {
         by_class.insert(Priority::Bulk, 2);
         assert_eq!(
             snap,
-            QueueSnapshot { depth: 2, by_class, oldest_deadline_ms: Some(7_000), limit: 3 }
+            QueueSnapshot {
+                depth: 2,
+                by_class,
+                oldest_deadline_ms: Some(7_000),
+                limit: 3
+            }
         );
     }
 

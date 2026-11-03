@@ -43,9 +43,16 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 #![allow(clippy::module_name_repetitions)]
+// The workspace sets `unwrap_used`/`expect_used` as warns (Cargo.toml
+// `[workspace.lints.clippy]`) and `yarn clippy` escalates them with `-D
+// warnings`. Those lints exist for the shipped paths; the policy comment says
+// tests "are allowed to be blunt", and an `expect` inside a unit test *is* the
+// assertion, so the exception is scoped to test builds here rather than by
+// watering down the lint for production code.
+#![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
-pub mod adapters;
 pub mod actor;
+pub mod adapters;
 pub mod auth;
 pub mod config;
 pub mod errors;
@@ -148,10 +155,7 @@ pub(crate) mod util {
     /// Case-insensitive, non-allocating hex validation for SHA-256 digests
     /// coming from workers (untrusted input — task §9).
     pub fn is_sha256_hex(value: &str) -> bool {
-        value.len() == 64
-            && value
-                .bytes()
-                .all(|b| b.is_ascii_hexdigit())
+        value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
     }
 
     /// Worker-supplied identifiers end up in filesystem paths and URLs, so they
@@ -166,6 +170,21 @@ pub(crate) mod util {
             // escape a join; reject any run of dots at the edges.
             && !value.starts_with('.')
             && !value.ends_with('.')
+    }
+
+    /// Pool ids carry one extra axis: they are `kind/model` (task §8, and the
+    /// reference pools are `llm.chat/qwen38` / `image.render/comfyui`), so a single
+    /// `/` is part of the vocabulary rather than a path accident. The rule is
+    /// therefore per-segment: **every** `/`-separated segment must pass
+    /// [`is_safe_id`], which keeps `""`, `"x/"`, `"/x"`, `"a//b"` and `"a/../b"`
+    /// rejected while `llm.chat/qwen38` parses.
+    ///
+    /// Pool ids are never filesystem path components here (only job and artifact
+    /// ids are, see `store::artifact_path_checked`), but they do appear in URLs,
+    /// metric labels and `Welcome.pools`, hence the same strength per segment.
+    pub fn is_safe_pool_id(value: &str) -> bool {
+        // Two 64-char segments plus the separator is the most a valid pair can be.
+        value.len() <= 129 && value.split('/').all(is_safe_id)
     }
 
     /// Length-checked, byte-wise equality without early exit on the content
@@ -187,6 +206,10 @@ pub(crate) mod util {
     /// comparisons against digests/hex allowlists are not case sensitive.
     #[must_use]
     pub fn normalize_hex(value: &str) -> String {
-        value.trim().chars().map(|c| c.to_ascii_lowercase()).collect()
+        value
+            .trim()
+            .chars()
+            .map(|c| c.to_ascii_lowercase())
+            .collect()
     }
 }

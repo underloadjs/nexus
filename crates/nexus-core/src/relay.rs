@@ -121,7 +121,11 @@ impl ConsumerEvent {
     #[must_use]
     pub fn seq(&self) -> Option<u64> {
         match self {
-            Self::Delta { seq } | Self::Event { seq } | Self::Log { seq } | Self::Artifact { seq } | Self::Finish { seq } => Some(*seq),
+            Self::Delta { seq, .. }
+            | Self::Event { seq, .. }
+            | Self::Log { seq, .. }
+            | Self::Artifact { seq, .. }
+            | Self::Finish { seq, .. } => Some(*seq),
             Self::Error { through_seq, .. } => *through_seq,
             Self::Gap { expected, .. } => Some(*expected - 1),
             Self::Replay { from_seq } => Some(*from_seq),
@@ -161,6 +165,14 @@ pub struct FlushGate {
     pub flushed_frames: u64,
     /// Batches emitted in total (metrics: syscalls saved).
     pub flushes: u64,
+    /// Set by [`FlushGate::force`]: the next [`FlushGate::should_flush`] answers
+    /// true whatever the size and age windows say, because a terminal or cancelled
+    /// job must never hold bytes behind a batching window. The age window alone
+    /// cannot express that (a frame that arrived 1 ms ago is younger than
+    /// `flush_interval_ms`), which is why the flag exists. Cleared by
+    /// [`FlushGate::commit_flush`].
+    #[serde(default)]
+    pub forced: bool,
 }
 
 impl FlushGate {
@@ -180,10 +192,15 @@ impl FlushGate {
         if self.pending_frames == 0 {
             return false;
         }
+        // `force()` wins over both windows: a batch that has been told to go, goes.
+        if self.forced {
+            return true;
+        }
         if self.pending_bytes >= byte_threshold {
             return true;
         }
-        self.oldest_ms.is_some_and(|first| now_ms.saturating_sub(first) >= interval_ms)
+        self.oldest_ms
+            .is_some_and(|first| now_ms.saturating_sub(first) >= interval_ms)
     }
 
     /// Clear the pending counters after a flush, recording the batch.
@@ -192,6 +209,8 @@ impl FlushGate {
         self.pending_bytes = 0;
         self.pending_frames = 0;
         self.oldest_ms = None;
+        // The forced request is spent: the next batch is judged on its own windows.
+        self.forced = false;
         self.flushed_frames += out.1 as u64;
         self.flushes += 1;
         out
@@ -206,8 +225,13 @@ impl FlushGate {
     }
 
     /// Force the next check to flush (cancel/finish must never hold bytes back).
+    ///
+    /// `now_ms` only seeds `oldest_ms` when nothing is pending yet, so a later
+    /// `note()` cannot start an age window that outlives the forced flush; the
+    /// flush decision itself comes from the `forced` flag, not from the clock.
     pub fn force(&mut self, now_ms: Timestamp) {
-        self.oldest_ms = Some(now_ms);
+        self.forced = true;
+        self.oldest_ms = self.oldest_ms.or(Some(now_ms));
     }
 }
 
@@ -255,7 +279,9 @@ pub fn sse_event(event: &ConsumerEvent) -> String {
 /// de-duplicates against the seq tracker.
 #[must_use]
 pub fn parse_resume_seq(value: Option<&str>) -> u64 {
-    value.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0)
+    value
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(0)
 }
 
 /// Tiny integer formatter (avoids pulling `itoa`/`ryu` into the core).
@@ -278,36 +304,63 @@ mod tests {
         // No event name → browsers treat it as `message`.
         assert_eq!(sse(None, None, "hello"), "data: hello\n\n");
         // Embedded newlines must each get their own `data:` prefix.
-        assert_eq!(sse(None, Some("log"), "one\ntwo\n"), "event: log\ndata: one\ndata: two\ndata: \n\n");
+        assert_eq!(
+            sse(None, Some("log"), "one\ntwo\n"),
+            "event: log\ndata: one\ndata: two\ndata: \n\n"
+        );
         assert_eq!(sse_comment("ping"), ": ping\n\n");
     }
 
     #[test]
     fn consumer_event_names_ids_and_sizes_are_exact() {
-        let delta = ConsumerEvent::Delta { seq: 3, text: "{\"choices\":[]}".to_string() };
+        let delta = ConsumerEvent::Delta {
+            seq: 3,
+            text: "{\"choices\":[]}".to_string(),
+        };
         assert_eq!(delta.event_name(), "delta");
         assert_eq!(delta.seq(), Some(3));
-        assert_eq!(delta.size_bytes(), 13);
+        // The delta's cost is its verbatim text: `{"choices":[]}` is 14 characters
+        // (1 + 1 + 7 + 1 + 1 + 1 + 1 + 1), and the ring stores exactly that string.
+        assert_eq!(delta.size_bytes(), 14);
 
-        let finish = ConsumerEvent::Finish { seq: 9, finish: FinishKind::ToolCalls, usage: Some(json!({"completion_tokens": 4})) };
+        let finish = ConsumerEvent::Finish {
+            seq: 9,
+            finish: FinishKind::ToolCalls,
+            usage: Some(json!({"completion_tokens": 4})),
+        };
         assert_eq!(finish.event_name(), "finish");
         assert_eq!(finish.seq(), Some(9));
 
-        let err = ConsumerEvent::Error { code: "worker_gone_partial".into(), message: "x".into(), retryable: false, through_seq: Some(5) };
+        let err = ConsumerEvent::Error {
+            code: "worker_gone_partial".into(),
+            message: "x".into(),
+            retryable: false,
+            through_seq: Some(5),
+        };
         assert_eq!(err.seq(), Some(5));
 
-        let meta = ConsumerEvent::Meta { job: "job-1".into(), attempt: 1, pool: "p".into(), kind: "llm.chat".into() };
+        let meta = ConsumerEvent::Meta {
+            job: "job-1".into(),
+            attempt: 1,
+            pool: "p".into(),
+            kind: "llm.chat".into(),
+        };
         assert_eq!(meta.seq(), None);
         assert_eq!(meta.event_name(), "meta");
     }
 
     #[test]
     fn sse_event_round_trips_through_the_generic_encoder() {
-        let event = ConsumerEvent::Event { seq: 4, payload: json!({"progress": 0.5}) };
+        let event = ConsumerEvent::Event {
+            seq: 4,
+            payload: json!({"progress": 0.5}),
+        };
         let block = sse_event(&event);
         assert!(block.starts_with("id: 4\nevent: event\ndata: "), "{block}");
         // The data line is the serialized event, so a client can parse it back.
-        let data = block.trim_end().trim_start_matches("id: 4\nevent: event\ndata: ");
+        let data = block
+            .trim_end()
+            .trim_start_matches("id: 4\nevent: event\ndata: ");
         let back: ConsumerEvent = serde_json::from_str(data).expect("parse back");
         assert_eq!(back, event);
         let _ = FrameKind::Delta;
@@ -320,9 +373,15 @@ mod tests {
 
         gate.note(100, 512);
         gate.note(110, 512);
-        assert!(!gate.should_flush(120, 75, 1_536), "1024 bytes is under the byte threshold and under the age");
+        assert!(
+            !gate.should_flush(120, 75, 1_536),
+            "1024 bytes is under the byte threshold and under the age"
+        );
         gate.note(120, 512);
-        assert!(gate.should_flush(125, 75, 1_536), "1536 bytes hits the byte threshold immediately");
+        assert!(
+            gate.should_flush(125, 75, 1_536),
+            "1536 bytes hits the byte threshold immediately"
+        );
         assert_eq!(gate.commit_flush(), (1_536, 3));
         assert_eq!((gate.flushes, gate.flushed_frames), (1, 3));
         assert!(!gate.should_flush(5_000, 75, 1_536));

@@ -37,9 +37,9 @@ pub struct WireCaps {
 impl Default for WireCaps {
     fn default() -> Self {
         Self {
-            max_line_bytes: 1 << 20,              // 1 MiB control line
-            max_frame_text_bytes: 256 << 10,      // 256 KiB delta/event body
-            max_inline_payload_bytes: 8 << 20,    // 8 MiB inline cap
+            max_line_bytes: 1 << 20,           // 1 MiB control line
+            max_frame_text_bytes: 256 << 10,   // 256 KiB delta/event body
+            max_inline_payload_bytes: 8 << 20, // 8 MiB inline cap
         }
     }
 }
@@ -90,7 +90,8 @@ impl Requires {
     }
 
     /// Union used when a worker joins several pools with different offers.
-    #[must_use]
+    /// Mutates `self`; no `#[must_use]` because the return value is `()` and the
+    /// effect *is* the mutation.
     pub fn merge(&mut self, other: &Self) {
         if self.model.is_none() {
             self.model.clone_from(&other.model);
@@ -266,7 +267,7 @@ impl ByeReason {
             Self::VersionMismatch => 1002, // protocol error
             Self::AttestationRejected | Self::AuthRejected => 1008, // policy violation
             Self::Evicted | Self::HeartbeatTimeout => 1000, // normal, reconnect expected
-            Self::Shutdown => 1001, // going away
+            Self::Shutdown => 1001,        // going away
         }
     }
 }
@@ -564,7 +565,12 @@ fn guard_line(line: &str, caps: &WireCaps) -> Result<(), CoreError> {
 /// here, before anything reaches the actor.
 fn validate_worker_frame(frame: &WorkerFrame, caps: &WireCaps) -> Result<(), CoreError> {
     match frame {
-        WorkerFrame::Hello { worker_id, capacity, attestation, .. } => {
+        WorkerFrame::Hello {
+            worker_id,
+            capacity,
+            attestation,
+            ..
+        } => {
             WorkerId::parse(worker_id)?;
             if *capacity == 0 {
                 return Err(CoreError::Protocol {
@@ -576,7 +582,13 @@ fn validate_worker_frame(frame: &WorkerFrame, caps: &WireCaps) -> Result<(), Cor
             validate_attestation_shape(attestation)?;
             Ok(())
         }
-        WorkerFrame::Frame { job, kind, text, artifact, .. } => {
+        WorkerFrame::Frame {
+            job,
+            kind,
+            text,
+            artifact,
+            ..
+        } => {
             JobId::parse(job.as_ref())?;
             if text.len() > caps.max_frame_text_bytes {
                 return Err(CoreError::TooLarge {
@@ -661,7 +673,11 @@ impl JsonLines {
     /// New splitter using `caps` for the per-line bound.
     #[must_use]
     pub fn new(caps: WireCaps) -> Self {
-        Self { buf: Vec::new(), caps, overflow: false }
+        Self {
+            buf: Vec::new(),
+            caps,
+            overflow: false,
+        }
     }
 
     /// Append a chunk and return every complete line, in arrival order.
@@ -691,19 +707,25 @@ impl JsonLines {
         // Split on b'\n' then drop CR so CRLF-terminated hosts also work.
         while let Some(pos) = self.buf.iter().position(|b| *b == b'\n') {
             let raw: Vec<u8> = self.buf.drain(..=pos).collect();
-            let trimmed = match raw.split_last() {
-                Some((b'\n', head)) => match head.split_last() {
-                    Some((b'\r', head2)) => *head2,
-                    _ => head,
-                },
-                _ => raw.as_slice(),
-            };
+            // Two sequential suffix trims, written as rebinds rather than a nested
+            // `match`: `split_last` binds the remainder by reference, so nested arms
+            // disagree between `[u8]` and `&[u8]`. Drop the `\n` that was split on
+            // first, then the `\r` in front of it when a CRLF host sent one.
+            let without_lf: &[u8] = raw
+                .split_last()
+                .filter(|(last, _)| **last == b'\n')
+                .map_or(raw.as_slice(), |(_, rest)| rest);
+            let trimmed: &[u8] = without_lf
+                .split_last()
+                .filter(|(last, _)| **last == b'\r')
+                .map_or(without_lf, |(_, rest)| rest);
             if !trimmed.is_empty() {
                 // Invalid UTF-8 on a JSON socket is a protocol error, but the
                 // lossy conversion keeps the message readable in logs.
-                let line = String::from_utf8(trimmed.to_vec()).map_err(|e| CoreError::Protocol {
-                    reason: format!("line is not utf-8: {e}"),
-                })?;
+                let line =
+                    String::from_utf8(trimmed.to_vec()).map_err(|e| CoreError::Protocol {
+                        reason: format!("line is not utf-8: {e}"),
+                    })?;
                 lines.push(line);
             }
         }
@@ -740,7 +762,10 @@ mod tests {
         assert!(
             matches!(
                 negotiate(2),
-                Err(CoreError::VersionMismatch { requested: 2, supported: 1 })
+                Err(CoreError::VersionMismatch {
+                    requested: 2,
+                    supported: 1
+                })
             ),
             "a version the hub does not speak must be a clean reject"
         );
@@ -790,11 +815,22 @@ mod tests {
 
     #[test]
     fn oversize_delta_is_capped() {
-        let caps = WireCaps { max_frame_text_bytes: 8, ..WireCaps::default() };
-        let line = r#"{"type":"frame","job":"j1","seq":1,"kind":"delta","text":"0123456789abcdef"}"#;
+        let caps = WireCaps {
+            max_frame_text_bytes: 8,
+            ..WireCaps::default()
+        };
+        let line =
+            r#"{"type":"frame","job":"j1","seq":1,"kind":"delta","text":"0123456789abcdef"}"#;
         let err = decode_worker_frame(line, &caps).expect_err("must reject");
         assert!(
-            matches!(err, CoreError::TooLarge { what: "frame text", limit: 8, actual: 16 }),
+            matches!(
+                err,
+                CoreError::TooLarge {
+                    what: "frame text",
+                    limit: 8,
+                    actual: 16
+                }
+            ),
             "{err:?}"
         );
     }
@@ -812,9 +848,22 @@ mod tests {
         assert_eq!(split.finish(), None);
 
         // A line larger than the cap is fatal, and stays fatal.
-        let mut tight = JsonLines::new(WireCaps { max_line_bytes: 4, ..WireCaps::default() });
+        let mut tight = JsonLines::new(WireCaps {
+            max_line_bytes: 4,
+            ..WireCaps::default()
+        });
         let err = tight.push(b"123456").expect_err("must reject");
-        assert!(matches!(err, CoreError::TooLarge { limit: 4, actual: 6, .. }), "{err:?}");
+        assert!(
+            matches!(
+                err,
+                CoreError::TooLarge {
+                    limit: 4,
+                    actual: 6,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
         assert!(tight.push(b"x").is_err(), "overflow must be sticky");
     }
 
@@ -832,11 +881,23 @@ mod tests {
             capabilities: BTreeSet::from(["tools".to_string()]),
             kv_estimate_tokens: None,
         };
-        assert!(!job.satisfied_by(&warm_4), "vision missing → immediate 400 path");
-        let full = Requires { capabilities: ["tools", "vision"].into_iter().collect(), ..warm_4.clone() };
+        assert!(
+            !job.satisfied_by(&warm_4),
+            "vision missing → immediate 400 path"
+        );
+        let full = Requires {
+            capabilities: ["tools", "vision"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            ..warm_4.clone()
+        };
         assert!(job.satisfied_by(&full));
         // kv estimate above the offered context is also unsatisfiable.
-        let kv = Requires { kv_estimate_tokens: Some(600_000), ..job.clone() };
+        let kv = Requires {
+            kv_estimate_tokens: Some(600_000),
+            ..job.clone()
+        };
         assert!(!kv.satisfied_by(&full));
     }
 }

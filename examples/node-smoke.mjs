@@ -30,7 +30,30 @@ const SHARD_1 = "40f369eca301ec6ea318dbb671b3132c26a2f0b89aa5458a7051b33215ee296
 const SHARD_2 = "316b46f3a2dbd68c900f43136ab9449f9dcc3725dfd8c794847c204bc161e113";
 
 /** The config the module is built with; identical to the Rust test fixture. */
+// `BrokerConfig::from_json_str` (what the WASM constructor calls) replaces the
+// whole document — it does not merge onto the defaults — and `validate()` refuses
+// a config with no pools or without the `llm.chat` kind the OpenAI adapter needs,
+// so the topology the Rust fixtures inherit from `BrokerConfig::default()`
+// (`nexus-core/src/fixture.rs:19`) is spelled out here. `tenants` is declared for
+// the same reason: an api key naming an undeclared tenant is a refused config,
+// not an implicitly created account.
 const CONFIG_JSON = JSON.stringify({
+    pools: {
+        "llm.chat/qwen38": {
+            requires: { model: "qwen38", min_context_tokens: 524288, capabilities: [] },
+        },
+    },
+    kinds: {
+        "llm.chat": {
+            pool: "llm.chat/qwen38",
+            idempotent: true,
+            streaming: true,
+            requires: { model: "qwen38", capabilities: [] },
+        },
+    },
+    tenants: {
+        acme: {},
+    },
     limits: {
         no_worker_grace_ms: 2000,
         resume_grace_ms: 1500,
