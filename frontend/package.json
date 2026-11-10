@@ -1,0 +1,29 @@
+{
+    "name": "@underload/nexus-frontend",
+    "version": "0.1.0",
+    "private": true,
+    "description": "Nexus Monitor — static GitHub Pages dashboard for observing a nexus-hub (polls GET /v1/observe + /metrics, read-only)",
+    "type": "module",
+    "scripts": {
+        "dev": "vite",
+        "build": "vite build",
+        "preview": "vite preview",
+        "test": "vitest run",
+        "typecheck": "tsc --noEmit"
+    },
+    "author": "NQQT",
+    "license": "MIT",
+    "dependencies": {
+        "react": "^18.2.0",
+        "react-dom": "^18.2.0"
+    },
+    "devDependencies": {
+        "@types/node": "^25.9.1",
+        "@types/react": "^18.2.0",
+        "@types/react-dom": "^18.2.0",
+        "@vitejs/plugin-react": "^6.0.1",
+        "typescript": "^6.0.0",
+        "vite": "^8.0.8",
+        "vitest": "^4.1.4"
+    }
+}

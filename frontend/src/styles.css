@@ -1,0 +1,826 @@
+/* Nexus Monitor — the single stylesheet for the whole dashboard.
+ *
+ * One plain CSS file by design: the app ships no component library, so the
+ * entire visual language (tokens, panels, tables, chips, graph nodes) lives
+ * here and can be read top to bottom. Class names mirror the component
+ * markup one-to-one.
+ */
+
+:root {
+    /* Dark telemetry aesthetic: low-luminance surfaces so the coloured
+       state chips are the most saturated thing on screen. */
+    --bg: #0a0e13;
+    --panel: #111721;
+    --panel-2: #0d131c;
+    --line: #1e2836;
+    --line-strong: #2b3a4d;
+    --text: #dbe4ee;
+    --muted: #8ea0b5;
+    --ok: #34d399;
+    --warn: #fbbf24;
+    --bad: #f87171;
+    --info: #60a5fa;
+    --accent: #22d3ee;
+
+    --radius: 10px;
+    --gap: 16px;
+
+    --font: ui-sans-serif, system-ui, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+    --font-mono: ui-monospace, 'Cascadia Mono', 'JetBrains Mono', Menlo, Consolas, monospace;
+}
+
+* {
+    box-sizing: border-box;
+}
+
+html,
+body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font);
+    font-size: 14px;
+    line-height: 1.45;
+}
+
+#root {
+    min-height: 100vh;
+}
+
+code,
+.mono {
+    font-family: var(--font-mono);
+    font-size: 0.92em;
+}
+
+.muted {
+    color: var(--muted);
+}
+
+/* ── Layout shell ─────────────────────────────────────────────────────── */
+
+.app {
+    display: flex;
+    flex-direction: column;
+    gap: var(--gap);
+    padding: 18px 22px 28px;
+    max-width: 1680px;
+    margin: 0 auto;
+}
+
+.app-header {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: var(--gap);
+    padding-bottom: 12px;
+    border-bottom: 1px solid var(--line);
+}
+
+.brand h1 {
+    margin: 0;
+    font-size: 20px;
+    letter-spacing: 0.2px;
+}
+
+.brand-meta {
+    display: block;
+    color: var(--muted);
+    font-size: 12px;
+}
+
+.app-footer {
+    color: var(--muted);
+    font-size: 12px;
+    text-align: center;
+    padding-top: 10px;
+    border-top: 1px solid var(--line);
+}
+
+/* Responsive panel grid: cards fill the width, wide panels span everything. */
+.grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(460px, 1fr));
+    gap: var(--gap);
+    align-items: start;
+}
+
+.span-all {
+    grid-column: 1 / -1;
+}
+
+/* ── Connect screen ───────────────────────────────────────────────────── */
+
+.connect-screen {
+    display: grid;
+    place-items: center;
+    padding: 8vh 16px 4vh;
+}
+
+.connect-card {
+    width: min(620px, 100%);
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding: 28px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+}
+
+.connect-card h1 {
+    margin: 0;
+    font-size: 24px;
+}
+
+.connect-lede {
+    margin: 0;
+    color: var(--muted);
+}
+
+.connect-notes {
+    margin: 8px 0 0;
+    padding-left: 18px;
+    color: var(--muted);
+    font-size: 12px;
+}
+
+.connect-notes li {
+    margin-bottom: 4px;
+}
+
+/* ── Inputs, buttons, fields ──────────────────────────────────────────── */
+
+.field-label {
+    display: block;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--muted);
+}
+
+.field-label-inline {
+    display: inline;
+    margin: 0;
+}
+
+.url-input {
+    width: 100%;
+    padding: 10px 12px;
+    background: var(--panel-2);
+    color: var(--text);
+    border: 1px solid var(--line-strong);
+    border-radius: 8px;
+    font-family: var(--font-mono);
+    font-size: 13px;
+}
+
+.url-input:focus {
+    outline: none;
+    border-color: var(--accent);
+}
+
+.url-input-compact {
+    width: 320px;
+    max-width: 46vw;
+    padding: 7px 10px;
+}
+
+.field-error {
+    margin: 0;
+    color: var(--bad);
+    font-size: 12px;
+}
+
+.field-error-inline {
+    display: inline-block;
+    margin-left: 4px;
+}
+
+.field-warn {
+    margin: 0;
+    color: var(--warn);
+    font-size: 12px;
+}
+
+.btn {
+    padding: 8px 14px;
+    background: var(--panel-2);
+    color: var(--text);
+    border: 1px solid var(--line-strong);
+    border-radius: 8px;
+    cursor: pointer;
+    font: inherit;
+}
+
+.btn:hover:not(:disabled) {
+    border-color: var(--accent);
+    color: #fff;
+}
+
+.btn:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+}
+
+.btn-primary {
+    background: linear-gradient(180deg, rgba(34, 211, 238, 0.18), rgba(34, 211, 238, 0.06));
+    border-color: var(--accent);
+    color: #e8fdff;
+    font-weight: 600;
+}
+
+.btn-ghost {
+    background: transparent;
+}
+
+.btn-mini {
+    padding: 3px 8px;
+    font-size: 11px;
+    border-radius: 6px;
+}
+
+.filter-input {
+    padding: 6px 10px;
+    width: 220px;
+    background: var(--panel-2);
+    color: var(--text);
+    border: 1px solid var(--line-strong);
+    border-radius: 8px;
+    font-size: 12px;
+}
+
+/* ── Connected header bar ─────────────────────────────────────────────── */
+
+.connect-bar {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    align-items: flex-end;
+}
+
+.connect-form {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+}
+
+.bar-controls {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+}
+
+/* ── Chips (state pills) ──────────────────────────────────────────────── */
+
+.chip {
+    display: inline-flex;
+    align-items: center;
+    padding: 2px 8px;
+    margin-right: 4px;
+    border-radius: 999px;
+    border: 1px solid var(--line-strong);
+    background: var(--panel-2);
+    color: var(--text);
+    font-size: 11px;
+    line-height: 1.6;
+    white-space: nowrap;
+}
+
+.tone-ok .chip,
+.chip.tone-ok {
+    border-color: rgba(52, 211, 153, 0.5);
+    color: var(--ok);
+}
+
+.tone-warn .chip,
+.chip.tone-warn {
+    border-color: rgba(251, 191, 36, 0.5);
+    color: var(--warn);
+}
+
+.tone-bad .chip,
+.chip.tone-bad {
+    border-color: rgba(248, 113, 113, 0.5);
+    color: var(--bad);
+}
+
+.tone-info .chip,
+.chip.tone-info {
+    border-color: rgba(96, 165, 250, 0.5);
+    color: var(--info);
+}
+
+.tone-warn-text {
+    color: var(--warn);
+}
+
+.legend {
+    display: inline-flex;
+    gap: 2px;
+}
+
+/* ── Banners ──────────────────────────────────────────────────────────── */
+
+.banner {
+    padding: 10px 14px;
+    border-radius: 8px;
+    border: 1px solid var(--line-strong);
+    background: var(--panel-2);
+    font-size: 13px;
+}
+
+.banner + .banner {
+    margin-top: 8px;
+}
+
+.banner strong {
+    margin-right: 6px;
+}
+
+.banner-meta {
+    display: block;
+    margin-top: 4px;
+    color: var(--muted);
+    font-size: 12px;
+}
+
+.banner-error {
+    border-color: rgba(248, 113, 113, 0.55);
+    background: rgba(248, 113, 113, 0.08);
+}
+
+.banner-warn {
+    border-color: rgba(251, 191, 36, 0.5);
+    background: rgba(251, 191, 36, 0.07);
+}
+
+.banner-info {
+    border-color: rgba(96, 165, 250, 0.5);
+    background: rgba(96, 165, 250, 0.07);
+}
+
+/* ── Boot / no-data states ────────────────────────────────────────────── */
+
+.boot {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    justify-content: center;
+    padding: 46px 18px;
+    color: var(--muted);
+    border: 1px dashed var(--line-strong);
+    border-radius: var(--radius);
+}
+
+.boot-error {
+    color: var(--bad);
+    border-color: rgba(248, 113, 113, 0.5);
+}
+
+.boot-spinner {
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    border: 2px solid var(--line-strong);
+    border-top-color: var(--accent);
+    /* Purely decorative; the text next to it says what is happening. */
+    animation: spin 0.9s linear infinite;
+}
+
+@keyframes spin {
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+/* ── Panels ───────────────────────────────────────────────────────────── */
+
+.panel {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    overflow: hidden;
+}
+
+.panel-head {
+    display: flex;
+    gap: 12px;
+    align-items: flex-start;
+    justify-content: space-between;
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--line);
+    background: var(--panel-2);
+}
+
+/* The heading block is the only shrinkable child of .panel-head: without
+   min-width:0 its flex item keeps its full content width, so a long hint
+   line (Connections, Metrics) pushes the count/legend out of the header. */
+.panel-heading {
+    min-width: 0;
+}
+
+.panel-head h2 {
+    margin: 0;
+    font-size: 14px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: #cfe0f0;
+}
+
+.panel-hint {
+    margin: 4px 0 0;
+    color: var(--muted);
+    font-size: 12px;
+    max-width: 72ch;
+}
+
+.panel-side {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    flex-shrink: 0;
+}
+
+.panel-count {
+    padding: 2px 8px;
+    border-radius: 999px;
+    border: 1px solid var(--line-strong);
+    color: var(--muted);
+    font-size: 11px;
+    white-space: nowrap;
+}
+
+.panel-body {
+    padding: 12px 14px;
+}
+
+.empty {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 18px 6px;
+    color: var(--muted);
+}
+
+.empty-message {
+    color: var(--text);
+    font-weight: 600;
+}
+
+.empty-hint {
+    font-size: 12px;
+}
+
+/* ── Stat cards (Overview) ────────────────────────────────────────────── */
+
+.stat-grid,
+.latency-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(158px, 1fr));
+    gap: 10px;
+}
+
+.stat-card,
+.latency-card {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 10px 12px;
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+}
+
+.stat-label {
+    color: var(--muted);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+}
+
+.stat-value {
+    font-family: var(--font-mono);
+    font-size: 22px;
+    line-height: 1.15;
+}
+
+.stat-sub {
+    color: var(--muted);
+    font-size: 11px;
+}
+
+.stat-card.tone-ok .stat-value {
+    color: var(--ok);
+}
+
+.stat-card.tone-warn .stat-value {
+    color: var(--warn);
+}
+
+.stat-card.tone-bad .stat-value {
+    color: var(--bad);
+}
+
+.model-list {
+    margin: 12px 0 0;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    word-break: break-all;
+}
+
+/* ── Pool cards ───────────────────────────────────────────────────────── */
+
+.pool-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 10px;
+}
+
+.pool-card {
+    padding: 10px 12px;
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+}
+
+.pool-flagged {
+    border-color: rgba(248, 113, 113, 0.55);
+    background: rgba(248, 113, 113, 0.06);
+}
+
+.pool-head {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 8px;
+}
+
+.pool-id {
+    font-size: 12px;
+    word-break: break-all;
+}
+
+.pool-stats {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 6px;
+    margin: 0;
+}
+
+.pool-stats div {
+    display: flex;
+    flex-direction: column;
+}
+
+.pool-stats dt {
+    color: var(--muted);
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+}
+
+.pool-stats dd {
+    margin: 0;
+    font-family: var(--font-mono);
+    font-size: 16px;
+}
+
+/* ── Tables ───────────────────────────────────────────────────────────── */
+
+.table-scroll {
+    overflow-x: auto;
+}
+
+.table-scroll + .table-scroll {
+    margin-top: 14px;
+}
+
+.table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+}
+
+.table th,
+.table td {
+    padding: 7px 10px;
+    text-align: left;
+    border-bottom: 1px solid var(--line);
+    vertical-align: middle;
+    white-space: nowrap;
+}
+
+.table th {
+    color: var(--muted);
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    position: sticky;
+    top: 0;
+    background: var(--panel);
+}
+
+.table tbody tr:hover {
+    background: rgba(96, 165, 250, 0.06);
+}
+
+.table-compact th,
+.table-compact td {
+    padding: 4px 8px;
+    font-size: 12px;
+}
+
+/* Wide text cells must wrap rather than push the table sideways. */
+.cell-pools,
+.cell-labels {
+    white-space: normal;
+    word-break: break-all;
+    max-width: 260px;
+}
+
+.row-expanded td {
+    background: rgba(34, 211, 238, 0.06);
+}
+
+.row-detail td {
+    background: var(--panel-2);
+    white-space: normal;
+}
+
+.detail-grid {
+    display: grid;
+    grid-template-columns: minmax(200px, 1fr) minmax(320px, 2fr);
+    gap: 16px;
+    padding: 4px 0;
+}
+
+.detail-grid h4 {
+    margin: 0 0 6px;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--muted);
+}
+
+.detail-grid ul {
+    margin: 0;
+    padding-left: 18px;
+    word-break: break-all;
+}
+
+.telemetry {
+    margin: 0;
+    max-height: 320px;
+    overflow: auto;
+    padding: 8px 10px;
+    background: #070b10;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.cell-slots {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+}
+
+.slot-bar {
+    display: inline-block;
+    width: 54px;
+    height: 6px;
+    border-radius: 3px;
+    background: var(--line);
+    overflow: hidden;
+}
+
+.slot-bar i {
+    display: block;
+    height: 100%;
+    background: var(--accent);
+}
+
+/* ── Graph ────────────────────────────────────────────────────────────── */
+
+.graph-scroll {
+    overflow-x: auto;
+}
+
+.graph {
+    display: block;
+    max-width: 100%;
+    height: auto;
+}
+
+.graph-caption {
+    fill: var(--muted);
+    font-size: 11px;
+    text-anchor: middle;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+}
+
+.graph-note {
+    margin: 8px 0 0;
+    color: var(--muted);
+    font-size: 12px;
+}
+
+.graph-edge-count {
+    fill: var(--muted);
+    font-size: 10px;
+    text-anchor: middle;
+}
+
+.node-box {
+    fill: var(--panel-2);
+    stroke: var(--line-strong);
+    stroke-width: 1;
+}
+
+.node-label {
+    fill: var(--text);
+    font-size: 11px;
+    font-family: var(--font-mono);
+}
+
+.node-sub {
+    fill: var(--muted);
+    font-size: 10px;
+}
+
+/* Node fills encode the state that matters on each side of the broker. */
+.node-live .node-box {
+    stroke: rgba(52, 211, 153, 0.85);
+}
+
+.node-orphaned .node-box {
+    stroke: rgba(248, 113, 113, 0.9);
+    stroke-dasharray: 4 3;
+}
+
+.node-leased .node-box {
+    stroke: rgba(96, 165, 250, 0.9);
+}
+
+.node-queued .node-box {
+    stroke: rgba(251, 191, 36, 0.85);
+    stroke-dasharray: 4 3;
+}
+
+.node-consumer .node-box {
+    stroke: rgba(34, 211, 238, 0.8);
+}
+
+.edge {
+    fill: none;
+    stroke-width: 1.4;
+}
+
+.edge-attached {
+    stroke: rgba(34, 211, 238, 0.55);
+}
+
+.edge-lease {
+    stroke: rgba(96, 165, 250, 0.6);
+}
+
+.edge-tenant {
+    stroke: rgba(34, 211, 238, 0.3);
+    stroke-dasharray: 5 4;
+}
+
+/* ── Narrow screens ───────────────────────────────────────────────────── */
+
+@media (max-width: 900px) {
+    .grid {
+        grid-template-columns: 1fr;
+    }
+
+    .app-header {
+        align-items: stretch;
+        flex-direction: column;
+    }
+
+    .connect-bar {
+        align-items: stretch;
+    }
+
+    .url-input-compact {
+        max-width: none;
+        width: 100%;
+        flex: 1;
+    }
+
+    .detail-grid {
+        grid-template-columns: 1fr;
+    }
+}

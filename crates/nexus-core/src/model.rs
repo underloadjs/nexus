@@ -573,6 +573,111 @@ pub struct JobView {
     pub idempotent: bool,
 }
 
+/// Derived **worker** view for the read-only monitoring surface.
+///
+/// [`crate::actor::PoolActor::pool_snapshot`] builds it from a [`WorkerRecord`],
+/// following the same rule [`JobView`] states: derived state, never a second
+/// authority. It exists rather than a `#[derive(Serialize)]` on [`WorkerRecord`]
+/// because the record also carries the capability/attestation objects a monitor
+/// does not ask about, and because a monitoring payload that grows with every
+/// internal field is a payload nobody can poll on a laptop.
+///
+/// Timestamps are **the actor's own clock** (`now_ms` as handed to
+/// [`crate::actor::PoolActor::handle`]), not wall-clock milliseconds: the core
+/// never reads a clock (`time.rs`). The native hub translates them into epoch ms
+/// when it renders `GET /v1/observe`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct WorkerView {
+    /// Worker identity.
+    pub id: WorkerId,
+    /// Hosts this worker declared and this actor admitted it to.
+    pub pools: BTreeSet<PoolId>,
+    /// Socket state: `live` or `orphaned` (resumable until `resume_deadline_ms`).
+    pub link: LinkState,
+    /// Engine liveness: `loading`, `ready` or `degraded`.
+    pub engine: EngineState,
+    /// Connection generation the actor believes is live (`Welcome.epoch`).
+    pub epoch: u64,
+    /// Declared concurrent slot count, as clamped at `Hello`.
+    pub capacity: u32,
+    /// Free slots from the worker's last heartbeat.
+    pub free_slots: u32,
+    /// Free KV/context budget in tokens, when the worker reports one.
+    pub free_kv_tokens: Option<u64>,
+    /// Jobs the actor has leased to this worker (the actor's own slot accounting).
+    pub in_flight: BTreeSet<JobId>,
+    /// Unfulfilled `Claim` authority: jobs this worker may still pull.
+    pub outstanding_claims: u32,
+    /// Slots this worker may accept right now ([`WorkerRecord::available_slots`]).
+    pub available_slots: u32,
+    /// Last inbound frame, on the actor's clock.
+    pub last_seen_ms: Timestamp,
+    /// Engine telemetry relayed by the last heartbeat; arbitrary JSON, or `null`.
+    pub telemetry: Option<Value>,
+}
+
+impl WorkerView {
+    /// Project one [`WorkerRecord`] into its monitoring view.
+    #[must_use]
+    pub fn from_record(worker: &WorkerRecord) -> Self {
+        Self {
+            available_slots: worker.available_slots(),
+            id: worker.id.clone(),
+            pools: worker.pools.clone(),
+            link: worker.link,
+            engine: worker.engine,
+            epoch: worker.epoch,
+            capacity: worker.capacity,
+            free_slots: worker.free_slots,
+            free_kv_tokens: worker.free_kv_tokens,
+            in_flight: worker.in_flight.clone(),
+            outstanding_claims: worker.outstanding_claims,
+            last_seen_ms: worker.last_seen_ms,
+            telemetry: worker.telemetry.clone(),
+        }
+    }
+}
+
+/// One pool's whole state as a single read-only snapshot, answering
+/// [`crate::actor::ActorMsg::Observe`] with
+/// [`crate::actor::Effect::Observed`].
+///
+/// # Why a whole-pool snapshot instead of N probes
+///
+/// `GET /v1/observe` answers "what is connected to whom" for **every** pool in one
+/// round trip. The actor is the single owner of workers, jobs and leases
+/// (task §5), so a per-pool fan-out of one message each is the cheapest way to
+/// read a *consistent* view of each pool: each snapshot comes back from the same
+/// mailbox that mutates the state, exactly like [`crate::actor::ActorMsg::Query`],
+/// and never as a torn mix of two transitions.
+///
+/// `jobs` carries the **active** records only (every phase the actor still
+/// considers live: `pending`, `queued`, `assigned`, `streaming`). Terminal jobs
+/// stay in the actor's map only for `job_retention_ms` so a retry can replay them;
+/// repeating them to a monitor would stream a growing answer-history past a
+/// dashboard's useful window. `consumers` and `lease` on each of those views are
+/// still the actor's own numbers, so "who is watching this job" and "which worker
+/// owns it" survive.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PoolSnapshot {
+    /// The pool this snapshot describes.
+    pub pool: PoolId,
+    /// Jobs waiting in the queue.
+    pub queue_depth: usize,
+    /// Live, ready workers of this pool.
+    pub ready_workers: usize,
+    /// Live workers of this pool whose engine is not ready.
+    pub loading_workers: usize,
+    /// Live workers of this pool (ready + loading), the "connected" count.
+    pub connected_workers: usize,
+    /// Live leases in this pool.
+    pub leases: usize,
+    /// Every worker record this actor holds for its own pool, id order.
+    pub workers: Vec<WorkerView>,
+    /// Active job views, job-id order.
+    pub jobs: Vec<JobView>,
+}
+
 /// Metadata for a produced artifact. Bytes live on disk/object storage (task
 /// §7.3), never in this record beyond the descriptor.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

@@ -300,6 +300,18 @@ means, which is why the two completion routes carry no `detach` field at all:
 - `GET /v1/jobs` (the jobs this hub currently holds a live relay for, filtered to the
   calling tenant) and `GET /v1/jobs/{id}` (one job's status)
 - `GET /v1/models`, `GET /healthz`, `GET /metrics`
+- **`GET /v1/observe`** — read-only whole-hub snapshot for the monitoring UI
+  (`observe.rs`): readiness, one row per pool, per-worker liveness and load, the
+  active jobs with their leases, and the live consumer sockets with the jobs each is
+  attached to. **Open, like `/healthz`** — a browser dashboard has no API key, and the
+  payload is aggregated state plus job metadata, never prompt text or answer bytes.
+  It answers `200` whenever the hub is serving, including at zero ready workers and
+  including when a pool actor fails to answer within the probe budget (that pool is
+  named in `unresponsive_pools` instead of turning the document into a status code),
+  so a monitor treats a transport failure as the only downtime signal. It is also the
+  one route that *relies* on CORS — the layer wraps every route (`main.rs`,
+  `observe_cors`): any origin, `GET`/`HEAD`/`OPTIONS`, any request headers,
+  no credentials.
 - bulk: `GET /v1/payloads/{id}` (supplier fetch), `GET|PUT /v1/artifacts/{id}` (§8.2)
 
 On `POST /v1/jobs` the NEX-6.6 contract is **required, not inferred**: the body must

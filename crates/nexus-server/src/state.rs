@@ -31,6 +31,7 @@ use nexus_core::ids::ConsumerId;
 use nexus_core::ids::JobId;
 use nexus_core::ids::PayloadRefId;
 use nexus_core::ids::PoolId;
+use nexus_core::ids::TenantId;
 use nexus_core::ids::WorkerId;
 // `Hub::cfg` is typed by name in three places below, so the type itself is needed.
 use nexus_core::protocol::ByeReason;
@@ -43,6 +44,7 @@ use nexus_core::Effect;
 use nexus_core::JobPhase;
 use nexus_core::JobView;
 use nexus_core::PoolActor;
+use nexus_core::PoolSnapshot;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -169,6 +171,60 @@ pub struct WorkerConn {
     pub tx: mpsc::Sender<WorkerWrite>,
 }
 
+/// One live consumer WebSocket connection, as `GET /v1/observe` reports it.
+///
+/// # Why the hub tracks this at all
+///
+/// "Which consumer is attached to which job" is *actor* state — `JobRecord::
+/// consumers` is the authority, and it is keyed by the per-(connection, task)
+/// `ConsumerId` the consumer face mints (`consumer_ws.rs:36-38`). What the actor
+/// cannot answer is the inverse question a monitor asks: **which connections are
+/// up right now**, across every pool, with the jobs each one is watching. Reading
+/// that out of the actors would mean one query per job per pool and still would
+/// not group them by socket, because a socket is not an actor concept — it is a
+/// `session()` concept. So the session owns exactly one of these records for its
+/// whole life, and it is the only writer.
+///
+/// # Why `std::sync::Mutex`, when every other hub map uses a tokio one
+///
+/// The deregistration has to happen on **every** exit path of a session, including
+/// a panic, and the only construct that cannot be skipped is `Drop` — which cannot
+/// await. Every critical section here is a hash lookup plus a `BTreeSet` insert or
+/// remove: no lock is ever held across an `.await`, so an async lock would buy
+/// nothing and cost a wakeup per attach. Poisoning is impossible by construction
+/// (nothing inside a critical section can panic), and [`poison_free`] still
+/// recovers rather than taking the hub down.
+#[derive(Debug, Clone)]
+pub struct ConsumerConnection {
+    /// Connection id, minted by [`IdSource::consumer_conn_id`]. One per socket,
+    /// **not** the per-task `ConsumerId` the actor keys its consumer sets by.
+    pub id: ConsumerId,
+    /// The tenant the pre-upgrade API key resolved to.
+    pub tenant: TenantId,
+    /// Wall-clock ms the socket was accepted (after auth, before any frame).
+    pub since_ms: u64,
+    /// Peer address, when the transport exposed one. `None` because
+    /// `axum::serve(listener, app)` does not install `ConnectInfo`, and inventing
+    /// a second service wrapper for one monitor field is not worth the churn.
+    pub peer: Option<String>,
+    /// Jobs this connection currently has a live stream for. Cleared per job when
+    /// its pump ends, and dropped whole when the connection does.
+    pub attached_jobs: BTreeSet<JobId>,
+}
+
+/// A hub lock that never panics on a poisoned mutex.
+///
+/// `Mutex::expect` is not an option under the workspace's `expect_used` lint, and
+/// `unwrap_or_else(|e| e.into_inner())` is not noise: it states the policy. A
+/// poison flag means some other task panicked while holding the lock; the data
+/// behind these locks is a plain map whose mutations are single `insert`/`remove`
+/// calls, so continuing with it is strictly better than refusing every request
+/// for the rest of the process's life.
+fn poison_free<T>(lock: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    lock.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Per-pool runtime handle.
 #[derive(Debug)]
 pub struct PoolHandle {
@@ -272,6 +328,23 @@ pub struct Hub {
     pub payload_waiters: Mutex<HashMap<PayloadRefId, oneshot::Sender<PayloadGrant>>>,
     /// Waiters for `GET /v1/jobs/{id}` answers, keyed by job.
     pub snapshot_waiters: Mutex<HashMap<JobId, Vec<oneshot::Sender<Option<JobView>>>>>,
+    /// Waiters for whole-pool `ActorMsg::Observe` answers, keyed by the token the
+    /// request carried (`Effect::Observed.token`).
+    ///
+    /// A token rather than a pool id because one pool may be watched by several
+    /// monitors at once and the actor answers them one per message, in mailbox
+    /// order: with a pool-keyed queue, a request that timed out and stopped
+    /// listening would shift every later answer onto the wrong waiter. The token
+    /// makes each answer addressable, so a stale snapshot can only ever be dropped
+    /// (nobody is waiting), never delivered to a request that asked for a newer one.
+    pub observe_waiters: Mutex<HashMap<u64, oneshot::Sender<PoolSnapshot>>>,
+    /// Monotonic source for those tokens. Started at `1` so `0` stays visibly
+    /// "not a token" in a log line.
+    pub observe_tokens: AtomicU64,
+    /// Live consumer WebSocket connections, keyed by connection id. Written only by
+    /// `consumer_ws::session` (accept / attach / detach / close); read by
+    /// `GET /v1/observe`. See [`ConsumerConnection`].
+    pub consumer_conns: std::sync::Mutex<HashMap<ConsumerId, ConsumerConnection>>,
     /// Wall-clock origin, for OpenAI `created`.
     pub epoch_ms: u64,
 }
@@ -329,6 +402,21 @@ impl IdSource {
         let n = self.consumer.fetch_add(1, Ordering::Relaxed);
         ConsumerId::new_unchecked(format!("con-{:08x}-{n:08x}", self.salt & 0xffff_ffff))
     }
+
+    /// Next consumer **connection** id (`c-…`): one per consumer WebSocket.
+    ///
+    /// A different prefix from [`Self::consumer_id`] on purpose. The actor keys
+    /// `JobRecord::consumers` by the per-(connection, task) id, and `consumer_ws`
+    /// mints one of those per watched job; the observe surface reports the
+    /// *socket*, which is a single thing that may be watching several jobs. Sharing
+    /// one counter keeps both id sets unique inside a process (one `fetch_add`
+    /// between them) while the prefixes mean a reader never has to guess which axis
+    /// an id names.
+    #[must_use]
+    pub fn consumer_conn_id(&self) -> ConsumerId {
+        let n = self.consumer.fetch_add(1, Ordering::Relaxed);
+        ConsumerId::new_unchecked(format!("c-{:08x}-{n:08x}", self.salt & 0xffff_ffff))
+    }
 }
 
 impl Hub {
@@ -367,6 +455,9 @@ impl Hub {
             key_of_job: Mutex::new(HashMap::new()),
             payload_waiters: Mutex::new(HashMap::new()),
             snapshot_waiters: Mutex::new(HashMap::new()),
+            observe_waiters: Mutex::new(HashMap::new()),
+            observe_tokens: AtomicU64::new(1),
+            consumer_conns: std::sync::Mutex::new(HashMap::new()),
             artifact_root: artifact_root.to_string(),
             ids: Arc::new(IdSource::new()),
             cfg,
@@ -574,6 +665,156 @@ impl Hub {
                 waiters.remove(job);
             }
         }
+    }
+
+    /// Whole-pool snapshot, read through one pool actor's mailbox.
+    ///
+    /// `None` means "this pool did not answer in time", never "this pool is empty":
+    /// the caller lists the pool under `unresponsive_pools` and still answers `200`,
+    /// because a monitor that gets nothing at all cannot tell a busy actor from a
+    /// dead hub. Same serialized-read property as [`Self::job_snapshot`] — the
+    /// answer comes from the single owner, so it is never a torn mix of two
+    /// transitions.
+    ///
+    /// The budget is the same `PROBE_TIMEOUT_MS` every other read-through probe
+    /// uses, and it bounds the **whole** probe: the mailbox send as well as the
+    /// answer. A saturated actor whose 512-deep mailbox is full would otherwise
+    /// park the monitor in `send().await` forever, which is exactly the hang the
+    /// deadline exists to prevent.
+    pub async fn pool_snapshot(&self, handle: &Arc<PoolHandle>) -> Option<PoolSnapshot> {
+        let token = self.observe_tokens.fetch_add(1, Ordering::Relaxed);
+        let (reply, waiting) = oneshot::channel();
+        self.observe_waiters.lock().await.insert(token, reply);
+        // One future for send + answer, so a single `timeout` covers both halves
+        // (two separate timeouts would let a stalled mailbox consume the budget
+        // twice and double the worst-case latency for the caller).
+        let probe = async {
+            handle
+                .tx
+                .send(ActorMsg::Observe { token })
+                .await
+                .map_err(|_| ())?;
+            waiting.await.map_err(|_| ())
+        };
+        let answer =
+            tokio::time::timeout(std::time::Duration::from_millis(PROBE_TIMEOUT_MS), probe)
+                .await
+                .ok()
+                .and_then(|answered| answered.ok());
+        // Prune on every non-answer, so a hub that polls a wedged actor forever
+        // does not accumulate one oneshot per poll. `remove` is by token, so this
+        // can never drop a waiter another monitor installed in the meantime.
+        if answer.is_none() {
+            self.observe_waiters.lock().await.remove(&token);
+        }
+        answer
+    }
+
+    /// Every pool's snapshot, queried **concurrently**, each with its own deadline.
+    ///
+    /// The result is in `pool_ids()` order (sorted, so the rendered document is
+    /// byte-stable across polls) with the pool id alongside the answer, and
+    /// `None` marks an unresponsive pool. Sequential probing would make the hub's
+    /// worst case `pools × 2 s` — with a dozen pools that is a monitor timing out
+    /// on a hub that is fine, so one stuck actor must cost one stuck entry and
+    /// nothing else.
+    pub async fn pool_snapshots(&self) -> Vec<(PoolId, Option<PoolSnapshot>)> {
+        // `pool` borrows `self`, so the Arc has to be cloned out before the async
+        // block captures it; the clone is also what keeps each future independent
+        // of the map's lifetime.
+        let probes: Vec<_> = self
+            .pool_ids()
+            .into_iter()
+            .filter_map(|pid| self.pool(&pid).map(|handle| (pid, Arc::clone(handle))))
+            .map(|(pid, handle)| async move {
+                let answer = self.pool_snapshot(&handle).await;
+                (pid, answer)
+            })
+            .collect();
+        futures_util::future::join_all(probes).await
+    }
+
+    /// An actor-clock timestamp as wall-clock milliseconds.
+    ///
+    /// Every timestamp inside the actor — `WorkerRecord::last_seen_ms`,
+    /// `JobTimings::accept_ms`, `Lease::deadline_ms` — is stamped from the clock
+    /// `run_actor` injects, which is [`monotonic_ms`]: milliseconds since an
+    /// `Instant` taken at process start, **not** epoch time. A monitoring document
+    /// that mixed `now_ms` (epoch) with `last_seen_ms` (process-relative) would
+    /// render "last seen 56 years ago", so the hub translates on the way out.
+    ///
+    /// The arithmetic is signed rather than two saturating `sub`s because
+    /// `deadline_ms` lies in the future: a saturating subtraction would collapse
+    /// every live lease deadline to "now", which is precisely the value a dashboard
+    /// polls for. `0` instead of a negative epoch is the honest floor.
+    ///
+    /// This method samples both clocks *now*; `observe.rs` holds one sampled pair for
+    /// a whole request (its `Clock`) so a slow fan-out cannot make the early rows of
+    /// one document disagree with the late ones. Both go through
+    /// [`actor_to_wall_ms`], the only implementation of the translation.
+    #[must_use]
+    pub fn to_wall_ms(&self, actor_ms: u64) -> u64 {
+        actor_to_wall_ms(self.wall_ms(), monotonic_ms(), actor_ms)
+    }
+
+    // ------------------------------------------------ consumer connection registry
+
+    /// Register an accepted consumer WebSocket and return its connection id.
+    ///
+    /// Called **after** the pre-upgrade API-key check has passed, so a socket that
+    /// never became a session is never listed, and a refused upgrade cannot leave a
+    /// ghost connection behind.
+    pub fn accept_consumer_conn(&self, tenant: TenantId, peer: Option<String>) -> ConsumerId {
+        let id = self.ids.consumer_conn_id();
+        let record = ConsumerConnection {
+            id: id.clone(),
+            tenant,
+            since_ms: self.wall_ms(),
+            peer,
+            attached_jobs: BTreeSet::new(),
+        };
+        poison_free(&self.consumer_conns).insert(id.clone(), record);
+        id
+    }
+
+    /// Mark one job as watched by this connection. Idempotent (a `BTreeSet`),
+    /// because a client that re-attaches to a finished task re-adds the same job
+    /// (`runtime_e2e`'s re-attach case) and the registry must not double-count it.
+    pub fn consumer_attach(&self, conn: &ConsumerId, job: &JobId) {
+        if let Some(record) = poison_free(&self.consumer_conns).get_mut(conn) {
+            record.attached_jobs.insert(job.clone());
+        }
+    }
+
+    /// Drop one job from this connection's watch set — a `detach`, a cancellation,
+    /// or the pump reaching end-of-stream on its own.
+    ///
+    /// Missing entries are ignored: the connection may already have closed, and
+    /// `close_consumer_conn` removes the whole record, after which a pump finishing
+    /// underneath the teardown is expected, not an error.
+    pub fn consumer_detach(&self, conn: &ConsumerId, job: &JobId) {
+        if let Some(record) = poison_free(&self.consumer_conns).get_mut(conn) {
+            record.attached_jobs.remove(job);
+        }
+    }
+
+    /// Remove a closed connection. Idempotent, and load-bearing for abnormal
+    /// disconnects: the session's guard runs it on every exit path, so a socket that
+    /// dies mid-stream cannot leave a connection listed as live forever.
+    pub fn close_consumer_conn(&self, conn: &ConsumerId) {
+        poison_free(&self.consumer_conns).remove(conn);
+    }
+
+    /// Live consumer connections, ordered by id so two polls of an idle hub render
+    /// identical bytes.
+    #[must_use]
+    pub fn consumer_connections(&self) -> Vec<ConsumerConnection> {
+        let mut out: Vec<ConsumerConnection> = poison_free(&self.consumer_conns)
+            .values()
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        out
     }
 
     /// Fetch a spilled payload on behalf of a worker, through the actor.
@@ -899,13 +1140,34 @@ async fn run_actor(
 }
 
 /// Monotonic millisecond clock for the actor, immune to wall-clock jumps.
-fn monotonic_ms() -> u64 {
+///
+/// `pub(crate)` because `observe.rs` needs the same reading the actors are fed: the
+/// only way to translate an actor timestamp is to know what the actor's clock says
+/// **right now**, and a second `Instant` origin would translate against a different
+/// zero.
+pub(crate) fn monotonic_ms() -> u64 {
     use std::sync::OnceLock;
     static ORIGIN: OnceLock<std::time::Instant> = OnceLock::new();
     ORIGIN
         .get_or_init(std::time::Instant::now)
         .elapsed()
         .as_millis() as u64
+}
+
+/// Translate one actor-clock timestamp into epoch milliseconds.
+///
+/// `epoch_origin_ms` is the wall clock and `actor_now_ms` is [`monotonic_ms`], both
+/// sampled at the **same instant**; `actor_ms` is a timestamp the actor stamped on
+/// its own clock. The offset is signed and can be negative, because a lease
+/// `deadline_ms` is in the future: saturating the difference would collapse every
+/// live deadline onto `epoch_origin_ms`, i.e. "expires right now", which is the one
+/// number a dashboard polls for. Clamping at `0` (rather than wrapping) keeps the
+/// output a valid epoch ms for a hub that has been up for less time than the
+/// timestamps it is replaying.
+#[must_use]
+pub(crate) fn actor_to_wall_ms(epoch_origin_ms: u64, actor_now_ms: u64, actor_ms: u64) -> u64 {
+    let delta = actor_ms as i128 - actor_now_ms as i128;
+    (i128::from(epoch_origin_ms) + delta).max(0) as u64
 }
 
 /// Perform the actor's effects, in order: worker writes first, so a consumer never
@@ -1093,6 +1355,18 @@ async fn dispatch(
                     if slot.is_empty() {
                         waiters.remove(&job);
                     }
+                }
+            }
+            Effect::Observed { token, snapshot } => {
+                // The waiting half lives in the hub (`Hub::pool_snapshot`), which is
+                // the only place that knows who asked. A missing waiter is normal:
+                // the monitor gave up at its own deadline, and the actor's answer
+                // for a request nobody still wants is dropped here rather than
+                // delivered to whoever happens to poll next.
+                if let Some(waiter) = hub.observe_waiters.lock().await.remove(&token) {
+                    let _ = waiter.send(*snapshot);
+                } else {
+                    tracing::debug!(pool = %handle.id, token, "observe answer had no waiter");
                 }
             }
             Effect::PayloadBytes {

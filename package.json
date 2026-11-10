@@ -24,6 +24,7 @@
         "test:accept": "cargo test -p nexus-core --test acceptance",
         "build": "cargo build --release -p nexus-server",
         "start": "cargo run -p nexus-server --bin nexus-hub",
+        "deploy:daytona": "node scripts/deploy-daytona.mjs",
         "worker": "cargo run -p nexus-worker-example",
         "bench": "cargo build --profile profiling -p nexus-server",
         "wasm": "cargo build --release --target wasm32-unknown-unknown -p nexus-wasm",

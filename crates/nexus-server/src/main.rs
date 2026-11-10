@@ -5,6 +5,7 @@
 mod consumer;
 mod consumer_ws;
 mod io;
+mod observe;
 #[cfg(test)]
 mod runtime_e2e;
 mod state;
@@ -12,11 +13,14 @@ mod worker_ws;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
+use axum::http::Method;
 use axum::routing::get;
 use axum::routing::post;
 use axum::Router;
 use nexus_core::BrokerConfig;
+use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 
@@ -142,9 +146,51 @@ pub fn app(hub: Arc<Hub>, body_limit: usize) -> Router {
         // ---- operations: open on purpose, a load balancer has no API key ----
         .route("/healthz", get(consumer::healthz))
         .route("/metrics", get(consumer::metrics))
+        // ---- observation plane for the GitHub-Pages dashboard ----
+        // Open by the same argument as `/healthz` (no secret, no identity), and
+        // additionally CORS-enabled because a browser on another origin calls it.
+        // Documented in README ("Routes" + "`GET /v1/observe`") and in
+        // `documents/specifications/hub-specification.md` §7's route list.
+        .route("/v1/observe", get(observe::observe))
+        // `observe_cors` is added last, so it is the OUTERMOST layer: an `OPTIONS`
+        // preflight is answered there without reaching the router, the body limit,
+        // or any handler. Order matters — see `observe_cors`.
+        .layer(observe_cors())
         .layer(RequestBodyLimitLayer::new(body_limit))
         .layer(TraceLayer::new_for_http())
         .with_state(hub)
+}
+
+/// CORS policy for the observation plane: any origin, `GET`/`HEAD`/`OPTIONS`,
+/// any request headers, and NO credentials.
+///
+/// Why it is safe to be permissive: `/v1/observe` carries no secret (the payload
+/// is aggregated pool state and job metadata) and never acts on the caller's
+/// identity, so a cross-site read cannot be forged into a mutation. Keeping
+/// credentials off is what makes `Allow-Origin: *` legal in the first place, and
+/// it means a browser never sends a cookie or `Authorization` header that this
+/// handler would then have to interpret.
+///
+/// The layer wraps every route, but only `GET` is a cross-origin read; `POST
+/// /v1/jobs` stays protected by the browser's same-origin policy plus its API key
+/// header, and the WS endpoints are not CORS-gated at all (a WS handshake ignores
+/// CORS). Because this layer is outermost, an `OPTIONS` preflight is answered by
+/// the layer itself, before the router or the body-limit layer sees it.
+fn observe_cors() -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::any())
+        .allow_methods(AllowMethods::list(vec![
+            Method::GET,
+            Method::HEAD,
+            Method::OPTIONS,
+        ]))
+        .allow_headers(AllowHeaders::any())
+        // Explicit, because `Allow-Origin: *` and credentials are mutually
+        // exclusive: if a cookie were sent, the browser would reject `*`.
+        .allow_credentials(false)
+        // Cache the preflight, so a dashboard polling every second does not pay a
+        // round trip per poll.
+        .max_age(Duration::from_secs(600))
 }
 
 /// Snapshot of the process environment as a sorted map, so `nexus-core` can parse

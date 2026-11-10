@@ -1,0 +1,34 @@
+// Standalone tsconfig (no `extends` outside this package, matching the
+// bench / story-generator app convention): the options mirror the
+// noobscript workspace root tsconfig.json so behavior is identical, but a
+// GitHub Pages checkout of any subset of the monorepo still typechecks.
+{
+    "compilerOptions": {
+        "module": "ESNext",
+        "target": "ESNext",
+        "moduleResolution": "bundler",
+        // Automatic runtime: no `import React` needed anywhere (the root
+        // app tsconfigs that set "jsx": "react" predate this package).
+        "jsx": "react-jsx",
+        "skipLibCheck": true,
+        "allowJs": true,
+        "experimentalDecorators": true,
+        "esModuleInterop": true,
+        "strict": true,
+        "lib": ["decorators", "dom", "es5", "scripthost", "es2015.collection"],
+        // "node" only typechecks when @types/node is a dependency OF THIS
+        // package (it is, in devDependencies). tsc resolves `types` entries
+        // through every ancestor node_modules/@types, so inside the noobscript
+        // monorepo a missing @types/node hides itself by resolving into the
+        // hoisted root install — while a standalone checkout of this repo (the
+        // GitHub Pages CI box, or a plain `git clone` of underloadjs/nexus) has
+        // no parent tree and fails with TS2688. Verified both ways: removing
+        // the devDependency and typechecking in an isolated copy reproduces the
+        // error; the in-monorepo run does not.
+        "types": ["node", "vitest/globals"]
+    },
+    // Tests are excluded from `tsc --noEmit` like every other package here
+    // (vitest executes them; the shipped bundle never contains them).
+    "exclude": ["node_modules", "dist", "lib", "Temp", "src/**/*.test.ts", "src/**/*.test.tsx"],
+    "include": ["src/**/*", "vite.config.ts"]
+}

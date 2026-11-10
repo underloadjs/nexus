@@ -28,10 +28,14 @@ use nexus_core::ids::TenantId;
 use nexus_core::ids::WorkerId;
 use nexus_core::model::EngineState;
 use nexus_core::model::JobPhase;
+// The read-only monitoring snapshot (`ActorMsg::Observe`), asserted on directly here
+// because the actor is the authority `GET /v1/observe` renders.
+use nexus_core::model::LinkState;
 use nexus_core::model::Priority;
 use nexus_core::model::Submission;
 use nexus_core::model::TerminalReason;
 use nexus_core::model::WorkerTier;
+use nexus_core::model::WorkerView;
 use nexus_core::protocol::Attestation;
 use nexus_core::protocol::ByeReason;
 use nexus_core::protocol::CancelReason;
@@ -46,6 +50,7 @@ use nexus_core::ConsumerEvent;
 use nexus_core::Effect;
 use nexus_core::HelloInput;
 use nexus_core::PoolActor;
+use nexus_core::PoolSnapshot;
 use serde_json::json;
 use serde_json::Value;
 
@@ -2952,5 +2957,221 @@ fn the_actor_never_reports_two_owners_for_one_job() {
         a.leases_len(),
         in_flight,
         "the lease table and the worker slots agree"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `GET /v1/observe`'s authority: `ActorMsg::Observe` → `Effect::Observed`.
+//
+// The dashboard renders exactly what `PoolActor::pool_snapshot` answers with, so
+// the numbers it displays are decided here, in the single owner. These two tests
+// are the contract's authority half; `runtime_e2e.rs` proves the wire half.
+// ---------------------------------------------------------------------------
+
+/// The one [`Effect::Observed`] answer in a `handle` result, unwrapped.
+///
+/// Panicking here *is* the assertion: an `Observe` that answers with anything else
+/// (or with nothing) is the bug the caller is testing for.
+fn observed(effects: &[Effect]) -> PoolSnapshot {
+    let mut answers: Vec<PoolSnapshot> = effects
+        .iter()
+        // `snapshot` is boxed so the effect enum stays small (`Effect::Observed`'s
+        // doc), so the payload is read through the box.
+        .filter_map(|effect| match effect {
+            Effect::Observed { snapshot, .. } => Some(snapshot.as_ref().clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(answers.len(), 1, "one Observe, exactly one answer");
+    answers.remove(0)
+}
+
+#[test]
+fn observe_answers_with_the_actors_own_workers_jobs_and_leases() {
+    // A one-worker pool holding one leased job: the shape the dashboard's first
+    // poll is supposed to show. Times are the injected ones, so every timestamp
+    // below is a literal the actor was actually handed.
+    let mut a = actor();
+    warm(&mut a, "w-a", 1, 2, 0); // hello at 0, `Ready` at 1
+    a.handle(5, claim_msg("w-a", 1, 2)); // authority for two jobs
+    let effects = a.handle(6, submit_msg("job-1", "k1", None));
+    assert_eq!(
+        assigned(&effects),
+        vec![("w-a".to_string(), "job-1".to_string(), 1u32)],
+        "outstanding claim authority dispatches the job at submit time"
+    );
+
+    // The token travels in and comes back out unchanged. The hub correlates by it
+    // because one pool may be polled by several monitors at once and the actor
+    // answers in mailbox order (`state.rs`, `Hub::pool_snapshot`).
+    let answered = a.handle(7, ActorMsg::Observe { token: 9_001 });
+    assert_eq!(
+        answered.len(),
+        1,
+        "an Observe mutates nothing and answers once"
+    );
+    match &answered[0] {
+        Effect::Observed { token, .. } => assert_eq!(*token, 9_001),
+        other => panic!("expected the snapshot answer, got {other:?}"),
+    }
+    let snap = observed(&answered);
+
+    // The gauges are the actor's own counter methods (`ready_workers`,
+    // `loading_workers`, `queue.depth`, `leases.len`), which is what stops
+    // `/healthz`, `/metrics` and `/v1/observe` from answering with three lookalikes.
+    assert_eq!(snap.pool, pool());
+    assert_eq!(snap.ready_workers, 1);
+    assert_eq!(snap.loading_workers, 0);
+    assert_eq!(snap.connected_workers, 1);
+    assert_eq!(snap.queue_depth, 0, "the only job is leased, not queued");
+    assert_eq!(snap.leases, 1);
+
+    // The worker row is the record, projected — including the two derived numbers
+    // the UI reads: `available_slots` (the actor's, not the heartbeat's) and
+    // `outstanding_claims` (2 granted minus the 1 this dispatch consumed).
+    assert_eq!(
+        snap.workers,
+        vec![WorkerView {
+            id: WorkerId::new_unchecked("w-a"),
+            pools: [pool()].into_iter().collect(),
+            link: LinkState::Live,
+            engine: EngineState::Ready,
+            epoch: 1,
+            capacity: 2,
+            free_slots: 2,
+            free_kv_tokens: Some(524_288),
+            in_flight: [JobId::new_unchecked("job-1")].into_iter().collect(),
+            outstanding_claims: 1,
+            available_slots: 1,
+            // The last frame the actor actually received: the `Claim` at t=5. A
+            // dispatch does not refresh it, because no bytes came off the wire.
+            last_seen_ms: 5,
+            telemetry: None,
+        }]
+    );
+
+    // Jobs come back through `job_view`, i.e. joined to the lease that lives in a
+    // second map — the only way "who owns this job" and "what phase is it in" can
+    // agree.
+    assert_eq!(snap.jobs.len(), 1);
+    let job = &snap.jobs[0];
+    assert_eq!(job.id, JobId::new_unchecked("job-1"));
+    assert_eq!(job.pool, pool());
+    assert_eq!(job.tenant, TenantId::new_unchecked("acme"));
+    assert_eq!(job.phase, JobPhase::Assigned);
+    assert_eq!(job.attempt, 1);
+    assert_eq!(job.consumers, 1, "the one face that submitted is watching");
+    assert_eq!(
+        job.lease,
+        Some(nexus_core::Lease {
+            job: JobId::new_unchecked("job-1"),
+            worker: WorkerId::new_unchecked("w-a"),
+            // The lease names the connection generation it was made on (§11's
+            // stale-generation guard), which is this worker's `conn`.
+            epoch: 1,
+            attempt: 1,
+            // t=6 + the pool's effective `lease_ms` (60_000; the sample topology
+            // sets no per-pool override), so the deadline is an absolute actor time.
+            deadline_ms: 60_006,
+            streamed_bytes: 0,
+        })
+    );
+
+    // Now finish it. The record survives for `job_retention_ms` so a retry can
+    // replay it, but a monitor must not be shown a finished job forever.
+    a.handle(8, delta_msg("w-a", 1, "job-1", 0, "hi"));
+    a.handle(9, done_msg("w-a", 1, "job-1", 1, None));
+    let after = observed(&a.handle(10, ActorMsg::Observe { token: 9_002 }));
+    assert!(
+        a.has_job(&JobId::new_unchecked("job-1")),
+        "the terminal record is still retained for replay"
+    );
+    assert!(
+        after.jobs.is_empty(),
+        "a terminal job is not monitoring state: {after:?}"
+    );
+    assert_eq!(after.leases, 0, "finishing dropped the lease");
+    assert_eq!(after.ready_workers, 1, "the worker is still warm and ready");
+    // `last_seen_ms` is deliberately not asserted here: the relay path refreshes it
+    // from the worker's frames (`actor.rs:2377`), so its exact value after a `Done`
+    // depends on whether that finish event carried bytes — not on the snapshot.
+    assert_eq!(
+        after.workers[0].in_flight.len(),
+        0,
+        "the slot is free again whatever the heartbeat says"
+    );
+    assert_eq!(
+        after.workers[0].available_slots, 2,
+        "capacity minus an empty in_flight is what dispatch obeys"
+    );
+    assert_eq!(
+        after.workers[0].outstanding_claims, 1,
+        "the second half of the claim is still authority the worker holds"
+    );
+}
+
+#[test]
+fn observe_lists_an_orphaned_worker_but_excludes_it_from_the_ready_and_connected_counts() {
+    // The case a dashboard would otherwise get wrong twice over: a socket that
+    // dropped mid-stream still owns its lease, and it is still resumable until
+    // `resume_grace_ms` expires. So it must appear (the job has an owner), but it
+    // must not be counted as capacity the hub can use.
+    let mut a = actor();
+    warm(&mut a, "w-b", 3, 1, 0);
+    a.handle(5, claim_msg("w-b", 3, 1));
+    a.handle(6, submit_msg("job-9", "k9", None));
+    let before = observed(&a.handle(7, ActorMsg::Observe { token: 1 }));
+    assert_eq!(before.connected_workers, 1);
+    assert_eq!(before.ready_workers, 1);
+
+    a.handle(8, gone_msg("w-b", 3));
+    let after = observed(&a.handle(9, ActorMsg::Observe { token: 2 }));
+
+    assert_eq!(
+        after.workers.len(),
+        1,
+        "an orphan is still a record, and the UI shows it as resumable"
+    );
+    let worker = &after.workers[0];
+    assert_eq!(worker.link, LinkState::Orphaned);
+    // `orphan_worker` degrades the engine and zeroes the heartbeat's slot count
+    // immediately (`actor.rs:2785-2793`), so a dropped socket is never advertised as
+    // capacity — while the actor's own `in_flight` survives, because the lease still
+    // names this worker and a resume must not take a second set of slots.
+    assert_eq!(worker.engine, EngineState::Degraded);
+    assert_eq!(worker.free_slots, 0);
+    assert_eq!(worker.available_slots, 0, "nothing dispatchable is left");
+    assert_eq!(
+        worker.in_flight,
+        [JobId::new_unchecked("job-9")].into_iter().collect(),
+        "the orphan still owns the job"
+    );
+    // A dead socket's unfulfilled claims are void; only leased work survives.
+    assert_eq!(worker.outstanding_claims, 0);
+    assert_eq!(
+        worker.epoch, 3,
+        "the epoch is the connection generation it had"
+    );
+    assert_eq!(
+        worker.last_seen_ms, 5,
+        "the gone itself is not an inbound frame"
+    );
+
+    // The three counts a monitor sums over: an orphan is in none of them.
+    assert_eq!(after.ready_workers, 0);
+    assert_eq!(after.loading_workers, 0, "loading counts live sockets only");
+    assert_eq!(after.connected_workers, 0);
+    // The lease is held until the orphan timer fires at `8 + resume_grace_ms`, so a
+    // snapshot taken right after the drop still reports it.
+    assert_eq!(after.leases, 1);
+    assert_eq!(after.leases, a.leases_len(), "one source, no drift");
+    assert_eq!(
+        after.jobs.len(),
+        1,
+        "the job is still active, and still names its (unreachable) owner"
+    );
+    assert_eq!(
+        after.jobs[0].lease.as_ref().expect("lease").worker,
+        WorkerId::new_unchecked("w-b")
     );
 }

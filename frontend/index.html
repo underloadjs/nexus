@@ -1,0 +1,27 @@
+<!doctype html>
+<!--
+    Static shell for the Nexus Monitor (this repository's GitHub Pages app,
+    built from `frontend/`). There is deliberately no favicon or
+    external font link: every request the page makes that is NOT the hub
+    itself is a chance to confuse first-time users ("why is there a 404 in
+    my console?"), and the monitor must stay a single self-contained bundle.
+    The dark body background matches styles.css so loads never flash white.
+-->
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <meta name="color-scheme" content="dark" />
+        <meta
+            name="description"
+            content="Read-only monitoring dashboard for a nexus-hub: pools, supplier workers, consumer connections, job leases and Prometheus counters, polled straight from the browser."
+        />
+        <title>Nexus Monitor</title>
+    </head>
+    <body>
+        <div id="root"></div>
+        <!-- Extensionless on purpose: tsc never parses HTML, and Vite's
+             resolver picks src/main.tsx up from the extension. -->
+        <script type="module" src="/src/main.tsx"></script>
+    </body>
+</html>

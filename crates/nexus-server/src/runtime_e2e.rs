@@ -2341,3 +2341,423 @@ async fn a_refused_submission_leaves_no_route_or_relay_behind() -> anyhow::Resul
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// The observation plane: `GET /v1/observe` + CORS.
+//
+// The dashboard is a static bundle on another origin, so these two tests are the
+// only place the whole feature is observed: that the endpoint is open and always
+// `200`, that its numbers come from the actor through the mailbox, and that a
+// browser origin actually gets the CORS headers. `nexus-core`'s acceptance suite
+// proves the snapshot's *values*; only a real listener can prove the wire shape.
+// ---------------------------------------------------------------------------
+
+/// Anything after this is a plausible epoch millisecond stamp (Nov 2023).
+///
+/// Every timestamp in the observe document is translated to epoch on the way out
+/// (`state::actor_to_wall_ms`), so the assertion that matters is "epoch-scale", not
+/// "the actor's process-relative number happened to be N".
+const EPOCH_FLOOR_MS: u64 = 1_700_000_000_000;
+
+/// Polls `GET /v1/observe` until `settled` accepts the document, and returns it.
+///
+/// The three producers of this document run independently — the actor answers a
+/// mailbox message, the mirrored gauges refresh on dispatch, and the consumer
+/// registry is written by the WS session — so "eventually true" is the honest
+/// precondition here. What is asserted after the poll is exact, and the failure
+/// message carries the whole last document.
+///
+/// The status assertion lives inside the helper on purpose: every poll of this
+/// endpoint must be a `200`, including a poll of a hub with nothing ready.
+async fn observe_until(
+    client: &reqwest::Client,
+    url: &str,
+    what: &str,
+    settled: impl Fn(&serde_json::Value) -> bool,
+) -> anyhow::Result<serde_json::Value> {
+    let mut last = serde_json::Value::Null;
+    for _ in 0..80 {
+        let response = client.get(url).send().await?;
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::OK,
+            "`/v1/observe` must always answer `200` while the hub is serving"
+        );
+        last = response.json().await?;
+        if settled(&last) {
+            return Ok(last);
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    Err(anyhow::anyhow!(
+        "`/v1/observe` never showed {what}; last document: {last}"
+    ))
+}
+
+/// The whole `nexus-hub-observe/v1` contract, against a hub that has one warm
+/// worker, one leased job and one consumer socket attached to it.
+#[tokio::test]
+async fn observe_documents_workers_jobs_leases_and_consumer_sockets() -> anyhow::Result<()> {
+    let hub = spawn_hub("observe_snapshot", test_config()).await?;
+    let client = reqwest::Client::new();
+    let url = format!("http://{}/v1/observe", hub.addr);
+
+    // ---- 1. An idle hub is a `200`, and an honest one ----
+    //
+    // No API key is sent: the endpoint is open by the same argument as `/healthz`
+    // (a browser dashboard has no secret, and the payload is operational state). A
+    // monitor must be able to treat a transport failure as the only downtime
+    // signal, so zero ready capacity is a field, never a status code.
+    let cold = client.get(&url).send().await?;
+    assert_eq!(cold.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        cold.headers()[reqwest::header::CONTENT_TYPE],
+        "application/json",
+        "the dashboard's client sniffs this to decide the body is JSON at all"
+    );
+    let cold = cold.json::<serde_json::Value>().await?;
+    assert_eq!(
+        cold["protocol"], "nexus-hub-observe/v1",
+        "the version marker the client checks before parsing"
+    );
+    assert_eq!(
+        cold["readiness"]["status"], "degraded",
+        "same rule as `/healthz`"
+    );
+    assert_eq!(cold["readiness"]["ready_workers"], 0);
+    assert_eq!(cold["readiness"]["loading_workers"], 0);
+    assert_eq!(cold["readiness"]["queue_depth"], 0);
+    assert_eq!(cold["readiness"]["connected_workers"], 0);
+    assert_eq!(
+        cold["readiness"]["capacity_signal"], "no_workers",
+        "the reason, not just the count"
+    );
+    assert_eq!(cold["readiness"]["warm_models"], serde_json::json!([]));
+    // Every collection is present and empty — never `null`, or the UI has to
+    // distinguish "no data" from "no rows".
+    for key in [
+        "pools",
+        "workers",
+        "jobs",
+        "leases",
+        "consumer_connections",
+        "unresponsive_pools",
+    ] {
+        assert!(cold[key].is_array(), "`{key}` must be an array: {cold}");
+    }
+    assert_eq!(cold["workers"], serde_json::json!([]));
+    assert_eq!(cold["jobs"], serde_json::json!([]));
+    assert_eq!(cold["consumer_connections"], serde_json::json!([]));
+    assert_eq!(cold["unresponsive_pools"], serde_json::json!([]));
+    // One row per configured pool, id-ordered, including the pool with nothing in
+    // it: a dashboard that only sees the busy pool cannot tell a cold one apart.
+    let cold_pools: Vec<&str> = cold["pools"]
+        .as_array()
+        .expect("pools array")
+        .iter()
+        .map(|row| row["id"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(cold_pools, vec!["image.render/comfyui", POOL]);
+    assert!(
+        cold["now_ms"].as_u64().unwrap_or_default() > EPOCH_FLOOR_MS,
+        "`now_ms` is epoch ms: {cold}"
+    );
+
+    // ---- 2. One warm worker, one leased job, one attached socket ----
+    let mut worker = dial_worker(hub.addr, "wkr-observe", true).await?;
+    assert!(matches!(
+        next_frame_of(&mut worker, "welcome").await?,
+        HubFrame::Welcome { .. }
+    ));
+    let mut consumer = dial_consumer(hub.addr).await?;
+    consumer_submit(&mut consumer, "observe me", false).await?;
+    let job = match next_consumer_frame(&mut consumer).await? {
+        nexus_core::protocol::HubConsumerFrame::Accepted { job, .. } => job,
+        other => panic!("expected the accept verdict, got {other:?}"),
+    };
+    // Wait for the hand-over: once the worker holds its `Assigned` frame, the lease,
+    // the worker's `in_flight` set and the job's phase are all decided, so every
+    // number below is a settled fact rather than a race against the dispatch.
+    assert!(matches!(
+        next_frame_of(&mut worker, "assigned").await?,
+        HubFrame::Assigned { .. }
+    ));
+
+    // The consumer registry is written by the WS session (`consumer_ws::spawn_pump`),
+    // not by the actor, so it lands on its own schedule; poll for it, then assert the
+    // rest of the document exactly.
+    let body = observe_until(&client, &url, "the attached consumer socket", |doc| {
+        doc["consumer_connections"]
+            .as_array()
+            .is_some_and(|rows| !rows.is_empty())
+    })
+    .await?;
+
+    // ---- worker row: the actor's `WorkerRecord`, projected ----
+    let workers = body["workers"].as_array().expect("workers array");
+    assert_eq!(workers.len(), 1, "one fake worker is connected: {body}");
+    let worker_row = &workers[0];
+    assert_eq!(worker_row["id"], "wkr-observe");
+    assert_eq!(worker_row["pools"], serde_json::json!([POOL]));
+    assert_eq!(worker_row["link"], "live");
+    assert_eq!(worker_row["engine"], "ready");
+    assert_eq!(worker_row["epoch"], 1, "the first connection generation");
+    assert_eq!(worker_row["capacity_slots"], 4, "as declared in `Hello`");
+    assert_eq!(
+        worker_row["free_slots"], 4,
+        "the heartbeat's own number: a dispatch does not rewrite it"
+    );
+    assert_eq!(
+        worker_row["available_slots"], 3,
+        "the actor's reconciled number, which is what dispatch obeys: 4 minus 1 in flight"
+    );
+    assert_eq!(worker_row["free_kv_tokens"], 524_288, "from `Ready`");
+    assert_eq!(
+        worker_row["in_flight"],
+        serde_json::json!([job.as_ref()]),
+        "job ids, so a monitor sees who owns what without joining `jobs[]`"
+    );
+    assert_eq!(
+        worker_row["outstanding_claims"], 3,
+        "`Claim{{jobs:4}}` minus the one job it was handed"
+    );
+    assert_eq!(
+        worker_row["telemetry"],
+        serde_json::Value::Null,
+        "the fake worker sent no telemetry, and `null` is not an empty object"
+    );
+    assert!(
+        worker_row["last_seen_ms"].as_u64().unwrap_or_default() > EPOCH_FLOOR_MS,
+        "`last_seen_ms` is epoch, not the actor's process-relative clock: {worker_row}"
+    );
+
+    // ---- job row, with its lease ----
+    let jobs = body["jobs"].as_array().expect("jobs array");
+    assert_eq!(jobs.len(), 1, "one active job: {body}");
+    let job_row = &jobs[0];
+    assert_eq!(job_row["id"], job.as_ref());
+    assert_eq!(job_row["pool"], POOL);
+    assert_eq!(
+        job_row["tenant"], "default",
+        "the tenant the consumer's API key resolves to"
+    );
+    assert_eq!(
+        job_row["phase"], "assigned",
+        "the actor's own vocabulary: leased, and not yet streaming"
+    );
+    assert_eq!(
+        job_row["running"], true,
+        "the boolean a simple client reads"
+    );
+    assert_eq!(
+        job_row["consumers"], 1,
+        "the actor's own consumer set: the one face that submitted"
+    );
+    assert!(
+        job_row["created_ms"].as_u64().unwrap_or_default() > EPOCH_FLOOR_MS,
+        "`created_ms` is translated from the actor's clock like every other stamp"
+    );
+    let lease = &job_row["lease"];
+    assert_eq!(lease["worker"], "wkr-observe");
+    assert_eq!(
+        lease["epoch"], 1,
+        "the lease names the connection generation it was made on"
+    );
+    assert_eq!(lease["attempt"], 1, "a first dispatch, never re-leased");
+    assert!(
+        lease["deadline_ms"].as_u64().unwrap_or_default()
+            > body["now_ms"].as_u64().unwrap_or_default(),
+        "a live deadline stays in the future; saturating the clock translation would \
+         collapse it onto `now_ms`: {job_row}"
+    );
+    // The same lease, published as its own row so the connection graph can join it
+    // without re-reading the job rows.
+    let leases = body["leases"].as_array().expect("leases array");
+    assert_eq!(leases.len(), 1);
+    assert_eq!(leases[0]["job"], job.as_ref());
+    assert_eq!(leases[0]["worker"], "wkr-observe");
+
+    // ---- consumer connection row: who is attached to whom ----
+    let conns = body["consumer_connections"]
+        .as_array()
+        .expect("consumer_connections array");
+    assert_eq!(conns.len(), 1, "one consumer socket: {body}");
+    let conn = &conns[0];
+    assert_eq!(conn["tenant"], "default");
+    assert_eq!(
+        conn["attached_jobs"],
+        serde_json::json!([job.as_ref()]),
+        "the socket's own watch set, mirrored by `spawn_pump`"
+    );
+    assert!(
+        conn["id"].as_str().unwrap_or_default().starts_with("c-"),
+        "a connection id is a different axis from the per-task consumer id: {conn}"
+    );
+    assert!(
+        conn["since_ms"].as_u64().unwrap_or_default() > EPOCH_FLOOR_MS,
+        "stamped at accept, on the hub's wall clock"
+    );
+    assert_eq!(
+        conn["peer"],
+        serde_json::Value::Null,
+        "`axum::serve` installs no `ConnectInfo`, so the hub reports no address"
+    );
+
+    // ---- the counts, from the same actor answers ----
+    let pool_row = &body["pools"].as_array().expect("pools array")[1];
+    assert_eq!(pool_row["id"], POOL);
+    assert_eq!(pool_row["ready_workers"], 1);
+    assert_eq!(pool_row["loading_workers"], 0);
+    assert_eq!(pool_row["connected_workers"], 1);
+    assert_eq!(pool_row["leases"], 1);
+    assert_eq!(
+        pool_row["queue_depth"], 0,
+        "the only job is leased, not queued"
+    );
+    assert_eq!(body["readiness"]["status"], "ok");
+    assert_eq!(body["readiness"]["capacity_signal"], "warm");
+    assert_eq!(body["readiness"]["ready_workers"], 1);
+    assert_eq!(body["readiness"]["connected_workers"], 1);
+    assert_eq!(body["readiness"]["queue_depth"], 0);
+    assert_eq!(
+        body["readiness"]["warm_models"],
+        serde_json::json!(["qwen38"]),
+        "warm means a ready worker declared that model"
+    );
+    assert_eq!(body["readiness"]["active_jobs"], 1);
+    assert_eq!(
+        body["unresponsive_pools"],
+        serde_json::json!([]),
+        "both pool actors answered inside the probe budget"
+    );
+
+    // ---- 3. The socket goes away: the registry follows on its own ----
+    //
+    // Nothing tells the actor about a dropped consumer before the hub's own session
+    // teardown runs, which is exactly why the registry exists and why it is written
+    // from a `Drop` guard. The job section is deliberately not re-asserted here:
+    // dropping the consumer also cancels the task, so its phase is a race between
+    // the cancel and the next poll.
+    drop(consumer);
+    let gone = observe_until(&client, &url, "the consumer socket to be gone", |doc| {
+        doc["consumer_connections"]
+            .as_array()
+            .is_some_and(Vec::is_empty)
+    })
+    .await?;
+    assert_eq!(gone["consumer_connections"], serde_json::json!([]));
+    assert_eq!(
+        gone["readiness"]["ready_workers"], 1,
+        "a consumer leaving does not take the worker's capacity with it"
+    );
+    let _ = worker;
+    Ok(())
+}
+
+/// The GitHub-Pages origin, which is the only reason CORS is enabled at all.
+const TEST_ORIGIN: &str = "https://underloadjs.github.io";
+
+/// CORS on the observation plane: a preflight is answered by the layer, and a
+/// simple cross-origin `GET` carries the header the browser checks.
+#[tokio::test]
+async fn a_cross_origin_dashboard_can_read_observe() -> anyhow::Result<()> {
+    let hub = spawn_hub("observe_cors", test_config()).await?;
+    let client = reqwest::Client::new();
+    let url = format!("http://{}/v1/observe", hub.addr);
+
+    // Preflight: `OPTIONS` + `Origin` + `Access-Control-Request-Method`. The layer is
+    // outermost, so this never reaches the router, the body limit, or a handler — and
+    // no API key is involved at any point.
+    let preflight = client
+        .request(reqwest::Method::OPTIONS, &url)
+        .header("origin", TEST_ORIGIN)
+        .header("access-control-request-method", "GET")
+        .header("access-control-request-headers", "content-type")
+        .send()
+        .await?;
+    assert_eq!(
+        preflight.status(),
+        reqwest::StatusCode::OK,
+        "the preflight is answered by the CORS layer itself"
+    );
+    let headers = preflight.headers();
+    assert_eq!(
+        headers["access-control-allow-origin"]
+            .to_str()
+            .unwrap_or_default(),
+        "*",
+        "any origin, because the payload carries no secret"
+    );
+    assert_eq!(
+        headers["access-control-allow-methods"]
+            .to_str()
+            .unwrap_or_default(),
+        "GET,HEAD,OPTIONS",
+        "the read verbs, and nothing that could mutate (tower-http joins the list \
+         with a bare comma, which the CORS list grammar accepts)"
+    );
+    assert_eq!(
+        headers["access-control-allow-headers"]
+            .to_str()
+            .unwrap_or_default(),
+        "*",
+        "any request headers"
+    );
+    assert_eq!(
+        headers["access-control-max-age"]
+            .to_str()
+            .unwrap_or_default(),
+        "600",
+        "a dashboard polling every second must not pay a preflight per poll"
+    );
+    assert!(
+        headers.get("access-control-allow-credentials").is_none(),
+        "`Allow-Origin: *` and credentials are mutually exclusive; sending none is \
+         what makes `*` legal, and what keeps an attacker's cookie out of the request"
+    );
+
+    // The actual read: a simple `GET` needs no preflight, and the response must carry
+    // the origin header for the browser to hand the body to the page.
+    let get = client
+        .get(&url)
+        .header("origin", TEST_ORIGIN)
+        .send()
+        .await?;
+    assert_eq!(get.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        get.headers()["access-control-allow-origin"]
+            .to_str()
+            .unwrap_or_default(),
+        "*"
+    );
+    let body = get.json::<serde_json::Value>().await?;
+    assert_eq!(
+        body["protocol"], "nexus-hub-observe/v1",
+        "and still the real document"
+    );
+
+    // The honest shape of `AllowOrigin::any()`: the value is static, so tower-http
+    // writes `access-control-allow-origin: *` (plus a `Vary`) whether or not the
+    // request carried an `Origin`, and the layer wraps every route. What must not
+    // change is the status and the body of the routes that were here first —
+    // `job_reads_require_an_api_key_and_operational_routes_do_not` pins those for
+    // each surface, and `/healthz` is pinned again here.
+    let plain = client
+        .get(format!("http://{}/healthz", hub.addr))
+        .send()
+        .await?;
+    assert_eq!(
+        plain.status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        "an idle hub is still `degraded` on `/healthz`, exactly as before the layer"
+    );
+    let health = plain.json::<serde_json::Value>().await?;
+    assert_eq!(health["status"], "degraded");
+    assert_eq!(health["ready_workers"], 0);
+    assert_eq!(
+        health["protocol"],
+        nexus_core::PROTOCOL_VERSION,
+        "the body is byte-for-byte the one `/healthz` has always returned"
+    );
+    Ok(())
+}

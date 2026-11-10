@@ -212,12 +212,60 @@ struct Session<'a> {
     sink: mpsc::Sender<ConsumerWrite>,
     /// Tasks this connection is watching.
     watches: HashMap<JobId, Watch>,
+    /// This connection's id in the hub's observe registry. Every attach and detach
+    /// of a task mirrors into it, and the `ConnGuard` in `session` removes the
+    /// record when the socket goes; the pumps carry the same id so a stream that
+    /// ends by itself stops being reported.
+    conn: ConsumerId,
+}
+
+/// This connection's record in the hub's monitoring registry, removed on drop.
+///
+/// # Why a guard rather than a teardown call
+///
+/// The registry's whole purpose is to say which consumer sockets are up **right
+/// now**, so the one failure mode that matters is an exit the session did not
+/// walk through in order: a panic in a frame handler, a `JoinHandle::abort` during
+/// shutdown, or an early `return` someone adds six months from now. A trailing
+/// `hub.close_consumer_conn(..)` statement would be skipped by all three and leave
+/// a connection listed as live — with its tenant and its watched jobs — for the
+/// rest of the process's life. `Drop` runs on every path, and it can call into the
+/// registry synchronously only because that registry is a `std::sync::Mutex`
+/// (see `state::ConsumerConnection` for why that lock is the right one here).
+struct ConnGuard {
+    /// Hub the record lives in.
+    hub: Arc<Hub>,
+    /// The id this session was registered under.
+    id: ConsumerId,
+}
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        self.hub.close_consumer_conn(&self.id);
+    }
 }
 
 async fn session(socket: WebSocket, hub: Arc<Hub>, tenant: TenantId) {
     let caps_in = hub.cfg.limits.worker_caps();
     let caps_out = hub.cfg.limits.hub_caps();
     let (mut sink, mut stream) = socket.split();
+
+    // 0. Register the connection with the hub's monitoring registry.
+    //
+    // This runs after `upgrade` has already authenticated the key, so a refused
+    // upgrade never appears as a live connection, and it runs before the first
+    // frame is read, so a monitor polling during a slow client's first submit still
+    // sees the socket it is connected to. `peer` is `None` because the hub serves
+    // `axum::serve(listener, app)` without `ConnectInfo`; inventing a service
+    // wrapper for one optional monitor field is not worth touching the router
+    // contract the runtime tests reuse verbatim.
+    //
+    // The guard, not a teardown statement, is what makes abnormal disconnects
+    // correct: see `ConnGuard`.
+    let conn = ConnGuard {
+        hub: Arc::clone(&hub),
+        id: hub.accept_consumer_conn(tenant.clone(), None),
+    };
 
     // 1. Outbound pump. Dropping its `stall` clone is how the reader learns the
     //    socket can no longer be written: every pump would otherwise park behind
@@ -248,6 +296,7 @@ async fn session(socket: WebSocket, hub: Arc<Hub>, tenant: TenantId) {
         caps_out,
         sink: write_tx.clone(),
         watches: HashMap::new(),
+        conn: conn.id.clone(),
     };
 
     // 2. Inbound loop: one frame at a time, handled to completion. That is what
@@ -730,6 +779,15 @@ fn spawn_pump(
     // Shared with the pump: end-of-stream ends the subscription, and the pump is the
     // one that knows when it happened.
     let attached = Arc::new(AtomicBool::new(true));
+    // The connection starts out watching this task, mirrored into the hub's observe
+    // registry here rather than at the two verdict sites: `spawn_pump` is the single
+    // point both follow paths funnel through (an accepted submit and an `attach`), so
+    // a refusal, or a follow that never reached this line, can never be reported as
+    // attached. Everything the pump needs is cloned before the borrow of `session`
+    // below, which the `watches` insert takes mutably.
+    let hub = Arc::clone(session.hub);
+    let conn = session.conn.clone();
+    hub.consumer_attach(&conn, &job);
     let task = tokio::spawn(pump(Pump {
         follow: Follow {
             handle,
@@ -743,6 +801,8 @@ fn spawn_pump(
         stop: stop_rx,
         ended: Arc::clone(&ended),
         attached: Arc::clone(&attached),
+        hub,
+        conn,
     }));
     session.watches.insert(
         job,
@@ -784,6 +844,11 @@ struct Pump {
     /// stream ends, because a finished stream is a gone subscription and the session's
     /// teardown must not claim it a second time.
     attached: Arc<AtomicBool>,
+    /// Hub side of the observe registry: the pump reports the connection's own
+    /// end-of-stream, which no session code can see.
+    hub: Arc<Hub>,
+    /// Connection whose watch set this stream is leaving.
+    conn: ConsumerId,
 }
 
 /// What one relay item means for this connection's stream.
@@ -810,6 +875,8 @@ async fn pump(pump: Pump) {
         mut stop,
         ended,
         attached,
+        hub,
+        conn,
     } = pump;
     let Follow {
         handle,
@@ -909,6 +976,12 @@ async fn pump(pump: Pump) {
     // fresh `attach` for the same task (the resume NEX-3.4's cursor enables) is no
     // longer a duplicate.
     attached.store(false, Ordering::SeqCst);
+    // The same fact, reported to the monitor: this socket stopped watching this task.
+    // The session cannot do this itself, because *it* did not end the stream — a task
+    // that finished, lagged, or found the socket unwritable did, and only this task
+    // knows when that happened. Without this line a long-lived connection that watched
+    // a hundred finished tasks would report a hundred attached jobs until it closed.
+    hub.consumer_detach(&conn, &job);
     // A pump that ended on its own is the subscription going away (NEX-6.1). A
     // pump the session stopped has already been detached by the session, and
     // `on_detach` is idempotent, so saying it twice is cheaper than risking a

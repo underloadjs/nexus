@@ -46,7 +46,10 @@ tracing = "0.1"
 # there.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "fs", "io-util", "signal"] }
 axum = { version = "0.8", features = ["ws", "json", "query"] }
-tower-http = { version = "0.6", features = ["limit", "trace"] }
+# `cors` is what lets the GitHub-Pages dashboard read `GET /v1/observe` from another
+# origin (main.rs, `observe_cors`); `limit` caps request bodies; `trace` is the access
+# log. All three are native-only: nexus-core never sees tower.
+tower-http = { version = "0.6", features = ["cors", "limit", "trace"] }
 tokio-stream = { version = "0.1", features = ["sync", "time"] }
 tokio-tungstenite = { version = "0.26", features = ["connect"] }
 anyhow = "1"

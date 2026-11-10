@@ -24,7 +24,8 @@ consumer ──POST /v1/jobs (artifact)       ──▶│ axum + tokio  │
 | --- | --- |
 | `crates/nexus-core` | The spine: `protocol`, `actor` (pool_actor), `queue` (trait + in-memory), `relay`, `adapters`, `store`, `scheduler`, `auth`, `seq`, `metrics`, `limits`, `config`. Synchronous, IO-free, compiles for native **and** `wasm32-unknown-unknown`. |
 | `crates/nexus-server` | Native runtime: axum + tokio, worker WebSocket, **consumer WebSocket (`/v1/consumer`)** and consumer SSE, artifact spill to disk, metrics, graceful drain. Not wasm-buildable (tokio IO/time drivers do not exist there). |
-| `crates/nexus-server/src/runtime_e2e.rs` | Runtime tests: a real listener, a real worker WebSocket, real SSE/JSON responses and real consumer-WebSocket frames (`§16.5`, `§16.6`, `§16.7`, `§16.14`, `§9` tenancy, `/metrics` shape). A unit-test module of the bin, because this crate has no library target. These **run and pass** — all 19, against real loopback sockets, real WebSocket handshakes and real SSE bytes; see *Verification status*. |
+| `crates/nexus-server/src/observe.rs` | `GET /v1/observe`: the one read-only document the monitoring UI is built against — readiness, pools, workers, active jobs with leases, live consumer sockets, unresponsive pools. Open by the same rule as `/healthz`, always `200`, and the only route that *relies* on CORS — the layer itself wraps every route. `crates/nexus-server/src/main.rs` (`observe_cors`) is the policy. |
+| `crates/nexus-server/src/runtime_e2e.rs` | Runtime tests: a real listener, a real worker WebSocket, real SSE/JSON responses and real consumer-WebSocket frames (`§16.5`, `§16.6`, `§16.7`, `§16.14`, `§9` tenancy, `/metrics` shape), plus the observation plane end to end (the `/v1/observe` contract, and a cross-origin preflight + read). A unit-test module of the bin, because this crate has no library target. These **run and pass** — all 21, against real loopback sockets, real WebSocket handshakes and real SSE bytes; see *Verification status*. |
 | `crates/nexus-wasm` | The **same** `PoolActor` re-exported to Node/browser via `wasm-bindgen`. |
 | `crates/nexus-worker-example` | Rust worker client that dials out and fronts a loopback engine (task §12). |
 | `examples/node-smoke.mjs` | Node smoke test that drives the WASM actor and asserts broker behaviour end-to-end. |
@@ -50,7 +51,7 @@ directory and `--locked`**, so nothing here depends on an incremental build.
 | --- | --- |
 | `cargo fmt --all -- --check` | **clean** (exit 0) |
 | `cargo check --workspace --all-targets` | **ok**, 0 errors, 0 warnings |
-| `cargo test --workspace` | **exit 0 — 163 passed / 0 failed**: `nexus-core` lib **86/86**, `crates/nexus-core/tests/acceptance.rs` **46/46**, `nexus-server` bin **31/31** (19 `runtime_e2e` + 7 `io::tests` + 5 `state::tests`), `nexus-wasm` 0 tests, `nexus-worker-example` 0 tests, doc-tests 0 |
+| `cargo test --workspace` | **exit 0 — 177 passed / 0 failed**: `nexus-core` lib **86/86**, `crates/nexus-core/tests/acceptance.rs` **48/48**, `nexus-server` bin **43/43** (21 `runtime_e2e` + 10 `observe::tests` + 7 `io::tests` + 5 `state::tests`), `nexus-wasm` 0 tests, `nexus-worker-example` 0 tests, doc-tests 0 |
 | `cargo clippy --workspace --all-targets` | **exit 0**, every crate linted |
 | `cargo clippy --workspace --all-targets -- -D warnings` (what `yarn clippy` runs) | **exit 0 — zero findings**. The 17 pre-existing `nexus-core` lints this row used to record are gone, so `yarn verify` no longer aborts before `yarn test` |
 | `cargo build --release -p nexus-server` | **ok** → `.rust/target/release/nexus-hub`, 3 403 096 bytes (3.25 MiB), a stripped ELF executable (fat LTO, `panic = abort`, symbols stripped) |
@@ -176,7 +177,7 @@ curl -N localhost:8085/v1/chat/completions \
 
 ### Routes
 
-Everything the hub listens for, as registered in `crates/nexus-server/src/main.rs:114-145`.
+Everything the hub listens for, as registered in `crates/nexus-server/src/main.rs:117-160`.
 The frame vocabulary and the body shapes are the specification's §7
 (`documents/specifications/hub-specification.md`).
 
@@ -191,7 +192,84 @@ The frame vocabulary and the body shapes are the specification's §7
 | `GET /v1/jobs/{id}/events` (SSE), `GET /v1/jobs/{id}/result` | consumer | Follow a detached job's stream with `Last-Event-ID` replay; fetch its result (`?from=&to=` ranges). |
 | `DELETE /v1/jobs/{id}` | consumer | Explicit cancel; the record keeps its normal terminal retention, unlike a lost connection. |
 | `GET /v1/models`, `GET /healthz`, `GET /metrics` | consumer / ops | Model list, health, Prometheus exposition. The last two are open on purpose: a load balancer has no API key. |
+| **`GET /v1/observe`** | consumer / ops / **browser** | **New.** One read-only document for the monitoring UI: readiness, one row per pool, worker liveness and load, the active jobs with their leases, and the live consumer sockets with the jobs each is attached to. Open like `/healthz`, and **always `200`** while the hub is serving. The only route that *relies* on CORS (the layer wraps every route). See the section below. |
 | `GET /v1/payloads/{id}`, `GET\|PUT /v1/artifacts/{id}` | supplier / both | Bulk payload fetch, and artifact upload/download with query-parameter ranges and a measured digest. |
+
+### `GET /v1/observe` — the monitoring plane
+
+`crates/nexus-server/src/observe.rs`. One request answers every question a dashboard
+asks, so a static bundle hosted on GitHub Pages does not have to combine `/healthz`
+(counts only), `/metrics` (a text exposition the browser must parse) and one
+`GET /v1/jobs/{id}` probe per job.
+
+```jsonc
+GET /v1/observe            // no Authorization header
+{
+  "protocol": "nexus-hub-observe/v1",
+  "now_ms": 1762760000000,                 // epoch ms, hub clock
+  "readiness": { "status": "ok", "ready_workers": 1, "loading_workers": 0,
+                 "queue_depth": 0, "mailbox_pending": 0, "warm_models": ["qwen38"],
+                 "capacity_signal": "warm", "connected_workers": 1, "active_jobs": 1,
+                 "pool_mailbox_depth": [ … ] },   // field names mirror `/healthz`
+  "pools":  [ { "id": "llm.chat/qwen38", "queue_depth": 0, "ready_workers": 1,
+                "loading_workers": 0, "connected_workers": 1, "leases": 1,
+                "mailbox_pending": 0 } ],
+  "workers":[ { "id": "w-…", "pools": ["llm.chat/qwen38"], "link": "live",
+                "engine": "ready", "epoch": 1, "capacity_slots": 4, "free_slots": 2,
+                "free_kv_tokens": 8192, "in_flight": ["job-…"], "outstanding_claims": 3,
+                "last_seen_ms": 1762759999000, "telemetry": null,
+                "resumable": false, "available_slots": 3 } ],
+  "jobs":   [ { "id": "job-…", "pool": "llm.chat/qwen38", "tenant": "default",
+                "phase": "assigned", "running": true, "created_ms": 1762759990000,
+                "consumers": 2,
+                "lease": { "worker": "w-…", "epoch": 1, "attempt": 1,
+                           "deadline_ms": 1762760005000 } } ],   // null while queued
+  "leases": [ { "job": "job-…", "worker": "w-…", "state": "leased", … } ],
+  "consumer_connections": [ { "id": "c-…", "tenant": "default",
+                              "since_ms": 1762759980000, "peer": null,
+                              "attached_jobs": ["job-…"] } ],
+  "unresponsive_pools": []
+}
+```
+
+Rules worth stating, because a dashboard is written against them:
+
+* **Open, and always `200`.** No key, same argument as `/healthz` (`main.rs`'s
+  "operations: open on purpose" group). Unlike `/healthz`, zero ready workers is a
+  field (`readiness.status: "degraded"`), never a `503`: a monitor should treat only a
+  transport failure as downtime.
+* **The actor is asked, not the mirror.** Workers, leases and job phases have exactly
+  one owner (`nexus-core/src/actor.rs`), so `Hub::pool_snapshot` sends one
+  `ActorMsg::Observe` per pool and reads the answer off the same mailbox that mutates
+  the state — the identical serialized read `GET /v1/jobs/{id}` already relies on. The
+  mirrored `PoolGauges` appear only where the actor could not answer (per-pool mailbox
+  depth) or where the actor is missing.
+* **A wedged pool cannot hang the dashboard.** The fan-out is concurrent and each
+  probe is bounded by the same 2 s budget every read-through probe uses
+  (`state.rs`, `PROBE_TIMEOUT_MS`). A pool that does not answer keeps its mirrored
+  gauges in `pools[]` and is named in `unresponsive_pools`; the response is still
+  `200`. `None` never means "empty pool".
+* **Clocks are translated, not mixed.** The actor's clock is process-relative
+  (`std::time::Instant`), so `last_seen_ms`, `created_ms` and a lease `deadline_ms`
+  are translated to epoch ms by one function (`state::actor_to_wall_ms`), with signed
+  arithmetic so a deadline in the future stays in the future.
+* **`leases` is null while a job is queued**, `telemetry` is arbitrary JSON or `null`,
+  and `jobs[].phase` is the actor's own vocabulary (`pending|queued|assigned|streaming`
+  for active work) rather than a single `"running"` — the queued-vs-leased distinction
+  is the whole point of the view. `jobs[].running` is the boolean for a client that
+  only wants "in flight". Extra fields are additive; renaming or dropping a documented
+  one is breaking.
+* **CORS** (`main.rs`, `observe_cors`): any origin, `GET`/`HEAD`/`OPTIONS`, any request
+  headers, **no credentials**, preflight cached 600 s. `Allow-Origin: *` is legal only
+  because nothing is sent that could identify the caller — a cross-site read cannot be
+  forged into a mutation. The layer is outermost, so a preflight is answered without
+  reaching the router. It wraps every route; see the privacy note below.
+* **Consumer sockets are hub state, not actor state.** The actor keys its consumer sets
+  by a per-(connection, task) id and cannot answer "which sockets are up", so
+  `consumer_ws` registers one record per accepted socket in the hub (`Hub::
+  consumer_connections`) and updates it on attach, on end-of-stream, and on close via
+  a `Drop` guard — which is what makes an abnormal disconnect disappear from this
+  document instead of lingering as a live connection.
 
 ### Configuration
 
@@ -419,6 +497,16 @@ Two documented deviations from a literal reading of the task:
 * **Path safety**: job/artifact ids are restricted to `[A-Za-z0-9._-]{1,64}` with no
   leading/trailing dot, and artifact paths are built through `artifact_path_checked`, so a
   `../` cannot escape the root.
+* **What `GET /v1/observe` publishes, to anyone.** The snapshot is open by the same
+  rule as `/healthz` and `/metrics`, and from any origin, so whoever can reach the
+  port can read **worker ids, pool and kind names, job ids, tenant ids, connection ids,
+  byte counters, lease deadlines and per-worker telemetry**. That is a deliberate
+  disclosure of topology and activity — which tenant is running what, and how loaded a
+  worker is. It is not a disclosure of content: no prompt text, no streamed answer, no
+  artifact bytes, no credentials, and no peer addresses (the transport does not expose
+  them). A deployment that must hide tenant names or job ids from the network should
+  not expose this route — front it with a proxy, or keep the dashboard on the same
+  origin — since the route itself carries no authentication to revoke.
 * A worker on hardware someone else administers is a worker, not a trusted peer: unknown
   fields are tolerated (forward compatibility) but every value is validated, and a bad
   frame closes the socket rather than desynchronising it.
@@ -428,7 +516,7 @@ Two documented deviations from a literal reading of the task:
 Two words carry precise meaning in this table:
 
 * **core** — `crates/nexus-core/tests/acceptance.rs` asserts the actor's decision
-  with injected time. That file has been **run and is green** (46/46), so "core" now
+  with injected time. That file has been **run and is green** (48/48), so "core" now
   means "a test states the exact expected value *and that value was observed*";
 * **runtime** — the behaviour needs the native handlers (`crates/nexus-server`)
   and a live socket. These are asserted by
@@ -467,14 +555,17 @@ resume-by-continuation on/off **and its refusal of opaque tool-call output**, de
 jobs surviving an events-watcher disconnect, and TTL/retention sweeps.
 
 The review passes also added the runtime and I/O coverage the package shipped without, and
-all of it has been executed since: `nexus-server`'s `runtime_e2e` module (**19** tests —
+all of it has been executed since: `nexus-server`'s `runtime_e2e` module (**21** tests —
 real listener, real worker socket, real SSE, and now real consumer-WebSocket traffic for
 the NEX-3 face and §16.7), `io.rs`'s download-and-ingest module (**7** tests: chunked
 streaming, exact slices, `416`, length/digest refusal, and staged ingest finalising by
 rename), and `state.rs`'s **5** unit tests (label merging, the stalled-connection report,
 the `JobForgotten` pruning of `job_index` and the relays, the idempotency mirror's bound
 and expiry, and the routing index holding only the jobs the actor still knows).
-Every one of them is written against the real types, and **163/163 pass** on this host.
+Every one of them is written against the real types, and **177/177 pass** on this host
+(the 163 that existed before the observation plane are unchanged and still green; the 14
+more are the `/v1/observe` actor snapshot, its unit tests, and the two runtime tests for
+the route and its CORS).
 
 ## Commands
 
@@ -508,8 +599,12 @@ child process cargo spawns, which is the root `AGENTS.md` scratch rule.
   not rebuilt here during the remediation pass, and nothing in this README claims it was.
   Installing the CLI is a host change, which this pass was scoped not to make.
 * **the suite is green on this host, and on a clean copy of it.** **163/163** with the
-  pinned `1.99.1` toolchain, reproduced from a pristine copy with a fresh target directory
-  and `--locked` — so it is no longer a single-host, single-incremental-build result. The
+  pinned `1.99.1` toolchain at the time of that reproduction, reproduced from a pristine
+  copy with a fresh target directory and `--locked` — so it is no longer a single-host,
+  single-incremental-build result. The observation plane has since taken that to
+  **177/177** on the same pinned toolchain (`cargo test --workspace`, 2026-11-10), with
+  the 14 additions listed in the table above; the pristine-copy `--locked` reproduction
+  has not been re-run since. The
   wasm smoke test and §14's latency budgets remain unmeasured, so nothing in this README
   claims them.
 
@@ -764,10 +859,11 @@ Correctness against the task:
 A follow-up pass took the six correctness items that the first pass had found but left
 open. Same rules: only this package, nothing compiled, and at the time every claim below
 was from reading code and tests that had never been executed. The verification pass above
-has since executed them: the claims held (the suite was 128/128 at that pass and is
-**163/163** now), with the
-fourteen exceptions itemised in *Fixed in this pass* — three of which were this document
-being confidently wrong, notably the `sha2` diagnosis for the streamed artifact digest.
+has since executed them: the claims held (the suite stood at 128/128 in that pass's
+own count, and at **163/163** when the verification pass executed it — **177/177**
+today, with the observation plane), with the fourteen exceptions itemised in *Fixed
+in this pass* — three of which were this document being confidently wrong, notably
+the `sha2` diagnosis for the streamed artifact digest.
 
 1. **The contradictory phase assertion was fixed in the test, not in the actor**
    (`tests/acceptance.rs:1095`, in `heartbeats_renew_the_lease_and_missing_heartbeats_pause_dispatch_only`).

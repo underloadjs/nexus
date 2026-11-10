@@ -1607,7 +1607,12 @@ fn header_of(text: &str) -> HeaderValue {
 }
 
 /// A JSON response with the right content type.
-fn json_response(status: StatusCode, body: &Value) -> Response {
+///
+/// `pub(crate)` so `observe.rs` renders its document through the *same* content-type
+/// and serialization rules as every other JSON surface: two builders of "the same"
+/// response drift (one adds a charset, one does not), and the dashboard's client
+/// sniffs this header to decide whether the body is JSON at all.
+pub(crate) fn json_response(status: StatusCode, body: &Value) -> Response {
     Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, "application/json")

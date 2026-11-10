@@ -77,10 +77,12 @@ use crate::model::JobRecord;
 use crate::model::JobView;
 use crate::model::Lease;
 use crate::model::LinkState;
+use crate::model::PoolSnapshot;
 use crate::model::Submission;
 use crate::model::TerminalReason;
 use crate::model::WorkerRecord;
 use crate::model::WorkerTier;
+use crate::model::WorkerView;
 use crate::protocol::Attestation;
 use crate::protocol::ByeReason;
 use crate::protocol::CancelReason;
@@ -299,6 +301,23 @@ pub enum ActorMsg {
         /// Job to read.
         job: JobId,
     },
+    /// Read-only whole-pool snapshot for the monitoring surface: the actor answers
+    /// with [`Effect::Observed`], built by [`PoolActor::pool_snapshot`].
+    ///
+    /// Same serialized-read contract as [`ActorMsg::Query`] — the answer arrives
+    /// from the same single-owner loop that mutates the state, so it cannot be a
+    /// torn mix of two transitions. It carries no reply channel because **this
+    /// crate has no tokio** (the hard rule at the top of `nexus-core/Cargo.toml`:
+    /// `wasm32-unknown-unknown` has no IO or time driver), so the reply travels as
+    /// an effect and the embedder owns the waiting side. The native hub does that
+    /// in `state::Hub::pool_snapshot`, keyed by a per-request token so two
+    /// concurrent monitors of one pool cannot be handed each other's snapshot.
+    Observe {
+        /// Correlation id, echoed verbatim into [`Effect::Observed`] so the
+        /// embedder can route the answer to whoever asked. The actor has no use
+        /// for it and does not interpret it.
+        token: u64,
+    },
     /// Virtual clock advance: leases, dispatch deadlines, TTLs, keepalives.
     Tick {
         /// Current time.
@@ -453,6 +472,25 @@ pub enum Effect {
         /// next-largest variant (a boxed `SendWorker` frame) instead of copying a whole
         /// view around for every delta.
         view: Box<Option<JobView>>,
+    },
+    /// Answer to [`ActorMsg::Observe`]: one pool's whole state, as its own actor
+    /// sees it.
+    ///
+    /// Boxed for the reason `Effect::Snapshot` states — a snapshot carries every
+    /// worker and every active job of the pool, which is by far the largest thing
+    /// in this enum, and `Effect` values live in `Vec<Effect>` on every mailbox
+    /// step. `Serialize` (the `Effect` derive) is the WASM half of the same
+    /// contract: a JS host that sends `observe` gets the identical JSON shape the
+    /// native hub renders.
+    Observed {
+        /// Correlation id from [`ActorMsg::Observe`], echoed unchanged. A pool has
+        /// one actor but may be watched by several monitors at once, and the actor
+        /// answers in mailbox order — routing by token is what pairs each answer
+        /// with the request that caused it instead of with whoever happens to be
+        /// waiting.
+        token: u64,
+        /// Whole-pool snapshot.
+        snapshot: Box<PoolSnapshot>,
     },
     /// Structured log line for the embedder.
     Log {
@@ -726,6 +764,59 @@ impl PoolActor {
         })
     }
 
+    /// Whole-pool monitoring snapshot: every worker record and every **active**
+    /// job view, plus the pool's own gauges. Answers [`ActorMsg::Observe`].
+    ///
+    /// Every number here is read from the one value that owns it, which is the
+    /// same reason [`PoolActor::job_view`] exists: a monitor that read a hub-side
+    /// mirror would be looking at a copy that can lag the truth. The worker filter
+    /// is the pool-membership test the readiness counters already use
+    /// (`w.pools.contains(&self.pool)`), so a snapshot's worker list can never
+    /// disagree with its `ready_workers` / `loading_workers` counts — including for
+    /// an **orphaned** record, which the counters deliberately exclude: an orphaned
+    /// worker owns a lease but cannot take work, so `in_flight` stays populated and
+    /// `connected_workers` does not count it.
+    ///
+    /// `jobs` is built through [`PoolActor::job_view`] for exactly one reason: the
+    /// lease is a second map (`self.leases`), and deriving the view is what joins
+    /// job state to its lease without a second copy of either.
+    #[must_use]
+    pub fn pool_snapshot(&self) -> PoolSnapshot {
+        // The three counters are method calls rather than one pass over `workers`,
+        // because they *are* the readiness definition (`ready_workers`/
+        // `loading_workers`): reusing them keeps `/healthz`, `/metrics` and
+        // `/v1/observe` answering from one rule instead of three lookalikes.
+        let connected_workers = self
+            .workers
+            .values()
+            .filter(|w| w.link == LinkState::Live && w.pools.contains(&self.pool))
+            .count();
+        PoolSnapshot {
+            pool: self.pool.clone(),
+            queue_depth: self.queue.depth(),
+            ready_workers: self.ready_workers(),
+            loading_workers: self.loading_workers(),
+            connected_workers,
+            leases: self.leases.len(),
+            workers: self
+                .workers
+                .values()
+                .filter(|w| w.pools.contains(&self.pool))
+                .map(WorkerView::from_record)
+                .collect(),
+            // Active records only; see `PoolSnapshot`'s note on retention.
+            // `retain` + a second pass rather than `filter_map(job_view)`: the view
+            // is derived from `self.jobs` and `self.leases` together, so building it
+            // inside the filter would re-look-up the record it just matched.
+            jobs: self
+                .jobs
+                .values()
+                .filter(|record| !record.phase.is_terminal())
+                .filter_map(|record| self.job_view(&record.id))
+                .collect(),
+        }
+    }
+
     /// Reserve the next connection id; the transport tags every inbound frame
     /// with it, which is how stale sockets are detected.
     pub fn reserve_conn(&mut self) -> u64 {
@@ -840,6 +931,13 @@ impl PoolActor {
                 // unchanged, so a snapshot is still exactly what the single owner sees.
                 view: Box::new(self.job_view(&job)),
                 job,
+            }],
+            ActorMsg::Observe { token } => vec![Effect::Observed {
+                // Boxed payload: see `Effect::Observed`. The token is carried
+                // through untouched, so a reply can never be paired with the wrong
+                // request when two monitors poll the same pool at once.
+                token,
+                snapshot: Box::new(self.pool_snapshot()),
             }],
             ActorMsg::Tick { .. } => self.on_tick(now_ms),
             ActorMsg::Shutdown { .. } => self.on_shutdown(now_ms),
