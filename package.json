@@ -32,7 +32,16 @@
         "wasm:glue": "node scripts/build-wasm.mjs",
         "build:wasm": "yarn wasm && yarn wasm:glue",
         "smoke:wasm": "node examples/node-smoke.mjs",
+        "#daytona": "deploy:daytona ships bytes to an ENDPOINT THAT ALREADY EXISTS; start:daytona is the orchestrator that creates the sandbox first (scripts/start-daytona.ts header). vite-node is root-hoisted, so the TS script runs with no build step.",
+        "start:daytona": "vite-node scripts/start-daytona.ts",
+        "#ts": "The TypeScript surface is scripts/*.ts only (the Rust crates are checked by cargo). test:scripts covers those scripts; `test` stays cargo, which turbo orchestrates.",
+        "typecheck": "tsc --noEmit",
+        "test:scripts": "vitest run scripts",
         "verify": "yarn fmt:check && yarn clippy && yarn test && yarn build && yarn build:wasm && yarn smoke:wasm"
+    },
+    "#dependencies": "scripts/start-daytona.ts imports createSandbox from @services/daytona/sandbox; house convention is \"*\" + TS sources resolved through the workspace symlink (no build step, no lockfile entry needed for a private workspace package).",
+    "dependencies": {
+        "@services/daytona": "*"
     },
     "keywords": [
         "inference",
