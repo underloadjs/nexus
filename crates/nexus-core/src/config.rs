@@ -23,7 +23,14 @@ use crate::protocol::Requires;
 
 /// One kind of work. The registry the hub consults instead of trusting a
 /// client's claim about its own job.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Default` is derived rather than hand-written because every field's zero value
+/// *is* the conservative answer: an empty pool (which `validate()` then refuses),
+/// `idempotent = false` — re-running a side-effecting job is worse than failing it,
+/// so a new kind is non-idempotent until the operator says otherwise (task §5.3
+/// "fail loudly instead") — and no timeout override, which leaves the pool limits in
+/// charge.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct KindConfig {
     /// Pool this kind routes to.
@@ -44,23 +51,6 @@ pub struct KindConfig {
     /// Per-kind override of `Limits::no_worker_grace_ms`.
     #[serde(default)]
     pub no_worker_grace_ms: Option<u64>,
-}
-
-impl Default for KindConfig {
-    fn default() -> Self {
-        Self {
-            pool: String::new(),
-            // Conservative: a new kind is non-idempotent until declared
-            // otherwise, because re-running a side-effecting job is worse than
-            // failing it (task §5.3 "fail loudly instead").
-            idempotent: false,
-            streaming: false,
-            requires: Requires::default(),
-            claim_deadline_ms: None,
-            job_hard_cap_ms: None,
-            no_worker_grace_ms: None,
-        }
-    }
 }
 
 /// One capability pool: a queue plus the actor that owns it (task §5).
@@ -223,9 +213,16 @@ impl Default for BrokerConfig {
         cfg.pools
             .insert(image_pool.to_string(), PoolConfig::default());
 
-        let mut llm_requires = Requires::default();
-        llm_requires.model = Some("qwen38".to_string());
-        llm_requires.min_context_tokens = Some(524_288);
+        // Written as one literal, matching the pool's `requires` above: the capability
+        // floor every `llm.chat` submission inherits is the reference engine's shape
+        // (qwen38 at 524288 context), and listing all four fields keeps the model name
+        // and the context floor from ever drifting apart.
+        let llm_requires = Requires {
+            model: Some("qwen38".to_string()),
+            min_context_tokens: Some(524_288),
+            capabilities: BTreeSet::new(),
+            kv_estimate_tokens: None,
+        };
 
         cfg.kinds.insert(
             "llm.chat".to_string(),
@@ -380,6 +377,13 @@ impl BrokerConfig {
         set_num("NEXUS_PAYLOAD_TTL_MS", &mut self.limits.payload_ttl_ms);
         set_num("NEXUS_ARTIFACT_TTL_MS", &mut self.limits.artifact_ttl_ms);
         set_num("NEXUS_JOB_RETENTION_MS", &mut self.limits.job_retention_ms);
+        // NEX-6.6 / §9.1 item 3: the cap on an unclaimed detached job. Same
+        // `NEXUS_*_MS` shape as the other lifetimes, so an operator retunes every
+        // retention bound from one place.
+        set_num(
+            "NEXUS_DETACHED_ORPHAN_TTL_MS",
+            &mut self.limits.detached_orphan_ttl_ms,
+        );
         set_num(
             "NEXUS_IDEMPOTENCY_TTL_MS",
             &mut self.limits.idempotency_ttl_ms,
@@ -806,6 +810,43 @@ mod tests {
         assert_eq!(
             cfg.limits.queue_depth, 128,
             "an unparsable value keeps the default"
+        );
+    }
+
+    /// The NEX-6.6 detached-job cap has to be reachable the same way every other
+    /// lifetime is: exact value through `NEXUS_*`, default when the var is absent,
+    /// default when the value is junk.
+    #[test]
+    fn detached_orphan_ttl_env_override_is_exact() {
+        let mut values = BTreeMap::new();
+        values.insert(
+            "NEXUS_DETACHED_ORPHAN_TTL_MS".to_string(),
+            "45000".to_string(),
+        );
+        assert_eq!(
+            BrokerConfig::from_values(&values)
+                .limits
+                .detached_orphan_ttl_ms,
+            45_000
+        );
+
+        // Absent: the documented 5-minute default, which `validate()` accepts.
+        let mut unset = BrokerConfig::from_values(&BTreeMap::new());
+        assert_eq!(unset.limits.detached_orphan_ttl_ms, 300_000);
+        // Credentials are unrelated to this bound, so opt out of them the way every
+        // other fixture here does; the assertion is about the TTL, not §9's policy.
+        unset.auth.allow_anonymous = true;
+        assert_eq!(unset.validate(), Ok(()));
+
+        // Junk: keeps the default rather than zeroing the bound (`set_num` only ever
+        // assigns a value that parsed).
+        let mut junk = BTreeMap::new();
+        junk.insert("NEXUS_DETACHED_ORPHAN_TTL_MS".to_string(), "5m".to_string());
+        assert_eq!(
+            BrokerConfig::from_values(&junk)
+                .limits
+                .detached_orphan_ttl_ms,
+            300_000
         );
     }
 

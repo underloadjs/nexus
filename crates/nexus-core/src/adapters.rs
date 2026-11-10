@@ -110,10 +110,13 @@ impl ChatRequest {
             .to_string();
 
         // `/v1/completions` carries `prompt`; chat carries `messages`. Accept
-        // either so a client mixing the two is not silently dropped.
+        // either so a client mixing the two is not silently dropped. `and_then`
+        // over `as_array` replaces an `is_array()` + `as_array().expect(..)` pair:
+        // the check and the unwrap were the same question asked twice.
         let has_input = body
             .get("messages")
-            .is_some_and(|m| m.is_array() && !m.as_array().expect("array").is_empty())
+            .and_then(Value::as_array)
+            .is_some_and(|messages| !messages.is_empty())
             || body.get("prompt").is_some_and(|p| !p.is_null());
         if !has_input {
             return Err(AdapterError::bad_request(
@@ -167,9 +170,13 @@ impl ChatRequest {
             idempotency_key,
             session_hint,
             priority,
-            // Declared by the registry, never by the client (task §5.3).
-            idempotent: kind_cfg.map_or(false, |k| k.idempotent),
-            streaming: kind_cfg.map_or(true, |k| k.streaming),
+            // `is_some_and`/`is_none_or` instead of `map_or`: the default was a
+            // boolean literal, so both spellings are the same expression, and
+            // `kind_cfg` is a `Copy` `Option<&KindConfig>` — reading it twice is
+            // free. Both flags stay declared by the registry, never by the client
+            // (task §5.3).
+            idempotent: kind_cfg.is_some_and(|k| k.idempotent),
+            streaming: kind_cfg.is_none_or(|k| k.streaming),
             // An SSE chat request *is* its subscription (§6): losing the socket
             // means nobody wants the tokens any more.
             cancel_on_consumer_gone: true,
@@ -183,9 +190,13 @@ impl ChatRequest {
 #[must_use]
 pub fn infer_requires(model: &str, body: &Value) -> Requires {
     let mut capabilities: BTreeSet<String> = BTreeSet::new();
+    // `and_then(Value::as_array)` answers "is it a non-empty array" in one step;
+    // the previous `is_array()` + `as_array().expect("array")` pair asked it twice
+    // and carried an unwrap the type system had already discharged.
     if body
         .get("tools")
-        .is_some_and(|t| t.is_array() && !t.as_array().expect("array").is_empty())
+        .and_then(Value::as_array)
+        .is_some_and(|tools| !tools.is_empty())
     {
         capabilities.insert("tools".to_string());
     }

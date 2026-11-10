@@ -103,6 +103,33 @@ pub struct JobRequest {
     /// Optional priority class name.
     #[serde(default)]
     pub priority: Option<String>,
+    /// NEX-6.6's explicit opt-in, **required** on this route (spec §9.1 item 3:
+    /// detachment "must be stated as such on the request; it never applies to a
+    /// plain 'stream me the answer' submission").
+    ///
+    /// Only `true` is accepted here, and the two refusals are separate facts:
+    ///   * absent — nothing was stated. An omitted field is not a declaration, so
+    ///     defaulting it would hand every plain `POST /v1/jobs` detached-lifetime
+    ///     semantics as a route artifact, which is precisely what NEX-6.6 forbids.
+    ///     Refused with `400 detach_required`.
+    ///   * `true` — stated: "post it now, I will pick the result up later". The task
+    ///     keeps running when nothing is attached, bounded by
+    ///     `limits.detached_orphan_ttl_ms`.
+    ///   * `false` — the plain "stream me the answer" contract of NEX-6.1, which
+    ///     this route cannot honour: it answers `202` and hangs up, so a coupled
+    ///     submission would be orphaned and deleted before the client could poll it.
+    ///     Refused with the same code rather than silently picking one reading.
+    ///
+    /// `GET /v1/consumer` is where `detach: false` is meaningful, because there the
+    /// connection really is the subscription; on that face the field stays optional
+    /// and defaults to attached (`consumer_ws.rs:375-382`).
+    ///
+    /// `Option<bool>` rather than `bool` with `#[serde(default)]`: a plain `bool`
+    /// would make an absent field a serde failure, and the route would answer
+    /// `400 bad_json` for a body that is perfectly valid JSON. The refusal belongs
+    /// in the handler, where the code and the message can name the contract.
+    #[serde(default)]
+    pub detach: Option<bool>,
 }
 
 /// `POST /v1/chat/completions`.
@@ -163,6 +190,45 @@ async fn openai_endpoint(hub: Arc<Hub>, headers: &HeaderMap, raw: &[u8], kind: &
     );
     let stream = request.stream;
     let model = request.model.clone();
+
+    // §5.2 at the runtime level, on the surface that actually carries the answer: a key
+    // this hub has already routed is **followed**, not re-run. See `create_job` for the
+    // full reason this is decided on the face rather than left to the actor — the
+    // actor's duplicate branch replays on the original id, which is not the id this
+    // request would have registered its relay and gate under, and the retry used to
+    // time out as `503 hub_unavailable` while the original's replay was dropped.
+    //
+    // One caveat worth stating where it happens: the actor's own
+    // `nexus_idempotent_attach_total` no longer moves for these retries, because the
+    // actor is never told about a duplicate this hub can answer. The hub cannot
+    // compensate — `PoolGauges::from_actor` (state.rs:213-222) overwrites the mirrored
+    // registry from the actor on every dispatch, so a hub-side increment would be
+    // erased a tick later.
+    if let Some((_pool, existing)) = hub.idempotency_target(&submission.idempotency_key).await {
+        if let Some((consumer, handle, live, replay)) = join_existing_job(&hub, &existing).await {
+            // No verdict wait, unlike a fresh submission (§7.2): an attach emits only
+            // `ReplayTo` (`actor.rs:1228-1260`), and the record it follows is already
+            // past `Pending`, so its stream is open by definition — the same reading
+            // `GET /v1/jobs/{id}/events` takes.
+            let follow = Follow {
+                handle,
+                consumer,
+                job: existing.clone(),
+                live,
+                replay,
+            };
+            if !stream {
+                // `false`: a joiner does not own the relay it borrowed (see the
+                // parameter's documentation).
+                return aggregate_response(&hub, follow, &model, false).await;
+            }
+            return stream_completion(&hub, follow, model).await;
+        }
+        // Declining means the mirrored record is gone (NEX-6.3 deleted it, or its
+        // retention lapsed). Drop the straggler and let `submit` start the fresh
+        // execution NEX-6.3 asks for, re-mirroring the key on the way.
+        hub.forget_idempotency(&submission.idempotency_key).await;
+    }
     let (job, consumer, handle, _relay, gate, live, replay) =
         submit(&hub, &pool_id, submission).await;
 
@@ -180,22 +246,22 @@ async fn openai_endpoint(hub: Arc<Hub>, headers: &HeaderMap, raw: &[u8], kind: &
             message,
             retry_after_secs,
         })) => {
+            abandon_submission(&hub, &handle, &job).await;
             let mut response = json_error(status, &code, &message, retry_after_secs.is_some());
             if let Some(secs) = retry_after_secs {
-                response.headers_mut().insert(
-                    header::RETRY_AFTER,
-                    secs.to_string().parse().expect("seconds parse"),
-                );
+                response
+                    .headers_mut()
+                    .insert(header::RETRY_AFTER, retry_after(secs));
             }
-            response.headers_mut().insert(
-                "x-nexus-job",
-                job.as_ref().parse().expect("job id is a header value"),
-            );
+            response
+                .headers_mut()
+                .insert("x-nexus-job", header_of(job.as_ref()));
             return response;
         }
         // A timeout here is not "the worker is slow": it is the hub failing to
         // answer, and the honest answer is a retryable 503, not a hung stream.
         Ok(Ok(Gate::Closed)) | Ok(Err(_)) | Err(_) => {
+            abandon_submission(&hub, &handle, &job).await;
             let mut response = json_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "hub_unavailable",
@@ -208,28 +274,36 @@ async fn openai_endpoint(hub: Arc<Hub>, headers: &HeaderMap, raw: &[u8], kind: &
             return response;
         }
     }
+    let follow = Follow {
+        handle,
+        consumer,
+        job: job.clone(),
+        live,
+        replay,
+    };
     if !stream {
-        return aggregate_response(&hub, job, consumer, handle, live, replay, &model).await;
+        // The request owns this job's relay: nothing else will ever follow an id that
+        // was minted for this one call.
+        return aggregate_response(&hub, follow, &model, true).await;
     }
+    stream_completion(&hub, follow, model).await
+}
 
+/// Open the OpenAI SSE body for one followed job: headers, the role delta, then the
+/// pump that carries the rest (§7.2's ordering, §16.14's verbatim relay).
+///
+/// Split out of `openai_endpoint` because the idempotent-join path needs the identical
+/// sequence for a job this request did not create; two copies of "role chunk before the
+/// first keepalive" is how the two surfaces would drift.
+async fn stream_completion(hub: &Arc<Hub>, follow: Follow, model: String) -> Response {
+    let job = follow.job.clone();
     let created = hub.wall_ms();
     let (out_tx, out_rx) =
         mpsc::channel::<Result<Event, Infallible>>(hub.cfg.limits.consumer_backpressure_frames);
     // Headers first, then the role delta, then a keepalive while queued (§7.2).
-    let role = Event::default()
-        .json_data(adapters::role_chunk(&job, &model, created))
-        .expect("chunk serializes");
+    let role = json_data_event(adapters::role_chunk(&job, &model, created));
     let _ = out_tx.send(Ok(role)).await;
-    tokio::spawn(pump_sse(
-        handle,
-        consumer,
-        job.clone(),
-        model,
-        created,
-        live,
-        replay,
-        out_tx,
-    ));
+    tokio::spawn(pump_sse(follow, model, created, out_tx));
     let mut response = Sse::new(ReceiverStream::new(out_rx))
         .keep_alive(
             KeepAlive::new()
@@ -250,55 +324,116 @@ fn response_headers(job: &JobId, response: &mut Response) {
     }
 }
 
+/// The frame number an event carries, or `None` for the ones that have none (`Meta`,
+/// `Gap`, `Error`).
+///
+/// Extracted from `send_block` so the aggregating path can apply the **same** overlap rule
+/// the streaming pumps do: a joiner receives its buffered prefix on its private queue *and*
+/// the same seqs on the fan-out, and printing them twice is §16.4's duplicate-delta bug.
+/// Before the idempotent join path existed this could not show up — a fresh submission has
+/// no buffered prefix — which is why only the pumps guarded it.
+fn event_seq(event: &ConsumerEvent) -> Option<u64> {
+    match event {
+        ConsumerEvent::Delta { seq, .. }
+        | ConsumerEvent::Event { seq, .. }
+        | ConsumerEvent::Log { seq, .. }
+        | ConsumerEvent::Artifact { seq, .. }
+        | ConsumerEvent::Finish { seq, .. } => Some(*seq),
+        _ => None,
+    }
+}
+
+/// Fold one relayed event into an aggregated answer, skipping any seq this consumer has
+/// already contributed (see [`event_seq`]). Returns whether the event was terminal, which
+/// is what ends `aggregate_response`'s live loop.
+fn collect_event(
+    event: ConsumerEvent,
+    events: &mut Vec<ConsumerEvent>,
+    chunks: &mut Vec<String>,
+    through: &mut u64,
+) -> bool {
+    if let Some(seq) = event_seq(&event) {
+        if seq <= *through {
+            return false;
+        }
+        *through = seq;
+    }
+    if let ConsumerEvent::Delta { text, .. } = &event {
+        chunks.push(text.clone());
+    }
+    let terminal = matches!(
+        &event,
+        ConsumerEvent::Finish { .. } | ConsumerEvent::Error { .. }
+    );
+    events.push(event);
+    terminal
+}
+
 /// Collect the whole stream and answer once, for `stream: false` (test 17).
+///
+/// `prune_relay` is the difference between a request that **owns** the relay it is
+/// reading and one that borrowed it. A fresh submission mints a job id that nothing
+/// else will ever follow, so its entry goes with the request. An idempotent join does
+/// **not** own it: the relay belongs to the job, and removing the map entry while the
+/// original submission's pump is still attached moves the fan-out to a fresh relay
+/// under a live stream (`PoolHandle::relay` creates on demand), which would silence the
+/// original consumer's deltas.
 async fn aggregate_response(
     hub: &Arc<Hub>,
-    job: JobId,
-    consumer: ConsumerId,
-    handle: Arc<state::PoolHandle>,
-    live: broadcast::Receiver<RelayItem>,
-    replay: mpsc::Receiver<RelayItem>,
+    follow: Follow,
     model: &str,
+    prune_relay: bool,
 ) -> Response {
+    let Follow {
+        handle,
+        consumer,
+        job,
+        mut live,
+        mut replay,
+    } = follow;
     let mut events: Vec<ConsumerEvent> = Vec::new();
     let mut chunks: Vec<String> = Vec::new();
+    // The joiner's overlap watermark, same rule as the streaming pumps: the buffered
+    // prefix arrives on the private queue and the fan-out repeats those seqs.
+    let mut through: u64 = 0;
     // A joiner's buffered prefix arrives on its private queue, so the assembled
     // answer contains every delta rather than only the ones after the join.
-    let mut live = live;
-    let mut replay = replay;
+    let mut outcome = "end";
+    // The buffered prefix can already carry the terminal event: a retry of a job that
+    // finished while the hub still keeps its ring. Stopping there is what `pump_sse` does
+    // for the streaming surface, and for the same reason — waiting for a second terminal on
+    // the fan-out would answer `503 no_ready_worker` for an answer that is already complete.
+    let mut replayed_terminal = false;
     while let Some(item) = replay.recv().await {
         if let RelayItem::Event(event) = item {
-            if let ConsumerEvent::Delta { text, .. } = &event {
-                chunks.push(text.clone());
+            if collect_event(event, &mut events, &mut chunks, &mut through) {
+                replayed_terminal = true;
+                outcome = "terminal";
+                break;
             }
-            events.push(event);
         }
     }
-    let mut outcome = "end";
-    let deadline = tokio::time::sleep(Duration::from_secs(AGGREGATE_TIMEOUT_SECS));
-    tokio::pin!(deadline);
-    loop {
-        tokio::select! {
-            biased;
-            item = live.recv() => match item {
-                Ok(RelayItem::Event(event)) => {
-                    let terminal = matches!(event, ConsumerEvent::Finish { .. } | ConsumerEvent::Error { .. });
-                    if let ConsumerEvent::Delta { text, .. } = &event {
-                        chunks.push(text.clone());
+    if !replayed_terminal {
+        let deadline = tokio::time::sleep(Duration::from_secs(AGGREGATE_TIMEOUT_SECS));
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                biased;
+                item = live.recv() => match item {
+                    Ok(RelayItem::Event(event)) => {
+                        if collect_event(event, &mut events, &mut chunks, &mut through) {
+                            outcome = "terminal";
+                            break;
+                        }
                     }
-                    events.push(event);
-                    if terminal {
-                        outcome = "terminal";
-                        break;
-                    }
+                    Ok(RelayItem::End) => break,
+                    Ok(RelayItem::Comment(_)) => {}
+                    Err(_) => break,
+                },
+                _ = &mut deadline => {
+                    outcome = "timeout";
+                    break;
                 }
-                Ok(RelayItem::End) => break,
-                Ok(RelayItem::Comment(_)) => {}
-                Err(_) => break,
-            },
-            _ = &mut deadline => {
-                outcome = "timeout";
-                break;
             }
         }
     }
@@ -313,7 +448,9 @@ async fn aggregate_response(
         },
     )
     .await;
-    handle.forget_relay(&job).await;
+    if prune_relay {
+        handle.forget_relay(&job).await;
+    }
     if events
         .iter()
         .any(|e| matches!(e, ConsumerEvent::Error { .. }))
@@ -338,8 +475,11 @@ async fn aggregate_response(
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/json")
         .header("x-nexus-chunks", chunks.len().to_string())
+        // An assembled completion is a `Value`, so serialization cannot fail here;
+        // the `"{}"` fallback is the house style for that case (`io.rs:968`), not a
+        // silent downgrade of a real error path.
         .body(axum::body::Body::from(
-            serde_json::to_string(&assembled).expect("assembled object serializes"),
+            serde_json::to_string(&assembled).unwrap_or_else(|_| "{}".to_string()),
         ))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
@@ -363,75 +503,77 @@ pub async fn create_job(
             false,
         );
     };
-    let Some(kind_cfg) = hub.cfg.kind(&request.kind).cloned() else {
+    // NEX-6.6's letter: on this route the field is required, and only `true` is a
+    // valid answer. The two refusals are separate facts that share one code, because
+    // they are the same lesson: this route answers `202` and hangs up, so it can
+    // neither *declare* detachment on a silent client's behalf (absent) nor honour the
+    // coupled contract (`false`) — a coupled task posted here would be orphaned and
+    // deleted before the client could poll it. Surfaces that do hold the connection
+    // open are named in the message, because "then how do I stream the answer?" is the
+    // next question a client asks.
+    if !matches!(request.detach, Some(true)) {
         return json_error(
             StatusCode::BAD_REQUEST,
-            "unknown_kind",
-            &format!("kind {:?} is not registered", request.kind),
-            false,
-        );
-    };
-    let pool_name = request
-        .pool
-        .as_deref()
-        .or(query.pool.as_deref())
-        .unwrap_or(&kind_cfg.pool);
-    if pool_name != kind_cfg.pool {
-        return json_error(
-            StatusCode::BAD_REQUEST,
-            "wrong_pool",
-            "the pool does not serve this kind",
+            "detach_required",
+            "this route keeps no subscription; post with \"detach\": true, or use a surface that holds the connection open (the streaming completion routes, or GET /v1/consumer)",
             false,
         );
     }
-    let Ok(pool_id) = PoolId::parse(pool_name) else {
-        return json_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_pool",
-            "the pool name is not in the safe alphabet",
-            false,
-        );
-    };
+    // Admission — kind, pool, requirements, priority, idempotency — is shared with
+    // the consumer WebSocket so both faces refuse the same task the same way
+    // (§5.4). `?pool=` is HTTP-only, hence the override argument.
     let payload_bytes = serde_json::to_vec(&request.payload).unwrap_or_default();
-    let mut requires = request
-        .requires
-        .clone()
-        .unwrap_or_else(|| kind_cfg.requires.clone());
-    if requires.kv_estimate_tokens.is_none() {
-        requires.kv_estimate_tokens = Some(adapters::estimate_tokens(&request.payload));
+    let fallback_key =
+        nexus_core::store::content_idempotency_key(tenant.as_ref(), &request.kind, &payload_bytes);
+    let (mut submission, pool_id) = match build_submission(
+        &hub,
+        &tenant,
+        &request,
+        query.pool.as_deref(),
+        header_value(&headers, IDEMPOTENCY_HEADER),
+        fallback_key,
+    ) {
+        Ok(built) => built,
+        Err((status, code, message)) => return json_error(status, code, &message, false),
+    };
+    submission.session_hint = header_value(&headers, SESSION_HEADER).map(str::to_string);
+    // §5.2 at the runtime level: a key this hub has already routed is not new work, and
+    // the honest answer to a retry is the record that already exists — its id, its
+    // state, its links. Answering it here rather than letting the actor do it matters
+    // because the actor's duplicate branch replays on the **original** id
+    // (`actor.rs:1045-1064`, `Effect::Accepted { job: existing, attached: true, .. }`)
+    // while this face has to register its relay and its verdict gate under the id it
+    // mints (`submit`): a verdict that names a different job never resolves that gate,
+    // and the retry used to time out as `503 hub_unavailable`.
+    //
+    // NEX-6.3's delete-on-orphan is not weakened: the mirror is pruned by
+    // `Effect::JobForgotten` (`state.rs`'s arm for it), expires on the actor's own
+    // `limits.idempotency_ttl_ms`, and the record is re-read through the actor below
+    // before it is trusted. A task that was orphaned and deleted has neither a mirror
+    // entry nor a snapshot, so its retry runs fresh.
+    if let Some((_pool, existing)) = hub.idempotency_target(&submission.idempotency_key).await {
+        match hub.job_snapshot(&existing).await {
+            // Same tenant by construction — mirrored keys are namespaced
+            // `{tenant}:{key}` in `build_submission` — but the view is the proof, and a
+            // mismatch means the entry is not this caller's to reuse.
+            Some(view) if view.tenant == tenant => {
+                // Same shape as the fresh `202` below, built from the actor's view of
+                // the job that is answering: the client's links point at the task that
+                // exists, not at the id this request would have minted.
+                let artifact_path = Some(format!("/v1/artifacts/art-{existing}"));
+                return json_response(
+                    StatusCode::ACCEPTED,
+                    &adapters::accepted_body(&view, artifact_path),
+                );
+            }
+            Some(_) | None => {
+                // The record is gone (NEX-6.3 deleted it, or its retention lapsed) or it
+                // belongs to somebody else: drop the straggler and submit as new work.
+                hub.forget_idempotency(&submission.idempotency_key).await;
+            }
+        }
     }
-    // The idempotency map is hub-wide, so an explicit key is namespaced by
-    // tenant: guessing another tenant's `Idempotency-Key` must not attach to
-    // their job and stream their prompt's answer back (§9 tenancy).
-    let idempotency = match header_value(&headers, IDEMPOTENCY_HEADER) {
-        Some(key) => format!("{}:{key}", tenant.as_ref()),
-        None => nexus_core::store::content_idempotency_key(
-            tenant.as_ref(),
-            &request.kind,
-            &payload_bytes,
-        ),
-    };
-    let submission = Submission {
-        kind: request.kind.clone(),
-        pool: pool_id.clone(),
-        tenant: tenant.clone(),
-        requires,
-        payload: request.payload.clone(),
-        content_type: "application/json".to_string(),
-        idempotency_key: idempotency,
-        session_hint: header_value(&headers, SESSION_HEADER).map(str::to_string),
-        priority: request
-            .priority
-            .as_deref()
-            .map(Priority::from_name)
-            .unwrap_or_else(|| hub.cfg.tenant_priority(&tenant)),
-        idempotent: kind_cfg.idempotent,
-        streaming: kind_cfg.streaming,
-        // A job API submission is detached on purpose: the client may poll later
-        // (task §7.3), so losing the submitting socket is not a cancellation.
-        cancel_on_consumer_gone: false,
-    };
-    let (job, _consumer, _handle, relay, gate, _live, _replay) =
+    let (job, consumer, handle, _relay, gate, _live, _replay) =
         submit(&hub, &pool_id, submission).await;
     match tokio::time::timeout(
         Duration::from_millis(hub.cfg.limits.no_worker_grace_ms + 500),
@@ -439,23 +581,45 @@ pub async fn create_job(
     )
     .await
     {
-        Ok(Ok(Gate::Accepted)) => {}
+        Ok(Ok(Gate::Accepted)) => {
+            // The phantom consumer, removed. `ActorMsg::Submit` always registers
+            // the submitting consumer, but on this route nobody pumps that
+            // subscription — the request ends as soon as the `202` is written. Left
+            // in `record.consumers` it made the task look watched forever, which is
+            // what kept NEX-6.3's deletion and NEX-6.6's subscriber-less window
+            // from ever applying to an async job (`actor.rs:1296` for the detach,
+            // and the `consumers.is_empty()` test of the NEX-6.6 sweep at
+            // `actor.rs:3232-3246`). Detaching here is what makes `detach: true`
+            // mean what it says: watched by nobody, bounded by
+            // `limits.detached_orphan_ttl_ms`, and a later `/events` attach
+            // restarts the window. The OpenAI streaming routes do **not** do this:
+            // there the pump is the subscription and its own `Detach` is the event.
+            let _ = state::send(
+                handle.as_ref(),
+                ActorMsg::Detach {
+                    job: job.clone(),
+                    consumer,
+                },
+            )
+            .await;
+        }
         Ok(Ok(Gate::Reject {
             status,
             code,
             message,
             retry_after_secs,
         })) => {
+            abandon_submission(&hub, &handle, &job).await;
             let mut response = json_error(status, &code, &message, retry_after_secs.is_some());
             if let Some(secs) = retry_after_secs {
-                response.headers_mut().insert(
-                    header::RETRY_AFTER,
-                    secs.to_string().parse().expect("seconds parse"),
-                );
+                response
+                    .headers_mut()
+                    .insert(header::RETRY_AFTER, retry_after(secs));
             }
             return response;
         }
         _ => {
+            abandon_submission(&hub, &handle, &job).await;
             let mut response = json_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "hub_unavailable",
@@ -468,7 +632,9 @@ pub async fn create_job(
             return response;
         }
     }
-    let _ = relay;
+    // The task is accepted and detached; the client polls `/events` or the
+    // consumer WebSocket to watch it, and each of those subscriptions has its own
+    // lifetime (`state.rs`'s relay fan-out is per job, not per request).
     let view = hub.job_snapshot(&job).await;
     let artifact_path = view.as_ref().map(|_| format!("/v1/artifacts/art-{}", job));
     let body = adapters::accepted_body(
@@ -670,11 +836,13 @@ pub async fn job_events(
     let (out_tx, out_rx) =
         mpsc::channel::<Result<Event, Infallible>>(hub.cfg.limits.consumer_backpressure_frames);
     tokio::spawn(pump_relay(
-        handle,
-        consumer,
-        job.clone(),
-        relay.events.subscribe(),
-        replay_rx,
+        Follow {
+            handle,
+            consumer,
+            job: job.clone(),
+            live: relay.events.subscribe(),
+            replay: replay_rx,
+        },
         out_tx,
     ));
     let mut response = Sse::new(ReceiverStream::new(out_rx))
@@ -792,6 +960,14 @@ pub async fn metrics(State(hub): State<Arc<Hub>>) -> Response {
 /// Resolve the caller's tenant from the API key, failing closed (task §9: an
 /// API key per consumer, never one secret shared across both directions).
 /// Returns the response to send when the key is missing or unknown.
+//
+// `result_large_err` measures the cost of moving a big `Err` out of a return
+// value. `Response` is an opaque ~128-byte axum type, but every caller here
+// returns the error verbatim (`Err(response) => return response`) instead of
+// matching on it, so the only alternative — `Box<Response>` — adds an allocation
+// on the unauthenticated path and an `into_response()` hop in nine places for a
+// move the compiler already elides. Scoped to this signature for that reason.
+#[allow(clippy::result_large_err)]
 pub(crate) fn tenant_of(hub: &Arc<Hub>, headers: &HeaderMap) -> Result<TenantId, Response> {
     let key = bearer(
         headers
@@ -822,6 +998,120 @@ fn header_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
         .filter(|v| !v.trim().is_empty())
 }
 
+// ------------------------------------------------------------------ shared admission
+
+/// Resolve a generic job posting into the `Submission` the actor sees, and report
+/// the same refusals the route would have given: `unknown_kind`, `wrong_pool`,
+/// `invalid_pool`.
+///
+/// Shared by `POST /v1/jobs` and the consumer WebSocket (`consumer_ws.rs`) because
+/// §5.4 requires the two faces to refuse the same way: one task, one admission
+/// rule, whatever the transport. The OpenAI-shaped adapters do **not** call this —
+/// their kind comes from the route and their payload is translated, so their
+/// resolution genuinely differs (`adapters::openai_submission`).
+///
+/// `fallback_key` is what deduplication uses when the caller supplied no explicit
+/// key: the HTTP route passes a content hash ("same prompt, same answer"), the
+/// WebSocket passes a fresh per-submit id, because a socket that posts the same
+/// payload twice means two tasks unless it asked otherwise. An explicit key is
+/// namespaced by tenant either way: guessing another tenant's `Idempotency-Key`
+/// must not attach to their job and stream their prompt's answer back (§9).
+pub(crate) fn build_submission(
+    hub: &Arc<Hub>,
+    tenant: &TenantId,
+    request: &JobRequest,
+    pool_override: Option<&str>,
+    idempotency_key: Option<&str>,
+    fallback_key: String,
+) -> Result<(Submission, PoolId), (StatusCode, &'static str, String)> {
+    let Some(kind_cfg) = hub.cfg.kind(&request.kind).cloned() else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "unknown_kind",
+            format!("kind {:?} is not registered", request.kind),
+        ));
+    };
+    let pool_name = request
+        .pool
+        .as_deref()
+        .or(pool_override)
+        .unwrap_or(&kind_cfg.pool);
+    if pool_name != kind_cfg.pool {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "wrong_pool",
+            "the pool does not serve this kind".to_string(),
+        ));
+    }
+    let Ok(pool_id) = PoolId::parse(pool_name) else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "invalid_pool",
+            "the pool name is not in the safe alphabet".to_string(),
+        ));
+    };
+    let mut requires = request
+        .requires
+        .clone()
+        .unwrap_or_else(|| kind_cfg.requires.clone());
+    if requires.kv_estimate_tokens.is_none() {
+        requires.kv_estimate_tokens = Some(adapters::estimate_tokens(&request.payload));
+    }
+    let idempotency = match idempotency_key {
+        Some(key) => format!("{}:{key}", tenant.as_ref()),
+        None => fallback_key,
+    };
+    Ok((
+        Submission {
+            kind: request.kind.clone(),
+            pool: pool_id.clone(),
+            tenant: tenant.clone(),
+            requires,
+            payload: request.payload.clone(),
+            content_type: "application/json".to_string(),
+            idempotency_key: idempotency,
+            // Session affinity is a header concept; the WebSocket carries no
+            // session hint, so the actor's affinity simply does not apply there.
+            session_hint: None,
+            priority: request
+                .priority
+                .as_deref()
+                .map(Priority::from_name)
+                .unwrap_or_else(|| hub.cfg.tenant_priority(tenant)),
+            idempotent: kind_cfg.idempotent,
+            streaming: kind_cfg.streaming,
+            // NEX-6.6, read off the request rather than off the route: a declared
+            // detached task survives every consumer leaving, and a plain
+            // submission does not. `create_job` has already refused the
+            // combination it cannot honour, so on the HTTP route this is only
+            // ever reached with the detached reading.
+            cancel_on_consumer_gone: matches!(request.detach, Some(false)),
+        },
+        pool_id,
+    ))
+}
+
+/// One consumer's view of one job: everything a pump needs in order to follow it
+/// and to say so when the consumer goes away.
+///
+/// All three pumps — the OpenAI SSE body, the `/events` SSE body, and the
+/// consumer WebSocket's per-task stream — take this instead of a fistful of loose
+/// arguments, which is what keeps the three surfaces from drifting on what "the
+/// consumer left" means: same fields, same `Detach` at the end.
+pub(crate) struct Follow {
+    /// The pool actor that owns the job.
+    pub(crate) handle: Arc<state::PoolHandle>,
+    /// The consumer identity registered for this socket.
+    pub(crate) consumer: ConsumerId,
+    /// Job being followed.
+    pub(crate) job: JobId,
+    /// The job's live fan-out.
+    pub(crate) live: broadcast::Receiver<RelayItem>,
+    /// This consumer's private replay queue, closed by the dispatcher once the
+    /// buffered prefix has been written.
+    pub(crate) replay: mpsc::Receiver<RelayItem>,
+}
+
 /// Send a submission and register everything its answer needs **before** the
 /// actor is told about the job.
 ///
@@ -841,7 +1131,7 @@ fn header_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 /// has written the buffered prefix, which is what closes this channel and lets
 /// the pumps fall through to live events.
 #[allow(clippy::type_complexity)]
-async fn submit(
+pub(crate) async fn submit(
     hub: &Arc<Hub>,
     pool: &PoolId,
     submission: Submission,
@@ -856,6 +1146,12 @@ async fn submit(
 ) {
     let job = hub.ids.job_id();
     let consumer = hub.ids.consumer_id();
+    // Infallible by invariant: `pool` came out of `build_submission`, which only
+    // ever returns a pool the validated config registers a kind for, and
+    // `Hub::new` builds one handle per configured pool. A missing handle here is a
+    // broken config/registry pairing, not an input a caller can recover from, so
+    // the fail-stop stays and only the lint is scoped (same shape as `io.rs:285`).
+    #[allow(clippy::expect_used)]
     let handle = hub
         .pool(pool)
         .expect("pool handle exists for a configured pool");
@@ -870,6 +1166,13 @@ async fn submit(
     // The §5 read-mostly index is written here, once, so a later `GET
     // /v1/jobs/{id}` can be routed without a second source of job state.
     hub.bind_job(&job, pool).await;
+    // The hub-side mirror of the actor's §5.2 key table (`state.rs`'s `idempotency`),
+    // written with the id this face registered everything under. That mirror is what
+    // lets a later retry find this job instead of minting a second id the actor's
+    // answer would never name; `idempotency_target` reads it, and
+    // `Effect::JobForgotten` prunes it with the record.
+    hub.remember_idempotency(&submission.idempotency_key, pool, &job)
+        .await;
     if state::send(
         handle.as_ref(),
         ActorMsg::Submit {
@@ -896,6 +1199,98 @@ async fn submit(
     )
 }
 
+/// Undo everything `submit` installed for a submission the actor refused or never
+/// answered: the routing entry, the relay, and the idempotency row (NEX-7.2 — no per-task
+/// hub state that outlives the task).
+///
+/// All three are written *before* the actor is told, because the verdict's replay needs
+/// somewhere to land (see `submit`'s ordering comment). A submission that never became a
+/// job therefore owns entries the actor will never prune itself: it has no record, so
+/// neither `Effect::Terminal` nor `Effect::JobForgotten` can ever name its id. Without
+/// this, every refused `POST /v1/jobs` and every refused completion leaves a relay in the
+/// pool's map plus a row in each of the two hub-side indexes for the life of the process —
+/// the consumer WebSocket already prunes its own refusals (`consumer_ws.rs:487-496`), and
+/// this is that same step on the HTTP faces.
+///
+/// The gate-timeout arm is the one judgement call: an actor that answered nothing may
+/// still hold the record, and dropping the *route* makes it unpollable for the rest of its
+/// retention. That is the trade the WebSocket already makes, and the honest direction — the
+/// client has been told the hub did not answer, and a route to a task the hub has disowned
+/// is worse than the `404` that admits it.
+async fn abandon_submission(hub: &Arc<Hub>, handle: &Arc<state::PoolHandle>, job: &JobId) {
+    hub.forget_job(job).await;
+    handle.forget_relay(job).await;
+    // The third map `submit` writes. Pruning by job (rather than by the submission's key)
+    // is deliberate: the reverse index only ever points at the row for this job, so a row
+    // a newer submission has meanwhile taken over is left alone.
+    hub.forget_idempotency_for_job(job).await;
+}
+
+/// Follow the execution an idempotency key already owns instead of submitting a second
+/// one: the same three registrations `GET /v1/jobs/{id}/events` makes (relay, this
+/// consumer's private replay queue, `ActorMsg::Attach` from seq 0) and nothing else.
+///
+/// `submit`'s shape is deliberately **not** reproduced: there is no gate, because an attach
+/// emits only `Effect::ReplayTo` (`actor.rs:1228-1260`) and never `Accepted`, so a face
+/// that waited for a verdict here would wait out the grace window for a job that is already
+/// running. The record being past `Pending` is what makes its stream open by definition —
+/// the reading `/events` has always taken, and the reason a queued original answers with
+/// keepalives rather than a `503` here as well.
+///
+/// `None` means the mirrored record is no longer there: `route_job` lost it when the actor
+/// emitted `Effect::JobForgotten`, or the snapshot probe found nothing between the mirror
+/// lookup and now. The caller then submits normally, which is exactly NEX-6.3's "a deleted
+/// task re-runs" — and it closes the one gap a blind attach would leave, because attaching
+/// to a record the actor has dropped closes the replay queue with nothing in it and leaves
+/// the pump parked on a fan-out that can no longer produce events.
+///
+/// Two joins racing on one job inherit `/events`' pre-existing behaviour: the second
+/// overwrite of `replay_target` can strand the first joiner's buffered prefix. Only the
+/// ring's contents are at stake, and every consumer still gets the live tail.
+#[allow(clippy::type_complexity)]
+pub(crate) async fn join_existing_job(
+    hub: &Arc<Hub>,
+    job: &JobId,
+) -> Option<(
+    ConsumerId,
+    Arc<state::PoolHandle>,
+    broadcast::Receiver<RelayItem>,
+    mpsc::Receiver<RelayItem>,
+)> {
+    // The mirrored pool is only a hint; `job_index` is what owns the routing, and a job
+    // the actor has forgotten has no entry left to follow.
+    let handle = hub.route_job(job).await?;
+    // Guarded against the actor's retention rather than trusting the mirror's TTL: the
+    // two expiry clocks (`limits.idempotency_ttl_ms` here and in the actor) agree to the
+    // millisecond, but a record deleted by NEX-6.3 and a key that has not yet expired is
+    // a real combination.
+    hub.job_snapshot(job).await?;
+    let relay = handle
+        .relay(job, hub.cfg.limits.consumer_backpressure_frames)
+        .await;
+    let live = relay.events.subscribe();
+    let (replay_tx, replay_rx) = mpsc::channel::<RelayItem>(hub.cfg.limits.replay_frames.max(16));
+    *relay.replay_target.lock().await = Some(replay_tx);
+    let consumer = hub.ids.consumer_id();
+    if state::send(
+        handle.as_ref(),
+        ActorMsg::Attach {
+            job: job.clone(),
+            consumer: consumer.clone(),
+            from_seq: 0,
+        },
+    )
+    .await
+    .is_err()
+    {
+        // The pool actor is draining: undo what was just registered, so a caller that
+        // falls back to a fresh submission is not shadowed by a relay nobody will replay.
+        handle.forget_relay(job).await;
+        return None;
+    }
+    Some((consumer, handle, live, replay_rx))
+}
+
 /// Translate relay items into SSE blocks for the OpenAI surface.
 ///
 /// Order matters twice over: this consumer's replay prefix (the
@@ -906,16 +1301,27 @@ async fn submit(
 /// for a streaming kind that is what makes the last consumer leaving fan out a
 /// `Cancel` to the worker (§6). Without it, a client that closes its socket
 /// leaves the GPU decoding for nobody.
+///
+/// NEX-6.1 is why the live loop also waits on `tx.closed()`: hyper drops a parked
+/// response body as soon as the client hangs up (measured, not assumed —
+/// `runtime_e2e::an_idle_sse_hangup_cancels_the_worker_without_a_failed_write`
+/// pins the behaviour end to end), and dropping the body drops this channel's
+/// receiver. Before that arm the loss surfaced only when a push into the body
+/// failed, which on an idle stream is never: the task sat on a worker slot until
+/// the TCP stack or the hard cap gave up.
 async fn pump_sse(
-    handle: Arc<state::PoolHandle>,
-    consumer: ConsumerId,
-    job: JobId,
+    follow: Follow,
     model: String,
     created: u64,
-    mut live: broadcast::Receiver<RelayItem>,
-    mut replay: mpsc::Receiver<RelayItem>,
     tx: mpsc::Sender<Result<Event, Infallible>>,
 ) {
+    let Follow {
+        handle,
+        consumer,
+        job,
+        mut live,
+        mut replay,
+    } = follow;
     let mut through: u64 = 0;
     let mut finished = false;
     while let Some(item) = replay.recv().await {
@@ -944,26 +1350,29 @@ async fn pump_sse(
     }
     drop(replay);
     if !finished {
+        // NEX-6.1's independent notice, raced against the event source: as soon as
+        // the response body is gone this future resolves and the loop exits, and
+        // the `Detach` below is what turns it into the supplier `Cancel`.
+        let mut gone = std::pin::pin!(tx.closed());
         loop {
-            let item = match live.recv().await {
-                Ok(item) => item,
-                // A lagging consumer: end the stream in band rather than pretend
-                // the text continued (task §7.5).
-                Err(broadcast::error::RecvError::Lagged(missed)) => {
-                    let payload = adapters::in_band_error(
-                        "consumer_lagged",
-                        &format!("{missed} frames were dropped by the fan-out"),
-                        false,
-                    );
-                    let _ = tx
-                        .send(Ok(Event::default()
-                            .event("error")
-                            .json_data(payload)
-                            .expect("error object serializes")))
-                        .await;
-                    break;
-                }
-                Err(broadcast::error::RecvError::Closed) => break,
+            let item = tokio::select! {
+                biased;
+                () = &mut gone => break,
+                result = live.recv() => match result {
+                    Ok(item) => item,
+                    // A lagging consumer: end the stream in band rather than pretend
+                    // the text continued (task §7.5).
+                    Err(broadcast::error::RecvError::Lagged(missed)) => {
+                        let payload = adapters::in_band_error(
+                            "consumer_lagged",
+                            &format!("{missed} frames were dropped by the fan-out"),
+                            false,
+                        );
+                        let _ = tx.send(Ok(json_data_event(payload).event("error"))).await;
+                        break;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                },
             };
             match item {
                 RelayItem::Comment(_text) => {
@@ -1009,65 +1418,47 @@ async fn send_block(
     through: &mut u64,
     tx: &mpsc::Sender<Result<Event, Infallible>>,
 ) -> bool {
-    let seq = match &event {
-        ConsumerEvent::Delta { seq, .. }
-        | ConsumerEvent::Event { seq, .. }
-        | ConsumerEvent::Log { seq, .. }
-        | ConsumerEvent::Artifact { seq, .. }
-        | ConsumerEvent::Finish { seq, .. } => Some(*seq),
-        _ => None,
-    };
+    // The same watermark the aggregating path applies, through the same helper (§16.4).
+    let seq = event_seq(&event);
     if let Some(seq) = seq {
         if seq <= *through {
             return true;
         }
         *through = seq;
     }
-    let block = match &event {
-        ConsumerEvent::Delta { text, seq } => Event::default()
-            .id(seq.to_string())
-            .data(adapters::openai_delta_payload(text, job, model, created)),
-        ConsumerEvent::Event { seq, payload } => Event::default()
-            .id(seq.to_string())
-            .event("event")
-            .json_data(payload.clone())
-            .expect("event data serializes"),
-        ConsumerEvent::Log { seq, text } => Event::default()
-            .id(seq.to_string())
-            .event("log")
-            .data(text.clone()),
-        ConsumerEvent::Artifact { seq, manifest } => Event::default()
-            .id(seq.to_string())
-            .event("artifact")
-            .json_data(manifest.clone())
-            .expect("manifest serializes"),
-        ConsumerEvent::Gap { expected, got } => Event::default()
-            .event("gap")
-            .json_data(json!({ "expected": expected, "got": got }))
-            .expect("gap object serializes"),
-        ConsumerEvent::Finish { seq, finish, usage } => Event::default()
-            .id(seq.to_string())
-            .json_data(adapters::finish_chunk(
-                job,
-                model,
-                created,
-                *finish,
-                usage.as_ref(),
-            ))
-            .expect("finish chunk serializes"),
-        ConsumerEvent::Error {
-            code,
-            message,
-            retryable,
-            ..
-        } => Event::default()
-            .event("error")
-            .json_data(adapters::in_band_error(code, message, *retryable))
-            .expect("error object serializes"),
-        other => Event::default()
-            .json_data(other.clone())
-            .expect("event serializes"),
-    };
+    // Every payload below is a `Value` built from types that always serialize, so
+    // `json_data_event`'s fallback branch is never taken in practice — the house
+    // style for that case is `unwrap_or_else`, not an `expect` (`io.rs:968`).
+    let block =
+        match &event {
+            ConsumerEvent::Delta { text, seq } => Event::default()
+                .id(seq.to_string())
+                .data(adapters::openai_delta_payload(text, job, model, created)),
+            ConsumerEvent::Event { seq, payload } => json_data_event(payload.clone())
+                .id(seq.to_string())
+                .event("event"),
+            ConsumerEvent::Log { seq, text } => Event::default()
+                .id(seq.to_string())
+                .event("log")
+                .data(text.clone()),
+            ConsumerEvent::Artifact { seq, manifest } => json_data_event(manifest.clone())
+                .id(seq.to_string())
+                .event("artifact"),
+            ConsumerEvent::Gap { expected, got } => {
+                json_data_event(json!({ "expected": expected, "got": got })).event("gap")
+            }
+            ConsumerEvent::Finish { seq, finish, usage } => json_data_event(
+                adapters::finish_chunk(job, model, created, *finish, usage.as_ref()),
+            )
+            .id(seq.to_string()),
+            ConsumerEvent::Error {
+                code,
+                message,
+                retryable,
+                ..
+            } => json_data_event(adapters::in_band_error(code, message, *retryable)).event("error"),
+            other => json_data_event(other.clone()),
+        };
     tx.send(Ok(block)).await.is_ok()
 }
 
@@ -1091,38 +1482,50 @@ fn add_stream_headers(response: &mut Response) {
 /// any seq the replay already delivered. Like the OpenAI pump, it sends `Detach`
 /// when the consumer goes away, so a `/events` watcher that disconnects is not
 /// counted as an attached consumer forever.
-async fn pump_relay(
-    handle: Arc<state::PoolHandle>,
-    consumer: ConsumerId,
-    job: JobId,
-    mut live: broadcast::Receiver<RelayItem>,
-    mut replay: mpsc::Receiver<RelayItem>,
-    tx: mpsc::Sender<Result<Event, Infallible>>,
-) {
+///
+/// NEX-6.1 applies to a watcher exactly as it does to a streaming answer: a
+/// `/events` client that hangs up while nothing is arriving must stop counting as
+/// an attached consumer, so the live loop also waits on `tx.closed()`. The body
+/// being dropped *is* the connection event; it needs no failed write first.
+async fn pump_relay(follow: Follow, tx: mpsc::Sender<Result<Event, Infallible>>) {
+    let Follow {
+        handle,
+        consumer,
+        job,
+        mut live,
+        mut replay,
+    } = follow;
     let mut through: u64 = 0;
     while let Some(item) = replay.recv().await {
         if !forward(item, &tx, &mut through).await {
-            let _ = state::send(handle.as_ref(), ActorMsg::Detach { job, consumer }).await;
-            return;
+            // `forward` returns false when a write failed, which already means the
+            // body is gone; the `Detach` below is the only thing left to do.
+            break;
         }
     }
     drop(replay);
-    loop {
-        let item = match live.recv().await {
-            Ok(item) => item,
-            Err(broadcast::error::RecvError::Lagged(missed)) => {
-                let _ = tx
-                    .send(Ok(Event::default()
-                        .event("gap")
-                        .json_data(json!({ "dropped": missed }))
-                        .expect("gap serializes")))
-                    .await;
+    // The replay prefix can also have ended the stream; `forward` reports that the
+    // same way, so the live loop is skipped rather than re-entered.
+    if !tx.is_closed() {
+        let mut gone = std::pin::pin!(tx.closed());
+        loop {
+            let item = tokio::select! {
+                biased;
+                () = &mut gone => break,
+                result = live.recv() => match result {
+                    Ok(item) => item,
+                    Err(broadcast::error::RecvError::Lagged(missed)) => {
+                        let _ = tx
+                            .send(Ok(json_data_event(json!({ "dropped": missed })).event("gap")))
+                            .await;
+                        break;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                },
+            };
+            if !forward(item, &tx, &mut through).await {
                 break;
             }
-            Err(broadcast::error::RecvError::Closed) => break,
-        };
-        if !forward(item, &tx, &mut through).await {
-            break;
         }
     }
     let _ = state::send(handle.as_ref(), ActorMsg::Detach { job, consumer }).await;
@@ -1164,10 +1567,7 @@ async fn forward(
                 event,
                 ConsumerEvent::Finish { .. } | ConsumerEvent::Error { .. }
             );
-            let mut builder = Event::default()
-                .event(&name)
-                .json_data(event)
-                .expect("event serializes");
+            let mut builder = json_data_event(event).event(&name);
             if let Some(seq) = seq {
                 builder = builder.id(seq.to_string());
             }
@@ -1180,13 +1580,39 @@ async fn forward(
     }
 }
 
+/// One SSE event carrying a JSON payload.
+///
+/// `Event::json_data` is fallible only because it is generic over `Serialize`;
+/// every caller here passes something that always serializes (a `Value`, or a
+/// `ConsumerEvent` whose `Serialize` impl is derived), so the empty fallback is a
+/// defensive branch rather than a real case. Production code may not `expect`
+/// (workspace lint policy), and the house style for an infallible serialization is
+/// `unwrap_or_else` (`io.rs:968`).
+fn json_data_event<T: serde::Serialize>(payload: T) -> Event {
+    Event::default()
+        .json_data(payload)
+        .unwrap_or_else(|_| Event::default())
+}
+
+/// A `Retry-After` value. A decimal integer always encodes, so the fallback is
+/// defensive; `1` keeps the header meaningful if it is ever reached.
+fn retry_after(secs: u64) -> HeaderValue {
+    HeaderValue::from_str(&secs.to_string()).unwrap_or_else(|_| HeaderValue::from_static("1"))
+}
+
+/// A response header built from text the hub generated itself (a job id). Ids come
+/// from the safe alphabet, so the empty fallback cannot be reached in practice.
+fn header_of(text: &str) -> HeaderValue {
+    HeaderValue::from_str(text).unwrap_or_else(|_| HeaderValue::from_static(""))
+}
+
 /// A JSON response with the right content type.
 fn json_response(status: StatusCode, body: &Value) -> Response {
     Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, "application/json")
         .body(axum::body::Body::from(
-            serde_json::to_string(body).expect("value serializes"),
+            serde_json::to_string(body).unwrap_or_else(|_| "{}".to_string()),
         ))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }

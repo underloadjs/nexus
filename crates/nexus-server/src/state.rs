@@ -12,8 +12,10 @@
 //! ```
 //!
 //! The `DashMap<JobId, PoolHandle>` the task permits "only as a read-mostly index
-//! so a consumer's relay task can locate its job" is [`Hub::job_index`]: it is
-//! written once at submit time and never holds job state, so the actor remains the
+//! so a consumer's relay task can locate its job" is [`Hub::job_index`]: it is written
+//! at submit time and pruned whenever the actor reports `Effect::JobForgotten`, so it
+//! holds only jobs the actor still knows about rather than one entry per submission for
+//! the life of the process (NEX-7.2). It never holds job state, so the actor remains the
 //! single authority.
 
 use std::collections::BTreeMap;
@@ -227,8 +229,37 @@ pub struct Hub {
     pub cfg: BrokerConfig,
     /// Pool id → handle.
     pub pools: HashMap<PoolId, Arc<PoolHandle>>,
-    /// Job id → pool, populated at submit time (the §5 read-mostly index).
+    /// Job id → pool, populated at submit time (the §5 read-mostly index). Bounded by
+    /// the actor's own bounds: the entry is removed when the actor drops the record
+    /// (`Effect::JobForgotten`, handled in `dispatch`), so a long-lived hub does not
+    /// accumulate one id per submission ever made.
     pub job_index: Mutex<HashMap<JobId, PoolId>>,
+    /// Hub-side mirror of the actor's §5.2 idempotency table: key → (pool, job, expiry).
+    ///
+    /// It exists because the actor answers a duplicate on the **original** job's id
+    /// (`Effect::Accepted { job: existing, attached: true, .. }`, `actor.rs:1045-1064`)
+    /// while a face registers its relay, its verdict gate and its pump under the id it
+    /// minted for the request. With no way to find the original *before* minting, the
+    /// retry's gate was never resolved and the answer was `503 hub_unavailable` while the
+    /// original's replay was dropped on a relay nobody was reading.
+    ///
+    /// Bounded exactly as the actor's own table is (`limits.max_idempotency_entries`,
+    /// evicting whatever expires first — the rule of `actor.rs:1199-1215`) and pruned by
+    /// `Effect::JobForgotten` through [`Self::key_of_job`], so an entry can never outlive
+    /// the record it indexes: a task NEX-6.3 deleted has no mirror row left, and its retry
+    /// runs fresh. Expiry uses the actor's own `limits.idempotency_ttl_ms` and the actor's
+    /// own clock (`monotonic_ms`, the value `run_actor` feeds it), so the two tables lapse
+    /// together; if the actor's copy lapses a millisecond first, the face answers from the
+    /// still-retained record with the same id and the same bytes the actor's duplicate
+    /// branch would have replayed.
+    pub idempotency: Mutex<BTreeMap<String, (PoolId, JobId, u64)>>,
+    /// Expiry-ordered index of [`Self::idempotency`]'s keys, `(expiry_ms, key)`, so lazy
+    /// expiry and bounded eviction are O(log n) instead of a scan. Mirrors
+    /// `actor.rs:482`'s `idempotency_timer`.
+    pub idempotency_expiry: Mutex<BTreeSet<(u64, String)>>,
+    /// Job → key, so `Effect::JobForgotten` prunes the row that belongs to it without
+    /// scanning the table.
+    pub key_of_job: Mutex<HashMap<JobId, String>>,
     /// Consumer API keys, as digests.
     pub api_keys: nexus_core::auth::ApiKeyRegistry,
     /// Pool tokens, as digests.
@@ -305,21 +336,24 @@ impl Hub {
     #[must_use]
     pub fn new(cfg: BrokerConfig, artifact_root: &str) -> Arc<Self> {
         let mut pools = HashMap::new();
-        let mut starts: Vec<(PoolId, mpsc::Receiver<ActorMsg>)> = Vec::new();
+        // The receiver travels **with** the handle it belongs to. The spawn loop below
+        // runs after `pools` has moved into the `Hub`, so a handle that is looked up
+        // there instead of carried here would need an `expect` to prove an invariant the
+        // compiler can already see: `starts` is built from exactly the pool ids inserted
+        // above, one handle each.
+        let mut starts: Vec<(PoolId, mpsc::Receiver<ActorMsg>, Arc<PoolHandle>)> = Vec::new();
         for id in cfg.pools.keys() {
             let pid = PoolId::new_unchecked(id.clone());
             let (tx, rx) = mpsc::channel::<ActorMsg>(MAILBOX_DEPTH);
-            starts.push((pid.clone(), rx));
-            pools.insert(
-                pid.clone(),
-                Arc::new(PoolHandle {
-                    id: pid,
-                    tx,
-                    workers: Mutex::new(HashMap::new()),
-                    relays: Mutex::new(HashMap::new()),
-                    gauges: Mutex::new(PoolGauges::default()),
-                }),
-            );
+            let handle = Arc::new(PoolHandle {
+                id: pid.clone(),
+                tx,
+                workers: Mutex::new(HashMap::new()),
+                relays: Mutex::new(HashMap::new()),
+                gauges: Mutex::new(PoolGauges::default()),
+            });
+            starts.push((pid.clone(), rx, Arc::clone(&handle)));
+            pools.insert(pid, handle);
         }
         let hub = Arc::new(Self {
             epoch_ms: std::time::SystemTime::now()
@@ -328,6 +362,9 @@ impl Hub {
             api_keys: nexus_core::auth::ApiKeyRegistry::from_config(&cfg.auth),
             pool_tokens: nexus_core::auth::PoolTokenRegistry::from_config(&cfg.auth),
             job_index: Mutex::new(HashMap::new()),
+            idempotency: Mutex::new(BTreeMap::new()),
+            idempotency_expiry: Mutex::new(BTreeSet::new()),
+            key_of_job: Mutex::new(HashMap::new()),
             payload_waiters: Mutex::new(HashMap::new()),
             snapshot_waiters: Mutex::new(HashMap::new()),
             artifact_root: artifact_root.to_string(),
@@ -335,10 +372,9 @@ impl Hub {
             cfg,
             pools,
         });
-        for (pid, rx) in starts {
+        for (pid, rx, handle) in starts {
             let actor =
                 PoolActor::with_artifact_root(pid.clone(), hub.cfg.clone(), &hub.artifact_root);
-            let handle = Arc::clone(hub.pools.get(&pid).expect("pool handle exists"));
             tokio::spawn(run_actor(pid, actor, rx, handle, Arc::clone(&hub)));
         }
         hub
@@ -362,6 +398,9 @@ impl Hub {
     }
 
     /// Record which pool owns a job (called by the submit handler).
+    ///
+    /// Paired with [`Self::forget_job`]: the index only stays bounded if every entry a
+    /// submit adds is removed when the actor stops knowing the job.
     pub async fn bind_job(&self, job: &JobId, pool: &PoolId) {
         self.job_index
             .lock()
@@ -369,10 +408,122 @@ impl Hub {
             .insert(job.clone(), pool.clone());
     }
 
+    /// Drop the routing entry for a job the actor has forgotten
+    /// (`Effect::JobForgotten`). Idempotent: an unknown job prunes to nothing and
+    /// answers `false`, so the dispatcher can call it from every drop site without
+    /// tracking whether an earlier effect already did the work.
+    pub async fn forget_job(&self, job: &JobId) -> bool {
+        self.job_index.lock().await.remove(job).is_some()
+    }
+
     /// Route a job to its pool from the read-mostly index.
     pub async fn route_job(&self, job: &JobId) -> Option<Arc<PoolHandle>> {
         let pid = self.job_index.lock().await.get(job).cloned()?;
         self.pool(&pid).map(Arc::clone)
+    }
+
+    /// Record which job an idempotency key owns, for the reason given on
+    /// [`Self::idempotency`]. Called by the faces at submit time, in the same step that
+    /// writes `job_index` (`consumer::submit`), because the two must name the same job.
+    ///
+    /// Lock order across the three mirrors is fixed — table, expiry index, reverse index —
+    /// and no guard is held across a call that takes them again, so no path can acquire
+    /// them in opposite orders.
+    pub async fn remember_idempotency(&self, key: &str, pool: &PoolId, job: &JobId) {
+        let mut table = self.idempotency.lock().await;
+        let mut expiry_index = self.idempotency_expiry.lock().await;
+        let mut reverse = self.key_of_job.lock().await;
+        // The actor's clock, not the wall clock: `monotonic_ms` is the value `run_actor`
+        // hands the actor as `now_ms`, so a TTL started here expires with the actor's own
+        // entry for the same key.
+        let expiry = monotonic_ms().saturating_add(self.cfg.limits.idempotency_ttl_ms);
+        // A key reaching a second job replaces its first row, timer entry included;
+        // `JobForgotten` normally did this first, and the reverse row only changes when
+        // the job actually changed.
+        if let Some((_old_pool, old_job, old_expiry)) = table.remove(key) {
+            expiry_index.remove(&(old_expiry, key.to_string()));
+            if old_job != *job {
+                reverse.remove(&old_job);
+            }
+        }
+        // Bound the table by evicting whatever expires first, so a long-lived key is
+        // never dropped ahead of a stale one — the actor's rule (`actor.rs:1199-1215`),
+        // copied rather than paraphrased so the two tables never disagree.
+        while table.len() >= self.cfg.limits.max_idempotency_entries {
+            let Some((oldest_expiry, oldest)) = expiry_index.iter().next().cloned() else {
+                break;
+            };
+            expiry_index.remove(&(oldest_expiry, oldest.clone()));
+            if let Some((_pool, evicted, _evicted_expiry)) = table.remove(&oldest) {
+                reverse.remove(&evicted);
+            }
+        }
+        table.insert(key.to_string(), (pool.clone(), job.clone(), expiry));
+        expiry_index.insert((expiry, key.to_string()));
+        reverse.insert(job.clone(), key.to_string());
+    }
+
+    /// The job an idempotency key already owns, when the hub still mirrors it.
+    ///
+    /// Expiry is lazy and O(log n): the timer index is ordered, so the loop pops rows that
+    /// are already stale and stops at the first live one. `Effect::JobForgotten` normally
+    /// removes the row long before its TTL, so reaching an expired entry here needs a
+    /// record the actor kept for a full `idempotency_ttl_ms` with nobody following it.
+    #[must_use]
+    pub async fn idempotency_target(&self, key: &str) -> Option<(PoolId, JobId)> {
+        let now = monotonic_ms();
+        let mut table = self.idempotency.lock().await;
+        let mut expiry_index = self.idempotency_expiry.lock().await;
+        let mut reverse = self.key_of_job.lock().await;
+        while let Some((expiry, stale)) = expiry_index.iter().next().cloned() {
+            if expiry > now {
+                break;
+            }
+            expiry_index.remove(&(expiry, stale.clone()));
+            if let Some((_pool, job, _)) = table.remove(&stale) {
+                reverse.remove(&job);
+            }
+        }
+        let (pool, job, expiry) = table.get(key).cloned()?;
+        // The loop above only pops rows the timer index still lists, and this one can be
+        // the boundary case (`expiry == now`) that a coarse clock leaves behind, so the
+        // hit itself is checked too rather than answered a millisecond stale.
+        if expiry <= now {
+            table.remove(key);
+            expiry_index.remove(&(expiry, key.to_string()));
+            reverse.remove(&job);
+            return None;
+        }
+        Some((pool, job))
+    }
+
+    /// Drop one mirror entry by key: a face that found the mirrored record already gone,
+    /// so the key belongs to whatever it submits next.
+    pub async fn forget_idempotency(&self, key: &str) {
+        let mut table = self.idempotency.lock().await;
+        let mut expiry_index = self.idempotency_expiry.lock().await;
+        let mut reverse = self.key_of_job.lock().await;
+        if let Some((_pool, job, expiry)) = table.remove(key) {
+            expiry_index.remove(&(expiry, key.to_string()));
+            reverse.remove(&job);
+        }
+    }
+
+    /// Drop the mirror entry for a job the actor has forgotten (`Effect::JobForgotten`).
+    ///
+    /// This is what keeps a deleted task's retry honest: without it a key would go on
+    /// naming a record nobody holds, and NEX-6.3's fresh re-run would become a replay of a
+    /// `404`. Idempotent, like `forget_job`.
+    pub async fn forget_idempotency_for_job(&self, job: &JobId) {
+        let mut table = self.idempotency.lock().await;
+        let mut expiry_index = self.idempotency_expiry.lock().await;
+        let mut reverse = self.key_of_job.lock().await;
+        let Some(key) = reverse.remove(job) else {
+            return;
+        };
+        if let Some((_pool, _job, expiry)) = table.remove(&key) {
+            expiry_index.remove(&(expiry, key));
+        }
     }
 
     /// Authoritative job view, read through the owning actor's mailbox.
@@ -712,7 +863,10 @@ async fn run_actor(
     handle: Arc<PoolHandle>,
     hub: Arc<Hub>,
 ) {
-    let tick_ms = actor.config().heartbeat_ms_for(&pool).min(1_000).max(50);
+    // The actor's heartbeat period also sets how often the virtual clock advances, and
+    // both ends are intentional: never faster than a scheduler tick, never so slow that a
+    // dead worker looks alive for a whole lease period.
+    let tick_ms = actor.config().heartbeat_ms_for(&pool).clamp(50, 1_000);
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(tick_ms));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     tracing::info!(pool = %pool, tick_ms, "pool actor started");
@@ -774,7 +928,10 @@ async fn dispatch(
                 // `Accepted` arm below: the grace window can still end in a `503`
                 // with no body bytes). Handing the job to a worker is the moment
                 // the request became serviceable, so the body may open now.
-                if let HubFrame::Assigned { job, .. } = frame {
+                // `frame` is `&Box<HubFrame>` — the effect boxes the frame so the
+                // effect enum stays small (`clippy::large_enum_variant`), and serde
+                // unwraps the box, so the wire shape is unchanged.
+                if let HubFrame::Assigned { job, .. } = frame.as_ref() {
                     let relay = handle
                         .relay(job, actor.limits().consumer_backpressure_frames)
                         .await;
@@ -905,11 +1062,33 @@ async fn dispatch(
                 // in the actor and is unaffected.
                 handle.forget_relay(&job).await;
             }
+            Effect::JobForgotten { job } => {
+                // The actor has dropped the record, the replay ring and the idempotency
+                // key, so the job id is unknown from here on: a later submission with the
+                // old key starts a fresh execution (NEX-6.3). Every hub-side structure
+                // keyed by job id has to agree, or the two read-mostly maps outlive the
+                // thing they index — `job_index` was otherwise one entry per submission
+                // for the lifetime of the process (NEX-7.2).
+                //
+                // Removal is keyed by this job alone and idempotent, so it cannot disturb
+                // a live relay belonging to another job. A pump that is still attached
+                // holds its own `Arc<JobRelay>` and ends on the verdict it already has;
+                // a later `/events` attach answers `404 unknown_job`, which is the truth.
+                let routed = hub.forget_job(&job).await;
+                handle.forget_relay(&job).await;
+                // The key goes with the record: an entry left behind would answer a
+                // later retry with a job nobody has, where NEX-6.3 says it runs fresh.
+                hub.forget_idempotency_for_job(&job).await;
+                tracing::debug!(pool = %handle.id, %job, routed, "job forgotten by the actor; index, relay and idempotency mirror pruned");
+            }
             Effect::Snapshot { job, view } => {
                 let mut waiters = hub.snapshot_waiters.lock().await;
                 if let Some(slot) = waiters.get_mut(&job) {
                     if let Some(waiter) = slot.pop() {
-                        let _ = waiter.send(view.clone());
+                        // `view` is `Box<Option<JobView>>` (see `Effect::Snapshot`): the
+                        // box is an allocation detail, so the waiter receives exactly the
+                        // derived view it received before, cloned out from behind it.
+                        let _ = waiter.send(view.as_ref().clone());
                     }
                     if slot.is_empty() {
                         waiters.remove(&job);
@@ -959,8 +1138,10 @@ pub async fn drain_pools(hub: &Arc<Hub>) {
 
 #[cfg(test)]
 mod tests {
+    use super::dispatch;
     use super::send_frame;
     use super::with_pool_label;
+    use super::Hub;
     use super::PoolGauges;
     use super::PoolHandle;
     use super::WorkerConn;
@@ -972,6 +1153,9 @@ mod tests {
     use nexus_core::protocol::HubFrame;
     use nexus_core::protocol::WireCaps;
     use nexus_core::ActorMsg;
+    use nexus_core::BrokerConfig;
+    use nexus_core::Effect;
+    use nexus_core::PoolActor;
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::sync::mpsc;
@@ -1058,5 +1242,181 @@ mod tests {
             "exactly one report per failed send"
         );
         drop(worker_rx);
+    }
+
+    /// NEX-7.2 / NEX-6.3: the two hub-side maps keyed by job id must shrink when the
+    /// actor stops knowing the job. Without the `Effect::JobForgotten` arm, `job_index`
+    /// grows by one entry per submission for the lifetime of the process — the actor
+    /// bounds its own job map, but the index and the relay fan-out do not.
+    #[tokio::test]
+    async fn job_index_and_relays_are_pruned_when_the_actor_forgets_a_job() {
+        // A real `Hub`, so the dispatcher prunes the same maps the HTTP surface reads.
+        // The actor tasks it spawns stay parked on empty mailboxes: this test drives
+        // `dispatch` directly, which is the half that owns the pruning.
+        let hub = Hub::new(BrokerConfig::default(), "var/artifacts");
+        let pid = PoolId::new_unchecked("llm.chat/qwen38");
+        let handle = Arc::clone(
+            hub.pools
+                .get(&pid)
+                .expect("the sample topology owns the llm pool"),
+        );
+        let actor = PoolActor::new(pid.clone(), hub.cfg.clone());
+
+        let kept = JobId::new_unchecked("job-kept");
+        let gone = JobId::new_unchecked("job-gone");
+        hub.bind_job(&gone, &pid).await;
+        hub.bind_job(&kept, &pid).await;
+        // Two live fan-outs, because pruning has to be per-job and never "clear the map".
+        handle.relay(&gone, 16).await;
+        handle.relay(&kept, 16).await;
+        // And two idempotency rows, for the same reason: `JobForgotten` has to take the
+        // deleted task's key with it while its neighbour's stays (NEX-6.3's retry runs
+        // fresh, §5.2's duplicate still replays).
+        hub.remember_idempotency("gone-key", &pid, &gone).await;
+        hub.remember_idempotency("kept-key", &pid, &kept).await;
+        assert_eq!(hub.job_index.lock().await.len(), 2);
+        assert_eq!(handle.relays.lock().await.len(), 2);
+        assert_eq!(hub.idempotency.lock().await.len(), 2);
+
+        dispatch(
+            &hub,
+            &handle,
+            &actor,
+            vec![Effect::JobForgotten { job: gone.clone() }],
+        )
+        .await;
+
+        // The routing entry is gone, so a request for that job is a `404`, not a route to
+        // a pool whose actor has already forgotten it.
+        assert!(!hub.forget_job(&gone).await, "the entry was already pruned");
+        assert!(hub.route_job(&gone).await.is_none());
+        // The key goes with it: a retained row would answer the next retry with a task that
+        // no longer exists, where NEX-6.3 says it runs fresh.
+        assert!(hub.idempotency_target("gone-key").await.is_none());
+        assert!(!hub.key_of_job.lock().await.contains_key(&gone));
+        // The neighbour is untouched: a live relay for another job must survive.
+        assert!(handle.relays.lock().await.contains_key(&kept));
+        assert!(hub.job_index.lock().await.contains_key(&kept));
+        assert_eq!(
+            hub.idempotency_target("kept-key").await.map(|(_, job)| job),
+            Some(kept.clone()),
+            "a pruned job must not take another task's key with it"
+        );
+
+        // Idempotent, because two drop sites can report the same job: the NEX-6.3 orphan
+        // path deletes the record and the retention sweep may have armed a timer first.
+        dispatch(
+            &hub,
+            &handle,
+            &actor,
+            vec![Effect::JobForgotten { job: gone }],
+        )
+        .await;
+        assert_eq!(handle.relays.lock().await.len(), 1);
+        assert_eq!(hub.job_index.lock().await.len(), 1);
+        assert_eq!(hub.idempotency.lock().await.len(), 1);
+    }
+
+    /// NEX-7.2 on the new map: the idempotency mirror is bounded by the actor's own entry
+    /// cap, evicting whatever expires first rather than the newest key, and its rows expire
+    /// on the actor's own TTL so a long-lived hub does not route retries to jobs nobody has.
+    #[tokio::test]
+    async fn the_idempotency_mirror_is_bounded_and_expires() {
+        let mut cfg = BrokerConfig::default();
+        // Three rows is the whole table, and a TTL the test can outwait. `Hub::new` does
+        // not run `validate`, so `1 ms` is usable here rather than refused at boot.
+        cfg.limits.max_idempotency_entries = 3;
+        cfg.limits.idempotency_ttl_ms = 1;
+        let hub = Hub::new(cfg, "var/artifacts");
+        let pid = PoolId::new_unchecked("llm.chat/qwen38");
+
+        hub.remember_idempotency("k-1", &pid, &JobId::new_unchecked("job-1"))
+            .await;
+        hub.remember_idempotency("k-2", &pid, &JobId::new_unchecked("job-2"))
+            .await;
+        hub.remember_idempotency("k-3", &pid, &JobId::new_unchecked("job-3"))
+            .await;
+        assert_eq!(hub.idempotency.lock().await.len(), 3);
+        assert_eq!(hub.idempotency_expiry.lock().await.len(), 3);
+        assert_eq!(hub.key_of_job.lock().await.len(), 3);
+
+        // A fourth row is the cap: the entry that expires first leaves, and every reverse
+        // index loses exactly that one row.
+        hub.remember_idempotency("k-4", &pid, &JobId::new_unchecked("job-4"))
+            .await;
+        assert_eq!(
+            hub.idempotency
+                .lock()
+                .await
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec!["k-2".to_string(), "k-3".to_string(), "k-4".to_string()],
+            "the oldest-expiring key is the one that goes"
+        );
+        assert_eq!(hub.key_of_job.lock().await.len(), 3);
+        assert!(hub.idempotency_target("k-1").await.is_none());
+
+        // Expiry: every row carries the same 1 ms TTL, so after a short wait the table is
+        // empty on the next read rather than on a timer the hub would have to run.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert!(hub.idempotency_target("k-4").await.is_none());
+        assert!(hub.idempotency.lock().await.is_empty());
+        assert!(hub.idempotency_expiry.lock().await.is_empty());
+        assert!(
+            hub.key_of_job.lock().await.is_empty(),
+            "lazy expiry clears the reverse index too, or it grows on its own"
+        );
+    }
+
+    /// The bounded-shape claim, stated exactly: N submissions leave the index holding
+    /// only the jobs the actor still has records for.
+    #[tokio::test]
+    async fn the_routing_index_holds_only_the_jobs_the_actor_still_knows() {
+        let hub = Hub::new(BrokerConfig::default(), "var/artifacts");
+        let pid = PoolId::new_unchecked("llm.chat/qwen38");
+        let handle = Arc::clone(
+            hub.pools
+                .get(&pid)
+                .expect("the sample topology owns the llm pool"),
+        );
+        let actor = PoolActor::new(pid.clone(), hub.cfg.clone());
+
+        // Twelve submissions: twelve index entries and twelve fan-outs.
+        let ids: Vec<JobId> = (1..=12)
+            .map(|n| JobId::new_unchecked(format!("job-{n}")))
+            .collect();
+        for id in &ids {
+            hub.bind_job(id, &pid).await;
+            handle.relay(id, 16).await;
+        }
+        assert_eq!(hub.job_index.lock().await.len(), 12);
+
+        // One dispatcher pass carrying the actor's drop reports for the first nine.
+        let forgotten: Vec<Effect> = ids[..9]
+            .iter()
+            .map(|job| Effect::JobForgotten { job: job.clone() })
+            .collect();
+        dispatch(&hub, &handle, &actor, forgotten).await;
+
+        let expected: Vec<String> = ids[9..].iter().map(|j| j.as_ref().to_string()).collect();
+        let mut indexed: Vec<String> = hub
+            .job_index
+            .lock()
+            .await
+            .keys()
+            .map(|j| j.as_ref().to_string())
+            .collect();
+        indexed.sort();
+        assert_eq!(indexed, expected);
+        let mut relays: Vec<String> = handle
+            .relays
+            .lock()
+            .await
+            .keys()
+            .map(|j| j.as_ref().to_string())
+            .collect();
+        relays.sort();
+        assert_eq!(relays, expected);
     }
 }

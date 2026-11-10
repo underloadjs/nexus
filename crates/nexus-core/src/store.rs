@@ -6,7 +6,7 @@
 //! | --- | --- | --- | --- |
 //! | Request payload / prompt text (including spilled `payload_ref` bodies) | **memory only** | `Limits::payload_ttl_ms` or job terminal, whichever first | free-tier hosts are shared infrastructure; §9 forbids leaving prompt text in a scratch directory |
 //! | Worker→consumer deltas | memory ring buffer, bounded twice | `Limits::replay_*` | replay needs them, RSS needs a bound |
-//! | Artifacts (image/video/TTS output) | disk (or object storage), streamed | `Limits::artifact_ttl_ms` | "tens of MB" must not accumulate in RSS (§7.3) |
+//! | Artifacts (image/video/TTS output) | disk (or object storage), streamed | `Limits::artifact_ttl_ms`, or `MAX_ARTIFACT_ENTRIES` eviction, whichever comes first | "tens of MB" must not accumulate in RSS (§7.3) |
 //!
 //! This module holds only the *decisions and bookkeeping*; the native runtime
 //! performs the actual `read`/`write`, and the WASM host has no filesystem at
@@ -364,7 +364,34 @@ pub struct ArtifactBook {
     chunk_cap_bytes: usize,
     ttl_ms: u64,
     root: String,
+    /// Slots dropped by the count bound whose bytes still have to leave the disk.
+    /// Drained by [`ArtifactBook::purge_expired`], so an eviction reuses the TTL
+    /// sweep's deletion path (`Effect::DeleteArtifact` → `io::delete_artifact`)
+    /// instead of inventing a second effect the actor would have to learn about.
+    pending_deletions: Vec<(ArtifactId, String)>,
+    /// Slots dropped by the count bound. Exported for a
+    /// `nexus_artifact_evicted_total` gauge; the actor does not read it yet.
+    evictions: u64,
 }
+
+/// How many artifact slots the book may hold before it starts evicting — the
+/// count half of NEX-7.2's "bounded twice over, by count/bytes **and** by TTL".
+///
+/// **The stated reason every entry exists** (NEX-7.2's other clause): an entry is
+/// (a) the chunk ledger for one upload, one `(index, size)` pair per chunk and so
+/// up to `max_artifact_bytes / artifact_chunk_bytes` = 131 072 pairs for a single
+/// 512 MiB artifact, (b) one staging directory under the artifact root, and (c)
+/// the ability to answer `GET /v1/artifacts/{id}` for one produced artifact.
+/// `max_bytes` bounds only the *bytes those entries describe*: a thousand jobs
+/// uploading 1 KiB each sit three orders of magnitude below the 512 MiB budget
+/// while still growing the map, the directory count and the downloadable set
+/// without limit. The count bound closes exactly that hole.
+///
+/// 128 is deliberately `Limits::queue_depth`'s number — no more artifact slots
+/// than the pool can hold jobs at once. It is a `const` and not a `Limits` field
+/// because it is a property of this bookkeeping structure, not a storage decision
+/// an operator has a reason to tune (unlike `max_artifact_bytes`).
+const MAX_ARTIFACT_ENTRIES: usize = 128;
 
 impl ArtifactBook {
     /// New book rooted at `root` (server-side directory or object prefix).
@@ -382,6 +409,8 @@ impl ArtifactBook {
             chunk_cap_bytes,
             ttl_ms,
             root: root.into(),
+            pending_deletions: Vec::new(),
+            evictions: 0,
         }
     }
 
@@ -417,6 +446,11 @@ impl ArtifactBook {
     }
 
     /// Allocate an artifact slot for a job.
+    ///
+    /// Enforces [`MAX_ARTIFACT_ENTRIES`] before inserting (NEX-7.2): the book
+    /// never grows past the count bound, and whatever it drops is queued for the
+    /// same file deletion the TTL sweep performs. See [`ArtifactBook::make_room`]
+    /// for what gets sacrificed and why.
     #[must_use]
     pub fn register(&mut self, job: &JobId, id: ArtifactId, now_ms: Timestamp) -> ArtifactEntry {
         let path = artifact_path(&self.root, job.as_ref(), id.as_ref());
@@ -446,8 +480,79 @@ impl ArtifactBook {
                 .total_bytes
                 .saturating_sub(previous.record.recorded_bytes());
         }
+        // Freeing a slot *before* the insert is what makes the bound exact: after
+        // removing this id's own entry the book is at most one under the cap, so
+        // a re-dispatched job never evicts somebody else's artifact.
+        self.make_room(now_ms);
         self.entries.insert(id, entry.clone());
         entry
+    }
+
+    /// Drops entries until one fits under [`MAX_ARTIFACT_ENTRIES`].
+    ///
+    /// Victim order, oldest first inside each class (`expires_ms` ascending —
+    /// `expires_ms` is refreshed by both `record_chunk` and `complete`, so it is
+    /// the least-recently-active order, not just the registration order):
+    ///
+    /// 1. **already expired** — the entry is only still here because no sweep has
+    ///    run since it lapsed; the sweep would delete it anyway, so this is free;
+    /// 2. **complete** — its bytes are on disk and were downloadable. Preferring a
+    ///    finished artifact over a fresh upload is a stated trade: the job record
+    ///    keeps the `ArtifactRecord` after the slot goes (so the manifest is still
+    ///    readable), only the *bytes* become unreachable, and a consumer that
+    ///    arrives late gets a clean `404 artifact_unavailable` from `get_artifact`.
+    ///    The job waiting for this slot, by contrast, has been dispatched and cannot
+    ///    deliver its result at all without one;
+    /// 3. **saturation corner** — every slot belongs to an in-flight upload, so
+    ///    nothing is safe to sacrifice and the oldest goes anyway. The honest
+    ///    consequence, stated because it is observable: that upload's next chunk
+    ///    PUT finds no slot, `ArtifactBook::record_chunk` answers
+    ///    `Queue("artifact ... is unknown or already expired")`, and
+    ///    `PoolActor::on_artifact_stored` turns that into a `413` reject for the
+    ///    job (`actor.rs:2353-2361`) — a clean, retryable failure per NEX-7.3, not
+    ///    corruption. The bytes it had already staged go with the entry through
+    ///    `pending_deletions`. Refusing the *new* slot instead was not an option:
+    ///    `register` returns an `ArtifactEntry`, not a `Result`, because dispatch
+    ///    cannot roll back a lease it already granted.
+    ///
+    /// Ties break on artifact id: `BTreeMap` iterates in key order and
+    /// `min_by_key` keeps the first minimum, which keeps eviction deterministic
+    /// (the same reason the whole crate uses ordered maps).
+    fn make_room(&mut self, now_ms: Timestamp) {
+        // One victim per iteration, so at most one entry is evicted per `register`,
+        // and `pending_deletions` cannot outrun the sweep: the actor ticks at
+        // `heartbeat_ms.min(1000).max(50)` (`state.rs:731`), so a queued path waits
+        // at most a second on disk.
+        while self.entries.len() >= MAX_ARTIFACT_ENTRIES {
+            let Some(victim) = self
+                .oldest(|entry| now_ms >= entry.record.expires_ms)
+                .or_else(|| self.oldest(|entry| entry.record.complete))
+                .or_else(|| self.oldest(|_| true))
+            else {
+                // Unreachable: the loop body only runs while the map is non-empty.
+                break;
+            };
+            if let Some(entry) = self.entries.remove(&victim) {
+                // The evicted bytes leave the shared budget exactly as a TTL purge
+                // removes them, or `total_bytes` would leak against `max_bytes`.
+                self.total_bytes = self
+                    .total_bytes
+                    .saturating_sub(entry.record.recorded_bytes());
+                self.pending_deletions.push((victim, entry.record.path));
+                self.evictions += 1;
+            }
+        }
+    }
+
+    /// Oldest entry (by `expires_ms`) matching `is_victim`, in artifact-id order
+    /// on ties. Kept separate so [`ArtifactBook::make_room`] can chain its three
+    /// preference classes.
+    fn oldest(&self, is_victim: impl Fn(&ArtifactEntry) -> bool) -> Option<ArtifactId> {
+        self.entries
+            .iter()
+            .filter(|(_, entry)| is_victim(entry))
+            .min_by_key(|(_, entry)| entry.record.expires_ms)
+            .map(|(id, _)| id.clone())
     }
 
     /// Bind the upload to a worker attempt.
@@ -524,6 +629,12 @@ impl ArtifactBook {
     /// # Errors
     /// [`CoreError::Protocol`] on a digest or size mismatch, [`CoreError::Queue`]
     /// when the artifact slot is unknown.
+    // One argument over clippy's threshold, and every one of them is a distinct
+    // measurement (the worker's declared claim vs what the hub actually stored),
+    // so a parameter struct would only rename them. The call site that would have
+    // to change is `PoolActor::on_artifact_stored` (`actor.rs:2373`), outside this
+    // change's file list, so the count is documented instead of re-shaped.
+    #[allow(clippy::too_many_arguments)]
     pub fn complete(
         &mut self,
         id: &ArtifactId,
@@ -592,6 +703,14 @@ impl ArtifactBook {
         self.entries.len()
     }
 
+    /// Slots dropped by the [`MAX_ARTIFACT_ENTRIES`] bound. Ready for a
+    /// `nexus_artifact_evicted_total` gauge; nothing reads it yet (see the report
+    /// handoff — `actor.rs` publishes `nexus_artifact_bytes_on_disk` next door).
+    #[must_use]
+    pub fn evictions(&self) -> u64 {
+        self.evictions
+    }
+
     /// True when there are no artifacts.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -600,8 +719,16 @@ impl ArtifactBook {
 
     /// Expire finished artifacts, returning `(id, path)` so the server can
     /// `remove_file`.
+    ///
+    /// Also drains the slots dropped by [`ArtifactBook::make_room`]: their files
+    /// have to go too, and this is the only artifact sweep the actor runs, so
+    /// returning evictions from here lets eviction reuse the TTL path
+    /// (`Effect::DeleteArtifact` → `state.rs:890-893` → `io::delete_artifact`)
+    /// instead of needing a second effect type and a second call site in files
+    /// this module does not own. The actor ticks this every sweep, so an evicted
+    /// entry's staging directory lives at most one tick past its eviction.
     pub fn purge_expired(&mut self, now_ms: Timestamp) -> Vec<(ArtifactId, String)> {
-        let stale: Vec<(ArtifactId, String)> = self
+        let mut stale: Vec<(ArtifactId, String)> = self
             .entries
             .iter()
             .filter(|(_, e)| now_ms >= e.record.expires_ms)
@@ -614,6 +741,9 @@ impl ArtifactBook {
                     .saturating_sub(entry.record.recorded_bytes());
             }
         }
+        // Evicted entries are already out of `entries` and out of `total_bytes`
+        // (`make_room` did both when it dropped them); only their paths remain.
+        stale.append(&mut self.pending_deletions);
         stale
     }
 }
@@ -882,6 +1012,120 @@ mod tests {
             )]
         );
         assert_eq!(a.len(), 0);
+    }
+
+    /// NEX-7.2's count half: the artifact book holds at most
+    /// `MAX_ARTIFACT_ENTRIES` slots, and every slot it drops is handed to the
+    /// sweep that deletes the file, so the bound cannot leak a directory.
+    #[test]
+    fn artifact_book_is_count_bounded_and_reports_evicted_paths() {
+        let mut a = ArtifactBook::new("/tmp/art", 100_000, 1_024, 1_000);
+        let job = JobId::new_unchecked("job-cap");
+        // Fill the book exactly to the cap. Nothing is complete and nothing has
+        // lapsed, so the next allocation has to hit the saturation rule. The
+        // returned entries are unused: every assertion below reads the book itself.
+        for index in 0..MAX_ARTIFACT_ENTRIES {
+            let when = u64::try_from(index).expect("index fits in a timestamp");
+            let _ = a.register(
+                &job,
+                ArtifactId::new_unchecked(format!("art-{index}")),
+                when,
+            );
+        }
+        assert_eq!(a.len(), MAX_ARTIFACT_ENTRIES);
+        assert_eq!(a.evictions(), 0, "filling to the cap evicts nothing");
+
+        // One over the cap. With no expired and no complete slot to sacrifice, the
+        // oldest goes regardless of state; all deadlines are distinct here, so the
+        // victim is the first-registered slot, deterministically.
+        let _ = a.register(&job, ArtifactId::new_unchecked("art-cap"), 0);
+        assert_eq!(
+            a.len(),
+            MAX_ARTIFACT_ENTRIES,
+            "the bound is exact, not approximately the cap"
+        );
+        assert_eq!(a.evictions(), 1);
+        assert!(
+            a.get(&ArtifactId::new_unchecked("art-0")).is_none(),
+            "the oldest in-flight slot is the one that pays"
+        );
+        assert!(a.get(&ArtifactId::new_unchecked("art-1")).is_some());
+        assert!(a.get(&ArtifactId::new_unchecked("art-cap")).is_some());
+        // The eviction is reported on the sweep path the actor already runs, which
+        // is what turns it into `io::delete_artifact` for that staging directory.
+        assert_eq!(
+            a.purge_expired(0),
+            vec![(
+                ArtifactId::new_unchecked("art-0"),
+                "/tmp/art/job-cap/art-0".to_string()
+            )]
+        );
+        assert!(
+            a.purge_expired(0).is_empty(),
+            "the eviction queue is drained, not replayed"
+        );
+    }
+
+    /// The eviction order the bound commits to: a lapsed slot first, a finished
+    /// artifact second, an in-flight upload last.
+    #[test]
+    fn artifact_eviction_prefers_expired_slots_then_completed_ones() {
+        let mut a = ArtifactBook::new("/tmp/art", 1 << 30, 1 << 20, 1_000);
+        let job = JobId::new_unchecked("job-evict");
+        let worker = WorkerId::new_unchecked("wkr-1");
+        // Registered one millisecond apart, so `expires_ms` order is registration
+        // order and `art-000` is unambiguously the oldest slot. The returned
+        // entries are unused: the assertions read the book.
+        for index in 0..MAX_ARTIFACT_ENTRIES {
+            let when = u64::try_from(index).expect("index fits in a timestamp");
+            let _ = a.register(
+                &job,
+                ArtifactId::new_unchecked(format!("art-{index:03}")),
+                when,
+            );
+        }
+        // `art-001` becomes a finished artifact holding 7 bytes of the budget.
+        let done = ArtifactId::new_unchecked("art-001");
+        a.assign_owner(&done, &worker, 1);
+        a.record_chunk(&done, &worker, 1, 0, 7, 900).expect("chunk");
+        a.complete(&done, None, None, sha256_hex(b"x"), 7, None, 900)
+            .expect("complete");
+        assert_eq!(a.bytes(), 7);
+
+        // (a) A lapsed slot is the victim even though the completed `art-001`
+        // sorts ahead of it by id: at t=1_000 only `art-000` (registered at 0 with
+        // a 1_000 ms ttl) has expired.
+        let _ = a.register(&job, ArtifactId::new_unchecked("art-fresh-1"), 1_000);
+        assert!(
+            a.get(&ArtifactId::new_unchecked("art-000")).is_none(),
+            "an entry the sweep would delete anyway goes first"
+        );
+        assert!(a.get(&done).is_some());
+
+        // (b) With nothing left lapsed, the finished artifact is next: the fresh
+        // upload is a dispatched job that cannot deliver without a slot.
+        let _ = a.register(&job, ArtifactId::new_unchecked("art-fresh-2"), 1_000);
+        assert!(
+            a.get(&done).is_none(),
+            "a completed artifact is preferred over an in-flight upload"
+        );
+        assert_eq!(
+            a.bytes(),
+            0,
+            "an evicted entry leaves the shared byte budget"
+        );
+
+        // Both victims reach the sweep, oldest first, with the paths to delete.
+        assert_eq!(
+            a.purge_expired(1_000),
+            vec![
+                (
+                    ArtifactId::new_unchecked("art-000"),
+                    "/tmp/art/job-evict/art-000".to_string()
+                ),
+                (done, "/tmp/art/job-evict/art-001".to_string()),
+            ]
+        );
     }
 
     #[test]

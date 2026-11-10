@@ -3,6 +3,7 @@
 #![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used))]
 
 mod consumer;
+mod consumer_ws;
 mod io;
 #[cfg(test)]
 mod runtime_e2e;
@@ -57,10 +58,16 @@ async fn main() -> anyhow::Result<()> {
     let listen: SocketAddr = values
         .get(LISTEN_ENV)
         .and_then(|v| v.parse().ok())
+        // Infallible by construction: the fallback is a literal address, so a
+        // parse failure here is a typo in `DEFAULT_LISTEN` itself. Failing loudly
+        // beats substituting some other address, which would put the hub on a port
+        // nobody configured and make the health check pass in the wrong place.
         .unwrap_or_else(|| {
-            DEFAULT_LISTEN
+            #[allow(clippy::expect_used)]
+            let fallback: SocketAddr = DEFAULT_LISTEN
                 .parse()
-                .expect("built-in listen address parses")
+                .expect("built-in listen address parses");
+            fallback
         });
     let artifact_root = values
         .get(ARTIFACT_ROOT_ENV)
@@ -121,6 +128,11 @@ pub fn app(hub: Arc<Hub>, body_limit: usize) -> Router {
         .route("/v1/jobs/{id}/events", get(consumer::job_events))
         .route("/v1/jobs/{id}/result", get(consumer::job_result))
         .route("/v1/models", get(consumer::models))
+        // NEX-3: the same consumer surface over one socket, so several tasks can be
+        // posted and watched at once and a verdict can arrive before any event
+        // byte. It sits with the HTTP routes on purpose — same auth, same actor,
+        // same admission rules; only the transport differs.
+        .route("/v1/consumer", get(consumer_ws::upgrade))
         // ---- payload and artifact bulk transfer (task §10) ----
         .route("/v1/payloads/{id}", get(io::fetch_payload))
         .route(

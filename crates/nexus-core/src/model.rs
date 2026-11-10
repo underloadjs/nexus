@@ -151,7 +151,16 @@ pub struct WorkerRecord {
 impl WorkerRecord {
     /// Fresh record for a worker that has just passed handshake; starts
     /// `Loading` because readiness must be *reported*, never assumed.
+    ///
+    /// `#[allow(clippy::too_many_arguments)]`: these eight arguments are the
+    /// handshake's identity payload (who, which generation, how many slots, what it
+    /// can serve, what it attests, which pools, which tier, when), and both call sites
+    /// pass them straight from a decoded `Hello`. The alternative the lint offers — a
+    /// parameter struct — is a second type carrying the same eight fields; it does not
+    /// make the declaration shorter, and `fixture.rs` builds workers through this
+    /// signature as well.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: WorkerId,
         epoch: u64,
@@ -417,6 +426,22 @@ pub struct JobRecord {
     pub last_ping_ms: Option<Timestamp>,
     /// Consumers currently attached (drives cancel-on-gone).
     pub consumers: BTreeSet<ConsumerId>,
+    /// When this job **stopped having a reason to be watched**, for a *detached*
+    /// submission only (`cancel_on_consumer_gone == false`); `None` for a chat-style
+    /// submission, whose connection is the subscription and which is deleted outright
+    /// when that connection goes (NEX-6.3).
+    ///
+    /// The clock is the NEX-6.6 / §9.1-item-3 bound on a task nobody is watching:
+    ///   * `Some(accept_ms)` at submit — a detached job's existence was never
+    ///     justified by the socket that posted it, so the window starts immediately;
+    ///   * `None` while at least one consumer is attached (a live consumer is a stated
+    ///     reason for the bytes to exist, NEX-7.2);
+    ///   * back to `Some(now)` when the last one leaves.
+    ///
+    /// Only an **unclaimed** (`Pending`/`Queued`) record is deleted when this ages out:
+    /// a worker that already holds the lease has committed GPU work, which is bounded by
+    /// `job_hard_cap_ms` instead (see `PoolActor::on_tick` step 9 and the note there).
+    pub subscriberless_since: Option<Timestamp>,
     /// True once at least one delta/event frame has been relayed to a consumer.
     /// This is the "HTTP status is spent" flag.
     pub bytes_delivered: bool,
@@ -630,7 +655,15 @@ pub struct Submission {
 
 impl JobRecord {
     /// Build a fresh, non-terminal record from a validated submission.
+    ///
+    /// `#[allow(clippy::too_many_arguments)]`: every argument is one field of the
+    /// record, and the two call sites (the actor's `on_submit`, the test fixture)
+    /// construct the record exactly once from values they just computed. A builder or
+    /// parameter struct would be a second vocabulary for the same nine facts without
+    /// removing a single one of them, and `fixture.rs` builds records through this
+    /// signature too.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: JobId,
         sub: &Submission,
@@ -670,6 +703,10 @@ impl JobRecord {
             flush: FlushGate::default(),
             last_ping_ms: None,
             consumers: BTreeSet::new(),
+            // NEX-6.6: a detached submission is never "watched" by the socket that
+            // posted it, so its unwatched window starts at accept. A chat submission
+            // has no such clock — it dies with its consumer (NEX-6.3).
+            subscriberless_since: (!sub.cancel_on_consumer_gone).then_some(now_ms),
             bytes_delivered: false,
             cancel_sent_ms: None,
             artifact: None,
@@ -764,10 +801,61 @@ mod tests {
         assert_eq!(Priority::from_name("typo"), Priority::Default);
         assert_eq!(Priority::Bulk.as_str(), "bulk");
         assert!(TerminalReason::NoReadyWorker.retryable());
-        assert!(TerminalReason::WorkerGonePartial.retryable() == false);
+        assert!(!TerminalReason::WorkerGonePartial.retryable());
         assert_eq!(
             TerminalReason::LeaseExpiredPartial.as_str(),
             "lease_expired_partial"
         );
+    }
+
+    /// The NEX-6.6 unwatched clock is set by the submission's contract, never inferred
+    /// from the wire format: a detached job starts its window at accept, a chat job has
+    /// no window at all because it is deleted with its consumer (NEX-6.3).
+    #[test]
+    fn subscriberless_clock_follows_the_detach_contract_not_the_wire_format() {
+        let accepted = JobRecord::new(
+            JobId::new_unchecked("job-detached"),
+            &submission(false),
+            10,
+            "sha".to_string(),
+            1_000,
+            61_000,
+            1_801_000,
+            64,
+            65_536,
+        );
+        assert_eq!(accepted.subscriberless_since, Some(1_000));
+
+        let chat = JobRecord::new(
+            JobId::new_unchecked("job-chat"),
+            &submission(true),
+            10,
+            "sha".to_string(),
+            1_000,
+            61_000,
+            1_801_000,
+            64,
+            65_536,
+        );
+        assert_eq!(chat.subscriberless_since, None);
+    }
+
+    /// Minimal submission fixture for [`JobRecord::new`]; only the two flags that
+    /// decide lifetime policy vary between the cases.
+    fn submission(cancel_on_consumer_gone: bool) -> Submission {
+        Submission {
+            kind: "llm.chat".to_string(),
+            pool: PoolId::new_unchecked("llm.chat/qwen38"),
+            tenant: TenantId::new_unchecked("acme"),
+            requires: Requires::default(),
+            payload: Value::Null,
+            content_type: "application/json".to_string(),
+            idempotency_key: "k1".to_string(),
+            session_hint: None,
+            priority: Priority::Default,
+            idempotent: true,
+            streaming: true,
+            cancel_on_consumer_gone,
+        }
     }
 }

@@ -351,7 +351,14 @@ pub enum Effect {
         /// Destination worker.
         worker: WorkerId,
         /// Frame to send.
-        frame: HubFrame,
+        ///
+        /// Boxed, not inline: `HubFrame::Assigned` carries the payload, the
+        /// `Requires` set and the artifact grant, so a `HubFrame` is ~430 bytes
+        /// and the effect list the actor returns per message would be dominated
+        /// by frame copies (`clippy::large_enum_variant`). serde unwraps `Box`
+        /// transparently, so the JSON effect contract the WASM host and
+        /// `examples/node-smoke.mjs` read is unchanged.
+        frame: Box<HubFrame>,
     },
     /// Fan these events out to every consumer attached to the job.
     Relay {
@@ -400,6 +407,24 @@ pub enum Effect {
         /// Whether the consumer may retry.
         retryable: bool,
     },
+    /// The actor has **dropped the job record entirely**: no queue entry, no lease, no
+    /// replay ring, and no idempotency entry that would hand the same answer to a later
+    /// stranger. The job id is now unknown, so a later submission with its key executes
+    /// afresh rather than attaching to it.
+    ///
+    /// Emitted at every place a record leaves `PoolActor::jobs`:
+    ///   * the NEX-6.3 consumer-gone orphan deletion (`on_detach`, same mailbox step as
+    ///     the `Cancel` and the `Terminal`),
+    ///   * the NEX-6.6 unclaimed-detached sweep (`on_tick` step 9),
+    ///   * the `job_retention_ms` sweep (`on_tick` step 10).
+    ///
+    /// The embedder must drop every per-job side structure it keys by job id — the
+    /// server's routing index and its relay fan-out (`nexus-server/src/state.rs`) — or
+    /// those maps grow for the process lifetime while the actor has bounded its own.
+    JobForgotten {
+        /// Job whose record, replay buffer and idempotency entry are gone.
+        job: JobId,
+    },
     /// Answer to [`ActorMsg::FetchPayload`]: the payload bytes, or the refusal.
     PayloadBytes {
         /// Reference fetched.
@@ -420,7 +445,14 @@ pub enum Effect {
         /// Job read.
         job: JobId,
         /// `None` when the job is unknown or has left retention.
-        view: Option<JobView>,
+        ///
+        /// Boxed on purpose: `JobView` is by far the largest payload in this enum
+        /// (~700 B), and `Effect` values live in `Vec<Effect>` on every mailbox step.
+        /// A query is the rarest effect by orders of magnitude, so paying one
+        /// indirection there is what keeps the relay path's `Effect` at the size of its
+        /// next-largest variant (a boxed `SendWorker` frame) instead of copying a whole
+        /// view around for every delta.
+        view: Box<Option<JobView>>,
     },
     /// Structured log line for the embedder.
     Log {
@@ -466,6 +498,12 @@ impl PoolActor {
 
     /// Actor for `pool` whose artifacts live under `artifact_root` (server-side
     /// directory or object-storage prefix).
+    ///
+    /// An **empty** root is not "the current directory": it selects NEX-7.1's
+    /// memory-only mode, in which artifact-declaring kinds are refused at admission
+    /// (`on_submit`'s `artifact_unavailable`) instead of being written anywhere. The
+    /// native runtime passes `NEXUS_ARTIFACT_ROOT` through verbatim, so the empty string
+    /// is the operator's opt-out and an unset variable still means a real root.
     #[must_use]
     pub fn with_artifact_root(pool: PoolId, cfg: BrokerConfig, artifact_root: &str) -> Self {
         let limits = cfg.limits.clone();
@@ -798,7 +836,9 @@ impl PoolActor {
                 }
             }
             ActorMsg::Query { job } => vec![Effect::Snapshot {
-                view: self.job_view(&job),
+                // Boxed payload: see `Effect::Snapshot`. The derivation itself is
+                // unchanged, so a snapshot is still exactly what the single owner sees.
+                view: Box::new(self.job_view(&job)),
                 job,
             }],
             ActorMsg::Tick { .. } => self.on_tick(now_ms),
@@ -864,6 +904,13 @@ impl PoolActor {
                 // A second `Hello` on a live socket is a re-handshake (a cell
                 // re-run reusing the connection): close the old generation and
                 // open the new one so no lease points at the previous epoch.
+                //
+                // `expect` is infallible by invariant and stays that way on purpose: this
+                // arm just matched `WorkerFrame::Hello`, and `HelloInput::from_frame` only
+                // returns `None` for a frame that is *not* a `Hello`. Silently returning no
+                // effects here would swallow a handshake instead of failing loudly, which
+                // is the worse failure for a socket whose state the actor already trusts.
+                #[allow(clippy::expect_used)]
                 let hello = HelloInput::from_frame(&frame).expect("matched on Hello");
                 let mut effects = self.on_worker_gone(worker.clone(), conn, now_ms);
                 effects.extend(self.on_hello(worker, conn, hello, now_ms));
@@ -927,6 +974,37 @@ impl PoolActor {
             )];
         }
 
+        // NEX-7.1 / §9.1 item 5 — **in-memory-only mode**. An empty artifact root is the
+        // operator's explicit "this deployment has no scratch disk" opt-out
+        // (`NEXUS_ARTIFACT_ROOT=""`; the built-in default still applies when the variable
+        // is absent), and bulk artifact egress is the only thing NEX-7.4 lets this hub
+        // write anywhere.
+        //
+        // A non-streaming kind has no other way to deliver a result: dispatch hands the
+        // worker a pre-signed upload slot (`PoolActor::dispatch`, the
+        // `if record.streaming { None } else { … }` branch), so accepting the job here
+        // would only move the failure to the worker's first `PUT` — after the response
+        // body is already open, where a clean 4xx is no longer legal (§7.2). Refusing at
+        // admission, before any body byte, is the answer the client can act on.
+        //
+        // "Declares artifact output" is `!streaming`: the same test dispatch uses to
+        // decide whether to allocate a slot, so admission and dispatch can never
+        // disagree about which kinds need disk.
+        if !kind.streaming && self.artifacts.root().is_empty() {
+            self.metrics
+                .incr_label(names::JOBS_REJECTED, "reason", "artifact_unavailable", 1);
+            return vec![reject(
+                Some(job),
+                400,
+                "artifact_unavailable",
+                &format!(
+                    "kind {:?} returns an artifact, but this hub runs in memory-only mode (empty artifact root): submit a streaming kind, or point NEXUS_ARTIFACT_ROOT at scratch storage",
+                    sub.kind
+                ),
+                None,
+            )];
+        }
+
         // Payload budget: the cheap prompt-size mitigation of task §8 plus the
         // §10 body cap.
         let body = serde_json::to_vec(&sub.payload).unwrap_or_default();
@@ -967,8 +1045,15 @@ impl PoolActor {
         if let Some((existing, _)) = self.idempotency.get(&sub.idempotency_key).cloned() {
             if self.jobs.contains_key(&existing) {
                 let (replayed, _) = self.collect_replay(&existing, 0).unwrap_or_default();
+                // Defensive re-lookup: `contains_key` was checked a moment ago in the same
+                // mailbox step, so this cannot miss, and a miss must stay as silent as it was
+                // before this branch grew a second statement.
                 if let Some(record) = self.jobs.get_mut(&existing) {
                     record.consumers.insert(consumer);
+                    // The duplicate *is* a consumer arriving, so the NEX-6.6 unwatched window
+                    // closes: while somebody is following a detached job, its bytes have the
+                    // stated reason NEX-7.2 asks for and the subscriber-less clock must not run.
+                    record.subscriberless_since = None;
                 }
                 self.metrics.incr(names::IDEMPOTENT_ATTACH, 1);
                 return vec![Effect::Accepted {
@@ -1153,6 +1238,10 @@ impl PoolActor {
         record.consumers.insert(consumer.clone());
         // A re-attached consumer restarts the keepalive cadence immediately.
         record.last_ping_ms = None;
+        // An attached consumer is the stated reason a job's bytes still exist
+        // (NEX-7.2), so the NEX-6.6 subscriber-less window stops running for as long as
+        // anybody is watching — including a watcher that only opened `/events` to poll.
+        record.subscriberless_since = None;
         let attached_terminal = record.phase.is_terminal();
         let (mut events, lossy) = self.collect_replay(&job, from_seq).unwrap_or_default();
         if attached_terminal && events.is_empty() {
@@ -1217,6 +1306,19 @@ impl PoolActor {
             )
         };
         if !empty || terminal {
+            // Two "nothing to do" cases, and the second one is a deliberate decision:
+            //
+            //   * somebody is still attached, so this socket was not the subscription;
+            //   * the record is **already** terminal. Here the answer exists and finished
+            //     before the socket closed, which is exactly the reason NEX-7.2 allows
+            //     retaining bytes ("an answer a retry must not re-run"), and retention
+            //     already bounds the record by `job_retention_ms`. Deleting a completed
+            //     job because its consumer lingered for one more second would take away
+            //     the poll/replay the job API exists for.
+            //
+            // The case NEX-6.3 targets is the one below: a record that was **still
+            // running** when the last consumer left. Its only reason to exist was that
+            // consumer.
             return Vec::new();
         }
         // Task §6: the *subscription* decides, not the wire format. An SSE chat
@@ -1226,9 +1328,121 @@ impl PoolActor {
         // including when its kind happens to be streaming and the only thing that
         // just hung up is a transient `GET /v1/jobs/{id}/events` watcher.
         if cancel_on_gone {
-            self.on_cancel(job, CancelReason::ConsumerGone, now_ms)
+            // NEX-6.3: "the task is then **deleted**: no queue entry, no lease, no
+            // record, no retained stream, no idempotency entry that will hand the same
+            // answer to a later stranger. A task with no attached consumer has no reason
+            // to exist." So the orphan is dropped in **this same mailbox step**, not
+            // after `job_retention_ms`:
+            //
+            //   * `on_cancel` tells the lease holder first (NEX-6.4), pulls the task out
+            //     of the queue (NEX-6.2) and makes it terminal, releasing the prompt;
+            //   * `forget_job` then removes the record (the replay ring dies with it —
+            //     NEX-6.3's "no retained stream"), un-arms the retention entry
+            //     `finish_job` armed, frees a still-held payload reference and a still
+            //     recorded lease defensively, and deletes the idempotency entry, so the
+            //     next submission with the same key executes **fresh** instead of
+            //     attaching to a dead execution and replaying `job ended: cancelled`.
+            //
+            // This holds whatever `bytes_delivered` says: a consumer-gone task has no
+            // reason to exist whether or not it streamed (NEX-6.2/6.3), and the only
+            // reader of those bytes was the socket that just closed.
+            //
+            // The supplier side is untouched: the `Cancel` is the same one the worker
+            // already got, its slot is still released on `CancelAck` or lease expiry, and
+            // any frame that arrives afterwards finds no lease and takes the existing
+            // "refused, stop producing" path (`refuse_foreign_frame`) rather than
+            // relaying into nobody.
+            let mut effects = self.on_cancel(job.clone(), CancelReason::ConsumerGone, now_ms);
+            effects.extend(self.forget_job(&job));
+            effects
         } else {
+            // NEX-6.6's exception, with §9.1 item 3's cap: the job keeps running for the
+            // client that said "pick the result up later", but it is now watched by
+            // nobody, so the subscriber-less clock starts (or restarts) here and
+            // `on_tick` step 9 deletes it if it is *still* unclaimed when that window
+            // lapses. A claimed job is deliberately not swept by this clock — see the
+            // note in that step.
+            if let Some(record) = self.jobs.get_mut(&job) {
+                record.subscriberless_since = Some(now_ms);
+            }
             Vec::new()
+        }
+    }
+
+    /// Drop a job record and **everything keyed to it**, in one step: this is NEX-6.3's
+    /// "deleted", and it is the only place a record leaves [`PoolActor::jobs`].
+    ///
+    /// Concurrency accounting is handled here: a record deleted while it was still
+    /// non-terminal still occupied a tenant slot, so its slot is released on the way out;
+    /// a terminal record already released it in `finish_job` and is not counted twice.
+    ///
+    /// Idempotent by construction: a job that is already gone yields no effects, so the
+    /// same call is safe from the detach path, the subscriber-less sweep and the retention
+    /// sweep.
+    fn forget_job(&mut self, job: &JobId) -> Vec<Effect> {
+        let Some(record) = self.jobs.remove(job) else {
+            return Vec::new();
+        };
+        // Un-arm retention first: `finish_job` armed a timer for a record that is about
+        // to vanish, and a sweep that finds no record is pure noise (`retention_len`
+        // also feeds `/metrics`, so a dangling entry would misreport the bound).
+        self.retention_timer.retain(|(_, j)| j != job);
+        // A queued job must leave the queue too — NEX-6.3's "no queue entry". Removing a
+        // job that is not queued (the common terminal case) is a no-op.
+        self.queue.remove(job);
+
+        let mut effects = Vec::new();
+        // NEX-7.1's concurrency slot. Only a live record still holds one: `finish_job`
+        // released it for anything terminal, so decrementing there too would push the
+        // tenant's count below zero forever and slowly raise its effective cap.
+        if !record.phase.is_terminal() {
+            if let Some(count) = self.tenant_active.get_mut(&record.tenant) {
+                *count = count.saturating_sub(1);
+            }
+        }
+        // A prompt is normally released by `finish_job`; a record dropped *before* it
+        // terminated still holds the bytes, and releasing them here is what stops the
+        // spill budget leaking on every deleted detached job.
+        if let Some(reference) = &record.payload_ref {
+            self.payloads.release(reference);
+            effects.push(Effect::ReleasePayload {
+                job: job.clone(),
+                reference: Some(reference.clone()),
+            });
+        }
+        // Same defensive shape for the lease: every terminal path drops it first, so this
+        // only fires for a record deleted while it was still leased.
+        if let Some(lease) = self.leases.remove(job) {
+            self.lease_timer.remove(&(lease.deadline_ms, job.clone()));
+            if let Some(worker) = self.workers.get_mut(&lease.worker) {
+                worker.in_flight.remove(job);
+            }
+        }
+        // NEX-6.3's last clause: "no idempotency entry that will hand the same answer to a
+        // later stranger". Keyed by the record's own key — which is exactly the map key,
+        // because the tenant namespacing happens in the edge adapter before the
+        // submission reaches the actor.
+        self.forget_idempotency_for(&record.idempotency_key, job);
+        effects.push(Effect::JobForgotten { job: job.clone() });
+        // A deletion moves every gauge this actor publishes: queue depth, live leases,
+        // held prompt bytes. Refreshing here keeps `/metrics` honest on the very next
+        // scrape instead of waiting for the next terminal transition.
+        self.refresh_gauges();
+        effects
+    }
+
+    /// Remove an idempotency entry **only while it still points at `job`**.
+    ///
+    /// The guard matters: the same key may already have been re-pointed at a newer
+    /// execution (`remember_idempotency` overwrites), and deleting the key then would
+    /// forget a mapping that belongs to a different record.
+    fn forget_idempotency_for(&mut self, key: &str, job: &JobId) {
+        if self
+            .idempotency
+            .get(key)
+            .is_some_and(|(owner, _)| owner == job)
+        {
+            self.forget_idempotency(key);
         }
     }
 
@@ -1242,10 +1456,10 @@ impl PoolActor {
         if let Some(lease) = self.leases.get(&job).cloned() {
             effects.push(Effect::SendWorker {
                 worker: lease.worker,
-                frame: HubFrame::Cancel {
+                frame: Box::new(HubFrame::Cancel {
                     job: job.clone(),
                     reason,
-                },
+                }),
             });
         }
         if self.queue.remove(&job) {
@@ -1297,16 +1511,16 @@ impl PoolActor {
             return vec![
                 Effect::SendWorker {
                     worker: worker.clone(),
-                    frame: HubFrame::Reject {
+                    frame: Box::new(HubFrame::Reject {
                         code: err.code().to_string(),
                         message: err.to_string(),
-                    },
+                    }),
                 },
                 Effect::SendWorker {
                     worker,
-                    frame: HubFrame::Bye {
+                    frame: Box::new(HubFrame::Bye {
                         reason: ByeReason::VersionMismatch,
-                    },
+                    }),
                 },
             ];
         }
@@ -1317,16 +1531,16 @@ impl PoolActor {
             return vec![
                 Effect::SendWorker {
                     worker: worker.clone(),
-                    frame: HubFrame::Reject {
+                    frame: Box::new(HubFrame::Reject {
                         code: "attestation_rejected".to_string(),
                         message: err.to_string(),
-                    },
+                    }),
                 },
                 Effect::SendWorker {
                     worker,
-                    frame: HubFrame::Bye {
+                    frame: Box::new(HubFrame::Bye {
                         reason: ByeReason::AttestationRejected,
-                    },
+                    }),
                 },
             ];
         }
@@ -1343,16 +1557,16 @@ impl PoolActor {
             return vec![
                 Effect::SendWorker {
                     worker: worker.clone(),
-                    frame: HubFrame::Reject {
+                    frame: Box::new(HubFrame::Reject {
                         code: "pool_unavailable".to_string(),
                         message: message.clone(),
-                    },
+                    }),
                 },
                 Effect::SendWorker {
                     worker,
-                    frame: HubFrame::Bye {
+                    frame: Box::new(HubFrame::Bye {
                         reason: ByeReason::AuthRejected,
-                    },
+                    }),
                 },
                 Effect::Log {
                     level: LogLevel::Warn,
@@ -1361,8 +1575,11 @@ impl PoolActor {
             ];
         }
 
-        // Capacity is declared, never assumed, and clamped against nonsense.
-        let capacity = hello.capacity.min(MAX_DECLARED_CAPACITY).max(1);
+        // Capacity is declared, never assumed, and clamped against nonsense
+        // (`capacity: 1000000` must not become unbounded over-dispatch, and `0` would
+        // make a connected worker undispatchable forever). `clamp` cannot panic here:
+        // both bounds are constants with `1 <= MAX_DECLARED_CAPACITY`.
+        let capacity = hello.capacity.clamp(1, MAX_DECLARED_CAPACITY);
         if !self.workers.contains_key(&worker)
             && self.workers.len() >= self.limits().max_workers_per_pool
         {
@@ -1370,16 +1587,16 @@ impl PoolActor {
             return vec![
                 Effect::SendWorker {
                     worker: worker.clone(),
-                    frame: HubFrame::Reject {
+                    frame: Box::new(HubFrame::Reject {
                         code: "pool_full".to_string(),
                         message: format!("this hub holds {limit} workers for this pool"),
-                    },
+                    }),
                 },
                 Effect::SendWorker {
                     worker,
-                    frame: HubFrame::Bye {
+                    frame: Box::new(HubFrame::Bye {
                         reason: ByeReason::Evicted,
-                    },
+                    }),
                 },
             ];
         }
@@ -1394,9 +1611,9 @@ impl PoolActor {
                 self.metrics.incr(names::WORKER_EVCTIONS, 1);
                 effects.push(Effect::SendWorker {
                     worker: worker.clone(),
-                    frame: HubFrame::Bye {
+                    frame: Box::new(HubFrame::Bye {
                         reason: ByeReason::Evicted,
-                    },
+                    }),
                 });
                 // Only the *authority* dies with the old socket. This is a socket
                 // swap, not a death: `orphan_worker` here used to demote the engine,
@@ -1504,7 +1721,7 @@ impl PoolActor {
 
         effects.push(Effect::SendWorker {
             worker: worker.clone(),
-            frame: HubFrame::Welcome {
+            frame: Box::new(HubFrame::Welcome {
                 protocol: crate::PROTOCOL_VERSION,
                 worker_id: worker,
                 epoch: conn,
@@ -1513,7 +1730,7 @@ impl PoolActor {
                 lease_ms: self.cfg.lease_ms_for(&self.pool),
                 frame_cap_bytes: self.limits().worker_frame_text_cap_bytes,
                 resumed,
-            },
+            }),
         });
         self.refresh_gauges();
         // A newly warm worker may absorb queued work at once: §4's `Claim` drives
@@ -1955,7 +2172,7 @@ impl PoolActor {
 
         Ok(vec![Effect::SendWorker {
             worker,
-            frame: HubFrame::Assigned {
+            frame: Box::new(HubFrame::Assigned {
                 job,
                 attempt,
                 kind: record.kind.clone(),
@@ -1967,7 +2184,7 @@ impl PoolActor {
                 start_seq,
                 continuation_text,
                 artifact_put,
-            },
+            }),
         }])
     }
 
@@ -2023,10 +2240,10 @@ impl PoolActor {
             self.metrics.incr(names::FRAMES_DUPLICATE, 1);
             return vec![Effect::SendWorker {
                 worker,
-                frame: HubFrame::Ack {
+                frame: Box::new(HubFrame::Ack {
                     job,
                     seq: record.seq.acked_through(),
-                },
+                }),
             }];
         }
 
@@ -2041,12 +2258,14 @@ impl PoolActor {
         let relayed = relay_into(
             record,
             &self.cfg.limits,
-            seq,
-            kind,
-            &text,
-            artifact.as_ref(),
-            content_type.as_deref(),
-            now_ms,
+            FrameInput {
+                seq,
+                kind,
+                text: &text,
+                artifact: artifact.as_ref(),
+                content_type: content_type.as_deref(),
+                now_ms,
+            },
         );
         self.metrics
             .incr_label(names::FRAMES, "kind", frame_kind_name(kind), 1);
@@ -2073,10 +2292,10 @@ impl PoolActor {
         // reconnecting worker resumes from.
         effects.push(Effect::SendWorker {
             worker,
-            frame: HubFrame::Ack {
+            frame: Box::new(HubFrame::Ack {
                 job: job.clone(),
                 seq: record.seq.acked_through(),
-            },
+            }),
         });
         effects
     }
@@ -2112,10 +2331,10 @@ impl PoolActor {
             },
             Effect::SendWorker {
                 worker: worker.clone(),
-                frame: HubFrame::Cancel {
+                frame: Box::new(HubFrame::Cancel {
                     job: job.clone(),
                     reason: CancelReason::LeaseExpired,
-                },
+                }),
             },
         ]
     }
@@ -2230,11 +2449,11 @@ impl PoolActor {
             metrics.incr(names::RESUME_REJECTED, 1);
             vec![Effect::SendWorker {
                 worker: worker.clone(),
-                frame: HubFrame::ResumeNack {
+                frame: Box::new(HubFrame::ResumeNack {
                     job: job.clone(),
                     attempt,
                     reason,
-                },
+                }),
             }]
         };
         let Some(lease) = self.leases.get(&job).cloned() else {
@@ -2297,10 +2516,10 @@ impl PoolActor {
         vec![
             Effect::SendWorker {
                 worker,
-                frame: HubFrame::Ack {
+                frame: Box::new(HubFrame::Ack {
                     job,
                     seq: resume_from,
-                },
+                }),
             },
             Effect::Log {
                 level: LogLevel::Info,
@@ -2734,12 +2953,15 @@ impl PoolActor {
             if let Some(count) = self.tenant_active.get_mut(&record.tenant) {
                 *count = count.saturating_sub(1);
             }
+            // The idempotency entry outlives the job so a late retry replays the
+            // finished stream instead of re-running it (§5.2). The one exception is the
+            // NEX-6.3 consumer-gone orphan: `on_detach` calls `forget_job` right after
+            // this returns, which deletes the record, this timer entry and the key
+            // together, because nobody is left who could replay the answer.
             self.retention_timer.insert((
                 now_ms.saturating_add(self.limits().job_retention_ms),
                 job.clone(),
             ));
-            // The idempotency entry outlives the job so a late retry replays the
-            // finished stream instead of re-running it (§5.2).
             effects.push(Effect::Terminal {
                 job: job.clone(),
                 reason: applied,
@@ -2878,10 +3100,10 @@ impl PoolActor {
             if let Some(worker) = worker {
                 effects.push(Effect::SendWorker {
                     worker,
-                    frame: HubFrame::Cancel {
+                    frame: Box::new(HubFrame::Cancel {
                         job: job.clone(),
                         reason: CancelReason::Deadline,
-                    },
+                    }),
                 });
             }
             let through = self.jobs.get(&job).map(|r| r.seq.acked_through());
@@ -2954,9 +3176,8 @@ impl PoolActor {
                 r.streaming
                     && !r.consumers.is_empty()
                     && matches!(r.phase, JobPhase::Pending | JobPhase::Queued)
-                    && r.last_ping_ms.map_or(true, |last| {
-                        now_ms.saturating_sub(last) >= KEEPALIVE_INTERVAL_MS
-                    })
+                    && r.last_ping_ms
+                        .is_none_or(|last| now_ms.saturating_sub(last) >= KEEPALIVE_INTERVAL_MS)
             })
             .map(|(id, _)| id.clone())
             .collect();
@@ -2987,8 +3208,58 @@ impl PoolActor {
             self.forget_idempotency(&key);
         }
 
-        // 9. Terminal-job retention sweep, which bounds the jobs map (and with it
-        //    the replay rings) on a long-lived hub.
+        // 9. NEX-6.6's cap on a detached task with no subscriber (§9.1 item 3: "cap its
+        //    lifetime while it has no subscriber"). A detached submission is the one
+        //    permitted exception to "no consumer, no task", and until now it was the only
+        //    state in the actor with **no** upper bound while it stayed unclaimed: the
+        //    queue/claim deadlines answer the consumer that is not there, and
+        //    `job_retention_ms` only starts at a terminal state that may never be
+        //    reached. Delete the record and its idempotency entry, releasing the tenant
+        //    slot and the queued prompt with it.
+        //
+        //    **Only while unclaimed** (`Pending`/`Queued`), and that restriction is the
+        //    deliberate half: once a worker holds the lease, GPU work has been committed,
+        //    and killing a job that is 3 minutes into a render because a poller hung up
+        //    would throw away the expensive part to save the cheap part. An attached
+        //    worker is bounded by `job_hard_cap_ms` (step 4) and its terminal record by
+        //    `job_retention_ms` (step 10), so the state is still bounded — just by the
+        //    clock that matches what is actually being spent.
+        //
+        //    `finish_job` is *not* called: nobody is attached, so there is no stream to
+        //    end in band and no `Accepted`-opened body to answer; the record simply stops
+        //    existing, and the `JobForgotten` effect tells the embedder to drop its
+        //    routing entry.
+        let detached_orphan_ttl = self.limits().detached_orphan_ttl_ms;
+        let expired_detached: Vec<JobId> = self
+            .jobs
+            .iter()
+            .filter(|(_, r)| {
+                !r.cancel_on_consumer_gone
+                    && r.consumers.is_empty()
+                    && matches!(r.phase, JobPhase::Pending | JobPhase::Queued)
+                    && r.subscriberless_since
+                        .is_some_and(|since| now_ms.saturating_sub(since) >= detached_orphan_ttl)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for job in expired_detached {
+            // The tenant slot, the queued prompt and the idempotency key are all released
+            // by `forget_job`, which releases the slot exactly for a record that was still
+            // non-terminal (`finish_job` has already released a terminal one).
+            //
+            // No new metric here on purpose: every existing counter means something else
+            // (`jobs_rejected` is pre-acceptance, `jobs_terminal` is a state transition,
+            // `lease_expiries` involves a lease), and this deletion is none of those. It is
+            // observable as `Effect::JobForgotten`, which the server logs, plus the drop in
+            // `nexus_queue_depth` that `refresh_gauges` reports.
+            effects.extend(self.forget_job(&job));
+        }
+
+        // 10. Terminal-job retention sweep, which bounds the jobs map (and with it
+        //     the replay rings) on a long-lived hub. `forget_job` is what actually drops
+        //     the record, so this sweep and the NEX-6.3 orphan path cannot drift apart on
+        //     what "deleted" means: queue entry, payload, lease, idempotency key and the
+        //     `JobForgotten` effect are the same list in both.
         let expired_jobs: Vec<JobId> = self
             .retention_timer
             .iter()
@@ -2996,8 +3267,7 @@ impl PoolActor {
             .map(|(_, job)| job.clone())
             .collect();
         for job in expired_jobs {
-            self.retention_timer.retain(|(_, j)| j != &job);
-            self.jobs.remove(&job);
+            effects.extend(self.forget_job(&job));
         }
 
         self.refresh_gauges();
@@ -3010,18 +3280,18 @@ impl PoolActor {
         for (job, lease) in self.leases.iter() {
             effects.push(Effect::SendWorker {
                 worker: lease.worker.clone(),
-                frame: HubFrame::Cancel {
+                frame: Box::new(HubFrame::Cancel {
                     job: job.clone(),
                     reason: CancelReason::HubShutdown,
-                },
+                }),
             });
         }
         for worker in self.workers.keys() {
             effects.push(Effect::SendWorker {
                 worker: worker.clone(),
-                frame: HubFrame::Bye {
+                frame: Box::new(HubFrame::Bye {
                     reason: ByeReason::Shutdown,
-                },
+                }),
             });
         }
         let mut draining = self.queue.drain();
@@ -3078,6 +3348,28 @@ impl PoolActor {
 
 // ------------------------------------------------------------------ free helpers
 
+/// One accepted worker frame, exactly as [`relay_into`] needs it.
+///
+/// A struct rather than seven positional arguments: these fields are the decoded frame,
+/// they are read-only, and they always travel together. Grouping them leaves the relay
+/// helper's signature describing the two things that genuinely vary per call — the job's
+/// state, and the frame being appended to it.
+struct FrameInput<'a> {
+    /// Worker-assigned sequence number for the job.
+    seq: u64,
+    /// Frame class.
+    kind: FrameKind,
+    /// Verbatim text, copied into the ring untouched (NEX-5.2).
+    text: &'a str,
+    /// Manifest carried by an `artifact_chunk` frame.
+    artifact: Option<&'a crate::protocol::ArtifactManifest>,
+    /// Declared content type, recorded but never interpreted (only the adapters know
+    /// what it means).
+    content_type: Option<&'a str>,
+    /// Hub-side arrival time.
+    now_ms: Timestamp,
+}
+
 /// Append a frame to the job's replay ring, accumulate continuation text, and
 /// decide whether the flush gate is open (§7.2). Returns the events to relay
 /// **now**: empty when the batch is still accumulating.
@@ -3087,13 +3379,19 @@ impl PoolActor {
 fn relay_into(
     record: &mut JobRecord,
     limits: &Limits,
-    seq: u64,
-    kind: FrameKind,
-    text: &str,
-    artifact: Option<&crate::protocol::ArtifactManifest>,
-    content_type: Option<&str>,
-    now_ms: Timestamp,
+    frame: FrameInput<'_>,
 ) -> Vec<ConsumerEvent> {
+    // Destructured once so the body below reads as it always did: every name here is a
+    // field of the frame the caller just handed over.
+    let FrameInput {
+        seq,
+        kind,
+        text,
+        artifact,
+        content_type,
+        now_ms,
+    } = frame;
+
     if record.phase == JobPhase::Assigned {
         record.phase = JobPhase::Streaming;
         if record.timings.first_frame_ms.is_none() {
@@ -3170,6 +3468,14 @@ fn relay_into(
 }
 
 /// Convert one buffered frame into its consumer event.
+///
+/// `#[allow(clippy::expect_used)]` for the `ArtifactChunk` arm only, and it is
+/// infallible by invariant rather than by hope: `validate_worker_frame` rejects an
+/// `artifact_chunk` frame whose manifest is missing (`protocol.rs`, "artifact_chunk
+/// requires an artifact manifest"), so every frame the actor buffered under that kind
+/// carries one. Falling back to a synthetic event instead would invent consumer-visible
+/// content for a case the wire format cannot produce.
+#[allow(clippy::expect_used)]
 fn frame_event(frame: &BufferedFrame) -> ConsumerEvent {
     match frame.kind {
         FrameKind::Delta => ConsumerEvent::Delta {

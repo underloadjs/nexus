@@ -316,8 +316,13 @@ mod tests {
 
     #[test]
     fn pool_tokens_map_to_labels_and_reject_unknown() {
-        let mut auth = AuthConfig::default();
-        auth.worker_tokens = vec!["tok-a".to_string(), "tok-b".to_string()];
+        // Struct-update rather than `default()` then reassignment: the field list
+        // is what the test is about, and `field_reassign_with_default` is a lint
+        // the workspace runs with `-D warnings`.
+        let auth = AuthConfig {
+            worker_tokens: vec!["tok-a".to_string(), "tok-b".to_string()],
+            ..AuthConfig::default()
+        };
         let reg = PoolTokenRegistry::from_config(&auth);
         assert_eq!(reg.len(), 2);
         assert_eq!(reg.verify(Some("tok-a")).expect("ok"), "pool-token-0");
@@ -342,17 +347,21 @@ mod tests {
     #[test]
     fn api_keys_resolve_to_their_tenants_exactly() {
         use crate::config::ApiKeyConfig;
-        let mut auth = AuthConfig::default();
-        auth.api_keys = vec![
-            ApiKeyConfig {
-                key: "sk-1".to_string(),
-                tenant: "acme".to_string(),
-            },
-            ApiKeyConfig {
-                key: "sk-2".to_string(),
-                tenant: "default".to_string(),
-            },
-        ];
+        // Struct-update, not `default()` plus a reassignment (see the pool-token
+        // test above for why the lint exists).
+        let auth = AuthConfig {
+            api_keys: vec![
+                ApiKeyConfig {
+                    key: "sk-1".to_string(),
+                    tenant: "acme".to_string(),
+                },
+                ApiKeyConfig {
+                    key: "sk-2".to_string(),
+                    tenant: "default".to_string(),
+                },
+            ],
+            ..AuthConfig::default()
+        };
         let reg = ApiKeyRegistry::from_config(&auth);
         assert_eq!(
             reg.verify(Some("sk-1")).expect("ok"),

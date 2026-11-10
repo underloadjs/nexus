@@ -14,6 +14,14 @@
 //     delta is `{"type":"delta","seq":1,"text":"…"}`.
 // Everything below reads frames through those discriminators.
 //
+// The effect vocabulary is open-ended, and deliberately read that way here: the core
+// adds a kind when a rule needs one, and the one that arrives now is `JobForgotten` —
+// a detached task with no consumer is deleted once its subscriber-less window closes
+// (NEX-6.6), which is the actor saying this id is unknown from here on, and whose JSON
+// is `{"JobForgotten": {"job": …}}`. Nothing in this file throws on a kind it does not
+// name: `effects` warns about unseen ones, so a core change cannot break the smoke run,
+// and every assertion below names only the kinds it is about.
+//
 // Run: yarn smoke:wasm
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
@@ -118,7 +126,40 @@ function submission(text = "hi", key = "k1", session = null) {
     return JSON.parse(broker.submissionFromChat(JSON.stringify({ model: "qwen38", messages: [{ role: "user", content: text }], stream: true }), "acme", key, session));
 }
 
-const effects = (json) => JSON.parse(json);
+/** The effect kinds this script reads by name. A kind outside the set is not an error:
+ *  the core adds effects when a rule needs a new observable, and a smoke script must not
+ *  be the thing that pins the enum. */
+const KNOWN_EFFECTS = new Set([
+    "Accepted",
+    "Reject",
+    "SendWorker",
+    "Relay",
+    "ReplayTo",
+    "Keepalive",
+    "ReleasePayload",
+    "DeleteArtifact",
+    "Terminal",
+    "JobForgotten",
+    "PayloadBytes",
+    "Snapshot",
+    "Log",
+]);
+/** Kinds already reported, so one surprise prints once instead of per tick. */
+const unseenEffects = new Set();
+
+/** Build the effect list the actor returned, tolerating vocabulary this file predates. */
+function effects(json) {
+    const out = JSON.parse(json);
+    for (const effect of out) {
+        // Externally tagged, so the discriminator is the object's only key.
+        const [kind] = Object.keys(effect);
+        if (!KNOWN_EFFECTS.has(kind) && !unseenEffects.has(kind)) {
+            unseenEffects.add(kind);
+            console.warn(`[smoke] effect kind this file does not name: ${kind}`);
+        }
+    }
+    return out;
+}
 /** Hub frames sent to one worker, with their internal `type` discriminator. */
 const sentTo = (list, worker) => list.filter((e) => e.SendWorker && e.SendWorker.worker === worker).map((e) => e.SendWorker.frame);
 const framesOfType = (list, worker, type) => sentTo(list, worker).filter((f) => f.type === type);

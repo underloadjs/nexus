@@ -234,14 +234,20 @@ fn warm_pool(a: &mut PoolActor, worker: &str, conn: u64, capacity: u32, pool: &s
 }
 
 /// All `Assigned` frames as `(worker, job, attempt)`.
+///
+/// `Effect::SendWorker::frame` is a `Box<HubFrame>` (the effect enum boxes it so a
+/// relay step does not copy ~430 bytes per frame), so every helper matches through
+/// `frame.as_ref()` rather than matching the field directly.
 fn assigned(effects: &[Effect]) -> Vec<(String, String, u32)> {
     effects
         .iter()
         .filter_map(|e| match e {
-            Effect::SendWorker {
-                worker,
-                frame: HubFrame::Assigned { job, attempt, .. },
-            } => Some((worker.to_string(), job.to_string(), *attempt)),
+            Effect::SendWorker { worker, frame } => match frame.as_ref() {
+                HubFrame::Assigned { job, attempt, .. } => {
+                    Some((worker.to_string(), job.to_string(), *attempt))
+                }
+                _ => None,
+            },
             _ => None,
         })
         .collect()
@@ -266,7 +272,7 @@ fn sent_to<'a>(effects: &'a [Effect], worker: &str) -> Vec<&'a HubFrame> {
     effects
         .iter()
         .filter_map(|e| match e {
-            Effect::SendWorker { worker: w, frame } if w.as_ref() == worker => Some(frame),
+            Effect::SendWorker { worker: w, frame } if w.as_ref() == worker => Some(frame.as_ref()),
             _ => None,
         })
         .collect()
@@ -296,6 +302,39 @@ fn terminals(effects: &[Effect]) -> Vec<(String, TerminalReason, bool)> {
                 reason,
                 retryable,
             } => Some((job.to_string(), *reason, *retryable)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Job ids the actor reported as **deleted** (`Effect::JobForgotten`).
+///
+/// NEX-6.3's "the task is then deleted" is only observable through this effect: the
+/// hub's `job_index` and fan-out maps are keyed by job id and the actor is the only
+/// thing that knows a record is gone.
+fn forgotten(effects: &[Effect]) -> Vec<String> {
+    effects
+        .iter()
+        .filter_map(|e| match e {
+            Effect::JobForgotten { job } => Some(job.to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `Effect::Accepted` as `(job, attached, replayed)`.
+///
+/// `attached=false` with an empty replay is the whole difference between "a fresh
+/// execution" and "joined an execution that already has an answer" (§5.2, §9.1).
+fn accepted(effects: &[Effect]) -> Vec<(String, bool, Vec<ConsumerEvent>)> {
+    effects
+        .iter()
+        .filter_map(|e| match e {
+            Effect::Accepted {
+                job,
+                attached,
+                replayed,
+            } => Some((job.to_string(), *attached, replayed.clone())),
             _ => None,
         })
         .collect()
@@ -717,10 +756,11 @@ fn t08_reconnecting_worker_resumes_from_the_acked_seq_without_duplicates() {
     let resumed = welcome
         .iter()
         .find_map(|e| match e {
-            Effect::SendWorker {
-                frame: HubFrame::Welcome { resumed, .. },
-                ..
-            } => Some(resumed.clone()),
+            // `frame` is a `Box<HubFrame>`; match through it.
+            Effect::SendWorker { frame, .. } => match frame.as_ref() {
+                HubFrame::Welcome { resumed, .. } => Some(resumed.clone()),
+                _ => None,
+            },
             _ => None,
         })
         .expect("Welcome lists the resumable jobs");
@@ -2433,9 +2473,416 @@ fn prompt_retention_lapses_by_ttl_and_terminal_retention_bounds_the_job_map() {
     // `terminal_ms + job_retention_ms`), so the record is swept at 20 + 30 000 — the
     // boundary itself, since the sweep takes everything whose deadline is `<= now`.
     let later = b.handle(30_020, ActorMsg::Tick { now_ms: 30_020 });
-    assert!(later.is_empty(), "a retention sweep is silent to consumers");
+    // NEX-6.3's deletion is **reported**, not silent: the hub's `job_index` and relay
+    // maps are keyed by job id, and `Effect::JobForgotten` is the only signal that they
+    // may be pruned. It stays silent to *consumers* — the terminal event went out at
+    // t = 20, and a job that is merely forgotten must not invent a second verdict.
+    assert_eq!(
+        forgotten(&later),
+        vec!["job-r".to_string()],
+        "the retention sweep deletes the record and names it"
+    );
+    assert!(
+        relay_events(&later).is_empty() && terminals(&later).is_empty(),
+        "no consumer-visible event accompanies the deletion"
+    );
     assert!(!b.has_job(&JobId::new_unchecked("job-r")));
     assert_eq!(b.retention_len(), 0);
+}
+
+// ------------------------------------------------ NEX-6.3 / NEX-6.6: who may keep a task
+
+#[test]
+fn a_chat_task_that_loses_its_last_consumer_is_deleted_with_its_cancel() {
+    // NEX-6.3's decisive trace, resolved in code: "the task is then **deleted**: no
+    // queue entry, no lease, no record, no retained stream, no idempotency entry that
+    // will hand the same answer to a later stranger. A task with no attached consumer
+    // has no reason to exist." The question §9.1 item 2 asks — "does the next submission
+    // with the same idempotency key execute fresh, or attach to the dead execution and
+    // replay `job ended: cancelled`?" — is answered **fresh**, in the same mailbox step
+    // as the cancel, because the hub is single-threaded by construction.
+    let mut a = actor();
+    warm(&mut a, "w-a", 1, 4, 0);
+    a.handle(10, submit_msg("job-1", "k1", None));
+    a.handle(20, claim_msg("w-a", 1, 1));
+    assert_eq!(
+        a.leases_len(),
+        1,
+        "w-a holds the job before the socket dies"
+    );
+
+    let gone = a.handle(
+        30,
+        ActorMsg::Detach {
+            job: JobId::new_unchecked("job-1"),
+            consumer: ConsumerId::new_unchecked("con-job-1"),
+        },
+    );
+    // The consumer-visible half is exactly what it was: NEX-6.4's order (worker first),
+    // the terminal event in band.
+    assert!(
+        sent_to(&gone, "w-a").iter().any(|f| matches!(
+            f,
+            HubFrame::Cancel {
+                reason: CancelReason::ConsumerGone,
+                ..
+            }
+        )),
+        "cancel must fan out on disconnect"
+    );
+    assert_eq!(
+        terminals(&gone),
+        vec![("job-1".to_string(), TerminalReason::Cancelled, false)],
+        "the consumer's stream ends in band"
+    );
+    // The deletion half — NEX-6.3's list, in this same step, reported so the embedder's
+    // own job-id maps can go with it.
+    assert_eq!(
+        forgotten(&gone),
+        vec!["job-1".to_string()],
+        "the actor reports the deletion so the hub prunes its routing entry"
+    );
+    assert!(!a.has_job(&JobId::new_unchecked("job-1")), "no record");
+    assert_eq!(a.leases_len(), 0, "no lease");
+    assert_eq!(a.queue_depth(), 0, "no queue entry");
+    assert_eq!(
+        a.retention_len(),
+        0,
+        "no retention entry either: the job is deleted, not retired"
+    );
+    assert!(
+        a.workers()[&WorkerId::new_unchecked("w-a")]
+            .in_flight
+            .is_empty(),
+        "the worker holds no slot for a job that no longer exists"
+    );
+
+    // A frame still in flight from the cancelled worker is refused, never relayed into a
+    // stream nobody watches, and the worker is told to stop producing.
+    let late = a.handle(31, delta_msg("w-a", 1, "job-1", 2, "still producing"));
+    assert!(
+        relay_events(&late).is_empty(),
+        "bytes that arrive after the deletion are refused, not relayed"
+    );
+    assert!(
+        sent_to(&late, "w-a").iter().any(|f| matches!(
+            f,
+            HubFrame::Cancel {
+                reason: CancelReason::LeaseExpired,
+                ..
+            }
+        )),
+        "the refusal tells the worker to stop"
+    );
+    assert_eq!(a.metrics().get("nexus_inband_errors_total"), 1);
+
+    // The decisive half: same idempotency key, new job id, and a **fresh** execution.
+    let retry = a.handle(40, submit_msg("job-2", "k1", None));
+    assert_eq!(
+        accepted(&retry),
+        vec![("job-2".to_string(), false, Vec::new())],
+        "not attached and nothing replayed: the dead execution is not resurrected"
+    );
+    assert_eq!(
+        a.metrics().get("nexus_idempotent_attach_total"),
+        0,
+        "the idempotency entry was deleted with the task, so there was nothing to attach to"
+    );
+    assert_eq!(
+        a.job(&JobId::new_unchecked("job-2"))
+            .expect("the retry exists")
+            .attempt,
+        0,
+        "a brand new execution, not a continuation of the cancelled one"
+    );
+}
+
+#[test]
+fn a_detached_queue_without_a_subscriber_is_capped_by_the_orphan_ttl() {
+    // §9.1 item 3: "a detached job is the one permitted exception [to *no consumer, no
+    // task*]; cap its lifetime while it has no subscriber." The cap is
+    // `detached_orphan_ttl_ms`, and because the actor runs on a virtual clock it is a
+    // `Tick` statement, never a wall-clock sleep.
+    let mut cfg = config();
+    cfg.limits.detached_orphan_ttl_ms = 20_000;
+    // Neither the no-worker grace nor the queue deadline may answer first: the deletion
+    // under test has to be attributable to this cap and to nothing else.
+    cfg.limits.no_worker_grace_ms = 600_000;
+    cfg.limits.claim_deadline_ms = 600_000;
+    let mut a = PoolActor::new(pool(), cfg);
+    // Connected but loading: the job stays queued and nothing dispatches it.
+    a.handle(0, hello_msg("w-load", 1, 4));
+    a.handle(5, claim_msg("w-load", 1, 4));
+    let mut detached = submit_msg_with("job-d", "kd", None, chat_body(&"x".repeat(300)), None);
+    if let ActorMsg::Submit { submission, .. } = &mut detached {
+        // `POST /v1/jobs` semantics (NEX-6.1): this socket is not the owner, so the task
+        // goes on without one.
+        submission.cancel_on_consumer_gone = false;
+    }
+    a.handle(10, detached);
+    assert_eq!(
+        a.queue_depth(),
+        1,
+        "queued, waiting for a worker that is still loading"
+    );
+    assert!(a.has_job(&JobId::new_unchecked("job-d")));
+    // 300 characters of prompt is above the 64 B inline cap, so the queued body is held
+    // by reference and charged to the spill budget: 374 bytes is the serialized
+    // `chat_body` (56 + 300 + 18), and the deletion has to give every byte of it back.
+    assert_eq!(
+        a.payloads().bytes(),
+        374,
+        "the queued prompt occupies spill budget"
+    );
+
+    // The only socket that could ever follow this job closes at t = 20. The task survives
+    // that — §8's "keep it running" — so nothing is deleted yet.
+    let left = a.handle(
+        20,
+        ActorMsg::Detach {
+            job: JobId::new_unchecked("job-d"),
+            consumer: ConsumerId::new_unchecked("con-job-d"),
+        },
+    );
+    assert!(
+        forgotten(&left).is_empty(),
+        "the cap runs from the detach, and 20 - 20 is inside it"
+    );
+    assert_eq!(a.queue_depth(), 1, "NEX-6.6 keeps the queued work alive");
+
+    // One millisecond short of the window and the state is still there: the bound is the
+    // number, not an approximation of it.
+    let before = a.handle(20_019, ActorMsg::Tick { now_ms: 20_019 });
+    assert!(
+        forgotten(&before).is_empty(),
+        "19 999 ms of a 20 000 ms window"
+    );
+    assert!(a.has_job(&JobId::new_unchecked("job-d")));
+
+    // On the boundary the whole state stops existing.
+    let swept = a.handle(20_020, ActorMsg::Tick { now_ms: 20_020 });
+    assert_eq!(forgotten(&swept), vec!["job-d".to_string()]);
+    assert!(!a.has_job(&JobId::new_unchecked("job-d")), "no record");
+    assert_eq!(a.queue_depth(), 0, "no queue entry");
+    assert_eq!(
+        a.retention_len(),
+        0,
+        "and it is not parked in retention either"
+    );
+    assert_eq!(
+        a.payloads().bytes(),
+        0,
+        "the queued prompt's bytes go back to the budget"
+    );
+    assert_eq!(
+        a.metrics().get("nexus_queue_depth"),
+        0,
+        "the published gauge moves with the deletion"
+    );
+
+    // Its idempotency key went with it, so the same key executes fresh: §9.1 item 2's
+    // decisive question, asked of the detached shape this cap exists for. It goes first
+    // because the fresh execution is itself a **live** job: once the capacity probe below
+    // fills the tenant's budget, a new execution would answer 429 and prove nothing about
+    // the key.
+    let retry = a.handle(20_100, submit_msg("job-e", "kd", None));
+    assert_eq!(
+        accepted(&retry),
+        vec![("job-e".to_string(), false, Vec::new())],
+        "the key is free, so a new execution starts instead of an attach"
+    );
+
+    // NEX-7.1's tenant cap is what the deletion gave back. The cap is **4** concurrent
+    // jobs for `acme` and admission is `active < cap`
+    // (`tenant_concurrency_cap_answers_429_and_releases_on_terminal` admits 1..=4 and
+    // 429s on the 5th), so the freed slot is exactly the room `job-e` plus `job-n1..=n3`
+    // now occupy: four live jobs, and the fifth is the cap speaking. Had the deleted
+    // record kept its slot, `job-n3` would already be the 429; had the slot been released
+    // twice, `job-full` would have been admitted as well.
+    for n in 1..=3 {
+        let id = format!("job-n{n}");
+        let effects = a.handle(20_110 + n, submit_msg(&id, &format!("kn{n}"), None));
+        assert_eq!(
+            accepted(&effects),
+            vec![(id.clone(), false, Vec::new())],
+            "{id} must be admitted into the freed capacity"
+        );
+    }
+    assert_eq!(
+        rejects(&a.handle(20_200, submit_msg("job-full", "kfull", None))),
+        vec![(429, "tenant_limit".to_string(), Some(1_000))],
+        "the deleted job gave back exactly one slot, no more"
+    );
+}
+
+#[test]
+fn a_detached_job_with_a_live_lease_outlives_the_orphan_ttl_and_stays_replayable() {
+    // The restriction that makes the cap safe. Once a worker holds the lease, GPU work
+    // has been committed: killing a job 25 s into a render because a poller hung up would
+    // throw away the expensive part to save the bookkeeping. Claimed work is bounded by
+    // `job_hard_cap_ms`, and once terminal by `job_retention_ms` — never by this clock.
+    let mut cfg = config();
+    cfg.limits.detached_orphan_ttl_ms = 20_000;
+    let mut a = PoolActor::new(pool(), cfg);
+    warm(&mut a, "w-a", 1, 4, 0);
+    a.handle(5, claim_msg("w-a", 1, 4));
+    let mut detached = submit_msg("job-c", "kc", None);
+    if let ActorMsg::Submit { submission, .. } = &mut detached {
+        submission.cancel_on_consumer_gone = false;
+    }
+    a.handle(10, detached);
+    assert_eq!(a.leases_len(), 1, "a worker took it straight away");
+
+    let left = a.handle(
+        30,
+        ActorMsg::Detach {
+            job: JobId::new_unchecked("job-c"),
+            consumer: ConsumerId::new_unchecked("con-job-c"),
+        },
+    );
+    assert!(
+        forgotten(&left).is_empty(),
+        "the lease holder is still producing: this is the case the cap must not kill"
+    );
+    assert!(
+        sent_to(&left, "w-a")
+            .iter()
+            .all(|f| !matches!(f, HubFrame::Cancel { .. })),
+        "no Cancel reaches the GPU"
+    );
+    assert_eq!(a.leases_len(), 1, "and it keeps its slot");
+
+    // t = 25 000: past the detached cap, inside the lease (`lease_ms` 60 000) and the
+    // hard cap, so the subscriber-less sweep must leave it alone.
+    let held = a.handle(25_000, ActorMsg::Tick { now_ms: 25_000 });
+    assert!(
+        forgotten(&held).is_empty(),
+        "a claimed job is bounded by `job_hard_cap_ms`, not by the subscriber-less clock"
+    );
+    assert_eq!(
+        a.job(&JobId::new_unchecked("job-c"))
+            .expect("the job is still known")
+            .phase,
+        JobPhase::Assigned,
+        "still owned by w-a"
+    );
+    assert_eq!(a.leases_len(), 1, "the worker keeps its slot");
+
+    // The answer arrives, and the two legitimate clocks take over: the record is retained
+    // for `job_retention_ms`, and a retry with the same key attaches and replays it
+    // instead of re-running the GPU — NEX-7.2's "an answer a retry must not re-run".
+    a.handle(26_000, delta_msg("w-a", 1, "job-c", 1, "a frame"));
+    let done = a.handle(27_000, done_msg("w-a", 1, "job-c", 2, None));
+    assert_eq!(
+        terminals(&done).first().expect("terminal").1,
+        TerminalReason::Completed
+    );
+    assert!(
+        forgotten(&done).is_empty(),
+        "a terminal answer is retained, not deleted"
+    );
+    assert_eq!(
+        a.retention_len(),
+        1,
+        "bounded by retention from the terminal moment"
+    );
+
+    let retry = a.handle(28_000, submit_msg("job-c2", "kc", None));
+    let (job, attached, replayed) = accepted(&retry)
+        .first()
+        .expect("an Accepted effect")
+        .clone();
+    assert_eq!(
+        job, "job-c",
+        "the retry joins the execution that has the answer"
+    );
+    assert!(attached, "and does not start a second execution");
+    assert!(
+        matches!(replayed.last(), Some(ConsumerEvent::Finish { .. })),
+        "the finished stream is replayed to it"
+    );
+    assert_eq!(a.metrics().get("nexus_idempotent_attach_total"), 1);
+
+    // Terminal at 27 000 plus the harness's 30 000 ms retention: 57 000 is the boundary,
+    // and the orphan TTL had nothing to do with any of it.
+    let before = a.handle(56_999, ActorMsg::Tick { now_ms: 56_999 });
+    assert!(forgotten(&before).is_empty(), "one ms short of retention");
+    assert!(a.has_job(&JobId::new_unchecked("job-c")));
+    let later = a.handle(57_000, ActorMsg::Tick { now_ms: 57_000 });
+    assert_eq!(forgotten(&later), vec!["job-c".to_string()]);
+    assert!(!a.has_job(&JobId::new_unchecked("job-c")));
+    assert_eq!(a.retention_len(), 0);
+}
+
+#[test]
+fn memory_only_mode_refuses_a_kind_that_writes_an_artifact_and_admits_the_rest() {
+    // NEX-7.1 / §9.1 item 5: an empty artifact root is the operator's explicit "this
+    // deployment has no scratch disk" opt-out, and bulk artifact egress is the only thing
+    // this hub writes anywhere. A kind whose answer is a file can never be served, so the
+    // refusal happens at **admission**: once the response body is open a clean 4xx is no
+    // longer legal (§7.2), so waiting for the worker's first `PUT` would be too late.
+    let mut a = PoolActor::with_artifact_root(pool(), config(), "");
+    assert!(
+        a.artifacts().root().is_empty(),
+        "an empty root is the mode flag"
+    );
+    warm(&mut a, "w-a", 1, 4, 0);
+    a.handle(5, claim_msg("w-a", 1, 4));
+
+    // `notify.webhook` is the reference config's non-streaming kind on this pool: its
+    // answer is an artifact, which is exactly the pair the mode cannot serve.
+    let mut webhook = submit_msg("job-w", "kw", None);
+    if let ActorMsg::Submit { submission, .. } = &mut webhook {
+        submission.kind = "notify.webhook".to_string();
+        submission.streaming = false;
+        submission.idempotent = false;
+        submission.requires = Requires::default();
+    }
+    let refused = a.handle(10, webhook);
+    assert_eq!(
+        rejects(&refused),
+        vec![(400, "artifact_unavailable".to_string(), None)],
+        "refused before any body byte, with the reason the operator can act on"
+    );
+    assert!(
+        !a.has_job(&JobId::new_unchecked("job-w")),
+        "refused before the record existed"
+    );
+    assert_eq!(a.queue_depth(), 0, "and before the queue was touched");
+    assert_eq!(
+        a.metrics()
+            .get("nexus_jobs_rejected_total{reason=\"artifact_unavailable\"}"),
+        1,
+        "the refusal is counted under its own reason"
+    );
+
+    // A streaming kind answers on the response body, so the same mode still serves it:
+    // the rule is about artifact output, not about disk in general.
+    let ok = a.handle(11, submit_msg("job-s", "ks", None));
+    assert_eq!(
+        accepted(&ok),
+        vec![("job-s".to_string(), false, Vec::new())],
+        "a streaming kind needs no scratch disk"
+    );
+    assert!(a.has_job(&JobId::new_unchecked("job-s")));
+
+    // And a hub with the default root admits the artifact kind normally, which is the
+    // half that keeps `PoolActor::new` deployments untouched.
+    let mut d = actor();
+    warm(&mut d, "w-a", 1, 4, 0);
+    d.handle(5, claim_msg("w-a", 1, 4));
+    let mut second = submit_msg("job-w2", "kw2", None);
+    if let ActorMsg::Submit { submission, .. } = &mut second {
+        submission.kind = "notify.webhook".to_string();
+        submission.streaming = false;
+        submission.idempotent = false;
+        submission.requires = Requires::default();
+    }
+    assert_eq!(
+        accepted(&d.handle(10, second)),
+        vec![("job-w2".to_string(), false, Vec::new())],
+        "with a root configured, nothing about admission changes"
+    );
 }
 
 #[test]

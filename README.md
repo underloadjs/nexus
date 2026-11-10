@@ -12,8 +12,8 @@ no JS/TS application logic — the only JavaScript is generated `wasm-bindgen` g
 
 ```text
 consumer ──POST /v1/chat/completions (SSE)──▶┌───────────────┐◀──one persistent WS──▶ worker A (Strata, 4 slots)
-consumer ──POST /v1/jobs (artifact)      ──▶│  nexus hub    │◀──one persistent WS──▶ worker B (ComfyUI, 1 slot)
-                                             │ axum + tokio  │
+consumer ──GET /v1/consumer (WS)          ──▶│  nexus hub    │◀──one persistent WS──▶ worker B (ComfyUI, 1 slot)
+consumer ──POST /v1/jobs (artifact)       ──▶│ axum + tokio  │
                                              └───────────────┘
                           one actor per pool owns the queue, leases and jobs
 ```
@@ -23,8 +23,8 @@ consumer ──POST /v1/jobs (artifact)      ──▶│  nexus hub    │◀�
 | Path | What it is |
 | --- | --- |
 | `crates/nexus-core` | The spine: `protocol`, `actor` (pool_actor), `queue` (trait + in-memory), `relay`, `adapters`, `store`, `scheduler`, `auth`, `seq`, `metrics`, `limits`, `config`. Synchronous, IO-free, compiles for native **and** `wasm32-unknown-unknown`. |
-| `crates/nexus-server` | Native runtime: axum + tokio, worker WebSocket, consumer SSE, artifact spill to disk, metrics, graceful drain. Not wasm-buildable (tokio IO/time drivers do not exist there). |
-| `crates/nexus-server/src/runtime_e2e.rs` | Runtime tests: a real listener, a real worker WebSocket, real SSE/JSON responses (`§16.5`, `§16.6`, `§16.14`, `§9` tenancy, `/metrics` shape). A unit-test module of the bin, because this crate has no library target. These now **run and pass** — all 12, against real loopback sockets, a real WebSocket handshake and real SSE bytes; see *Verification status*. |
+| `crates/nexus-server` | Native runtime: axum + tokio, worker WebSocket, **consumer WebSocket (`/v1/consumer`)** and consumer SSE, artifact spill to disk, metrics, graceful drain. Not wasm-buildable (tokio IO/time drivers do not exist there). |
+| `crates/nexus-server/src/runtime_e2e.rs` | Runtime tests: a real listener, a real worker WebSocket, real SSE/JSON responses and real consumer-WebSocket frames (`§16.5`, `§16.6`, `§16.7`, `§16.14`, `§9` tenancy, `/metrics` shape). A unit-test module of the bin, because this crate has no library target. These **run and pass** — all 19, against real loopback sockets, real WebSocket handshakes and real SSE bytes; see *Verification status*. |
 | `crates/nexus-wasm` | The **same** `PoolActor` re-exported to Node/browser via `wasm-bindgen`. |
 | `crates/nexus-worker-example` | Rust worker client that dials out and fronts a loopback engine (task §12). |
 | `examples/node-smoke.mjs` | Node smoke test that drives the WASM actor and asserts broker behaviour end-to-end. |
@@ -32,30 +32,32 @@ consumer ──POST /v1/jobs (artifact)      ──▶│  nexus hub    │◀�
 
 ## Verification status — read this first
 
-**Compiled and executed on this host, on the pinned toolchain, 2026-11-03.** What is
-actually installed: `rustup 1.29.2`, active toolchain `1.99.1-x86_64-pc-windows-msvc`
-(the `1.99.1` pin in the root `rust-toolchain.toml`), `rustc 1.99.1 (58cf8f9c3)`,
-`cargo 1.99.1 (5f94df478)`, installed targets `x86_64-pc-windows-msvc` and
-`wasm32-unknown-unknown`. **`wasm-bindgen` / `wasm-bindgen-cli` / `wasm-pack` /
-`wasm-opt` are still absent from `PATH`** (checked against `PATH`, `~/.cargo/bin` and
-every `~/.rustup/toolchains/*/bin`), and that is the only remaining toolchain gap.
+**Compiled and executed on this host, on the pinned toolchain, 2026-11-10.** What is
+actually installed: active toolchain `1.99.1` (the pin in the root `rust-toolchain.toml`),
+`rustc 1.99.1`, `cargo 1.99.1`, with `rustfmt` and `clippy` as declared components and
+`wasm32-unknown-unknown` as a declared target. **`wasm-bindgen` / `wasm-bindgen-cli` /
+`wasm-pack` / `wasm-opt` remain absent from `PATH`**, and that is still the only toolchain
+gap — it is why the last two rows below are blocked rather than green. (The 2026-11-03
+row set, run on Windows/MSVC with the same pinned toolchain, is superseded by this one;
+the environment notes under the table describe that earlier pass.)
 
 Everything below was run from `packages/underload/nexus` with the repo-root
-`.cargo/config.toml` in force (`target-dir = .rust/target`, and `TMP`/`TEMP`/`TMPDIR`
-= `Temp/rust` for every child process). Exit codes are the command's own.
+`.cargo/config.toml` in force (`target-dir = .rust/target`). Exit codes are the
+command's own. The whole set also reproduces from a **pristine copy with a fresh target
+directory and `--locked`**, so nothing here depends on an incremental build.
 
 | Command | Result |
 | --- | --- |
-| `cargo fmt --all` → `cargo fmt --all -- --check` | **clean and idempotent** (the check is exit 0 after the format pass) |
+| `cargo fmt --all -- --check` | **clean** (exit 0) |
 | `cargo check --workspace --all-targets` | **ok**, 0 errors, 0 warnings |
-| `cargo test --workspace --no-fail-fast` | **exit 0 — 128 passed / 0 failed**: `nexus-core` lib 74/74, `crates/nexus-core/tests/acceptance.rs` **42/42**, `nexus-server` bin (unit + `runtime_e2e`) **12/12**, `nexus-wasm` 0 tests, `nexus-worker-example` 0 tests, doc-tests 0 |
-| `cargo clippy --workspace --all-targets` | **exit 0** at the lint levels the workspace configures (`unwrap_used`/`expect_used` = `warn`): every crate is linted, and the run reports 17 findings in `nexus-core`, 22 in `nexus-server` and 2 in `nexus-wasm` — all on lines this pass did not touch |
-| `cargo clippy --workspace --all-targets -- -D warnings` (what `yarn clippy` runs) | **fails**: 17 denials, every one pre-existing `nexus-core` lint (`expect_used`, `field_reassign_with_default`, `too_many_arguments`, `unnecessary_map_or`, `large_enum_variant`, `derivable_impls`, `manual_clamp`, `useless_format`, `bool_comparison`). Because the crate fails to compile under `-D`, `nexus-server`, `nexus-wasm` and `nexus-worker-example` are never reached by **this** variant, and `yarn verify` therefore stops before `yarn test` |
-| `cargo build --workspace --release` | **ok** → `.rust/target/release/nexus-hub.exe` 2,796,544 bytes and `nexus-worker-example.exe` 785,920 bytes (fat LTO, `panic = abort`, symbols stripped) |
-| `cargo build --release --target wasm32-unknown-unknown -p nexus-wasm` | **ok** → `.rust/target/wasm32-unknown-unknown/release/nexus_wasm.wasm`, 984,056 bytes; Node's `WebAssembly.compile` accepts it — 112 exports (16 `nexusbroker_*` entry points + `memory`), 6 imports, all from the two `__wbindgen_*` shim modules the glue would supply |
+| `cargo test --workspace` | **exit 0 — 163 passed / 0 failed**: `nexus-core` lib **86/86**, `crates/nexus-core/tests/acceptance.rs` **46/46**, `nexus-server` bin **31/31** (19 `runtime_e2e` + 7 `io::tests` + 5 `state::tests`), `nexus-wasm` 0 tests, `nexus-worker-example` 0 tests, doc-tests 0 |
+| `cargo clippy --workspace --all-targets` | **exit 0**, every crate linted |
+| `cargo clippy --workspace --all-targets -- -D warnings` (what `yarn clippy` runs) | **exit 0 — zero findings**. The 17 pre-existing `nexus-core` lints this row used to record are gone, so `yarn verify` no longer aborts before `yarn test` |
+| `cargo build --release -p nexus-server` | **ok** → `.rust/target/release/nexus-hub`, 3 403 096 bytes (3.25 MiB), a stripped ELF executable (fat LTO, `panic = abort`, symbols stripped) |
+| `cargo check -p nexus-wasm --target wasm32-unknown-unknown` | **ok** — the spine still compiles for the wasm target |
 | `node --check scripts/build-wasm.mjs`, `node --check examples/node-smoke.mjs` | **ok** — syntax only; the two scripts are unchanged in this pass |
 | `node scripts/build-wasm.mjs` | **blocked**: exits 1 — `wasm-bindgen is not on PATH … cargo install wasm-bindgen-cli --locked --version 0.2.130` (the version is read from `Cargo.lock`) |
-| `node examples/node-smoke.mjs` | **blocked**: exits 2 — `[smoke] missing …\pkg\nexus_wasm.js`, because the glue step above could not run, so its 11 assertion blocks have still never executed |
+| `node examples/node-smoke.mjs` | **blocked**: exits 2 — `[smoke] missing …\pkg\nexus_wasm.js`, because the glue step above cannot run, so its assertion blocks have still never executed |
 
 Two environment notes, because they will bite the next person:
 
@@ -71,9 +73,8 @@ Two environment notes, because they will bite the next person:
 
 The suite is green, so "covered" means *a test asserts it and that test passed on this
 host*. What is still unproven is listed in *Known gaps* rather than averaged away: the
-wasm glue and the Node smoke test that consumes it (a missing tool, not a code gap),
-the `clippy -D warnings` variant `yarn clippy` runs, and every §14 latency number
-(nothing has been benchmarked).
+wasm glue and the Node smoke test that consumes it (a missing tool, not a code gap), and
+every §14 latency number (nothing has been benchmarked).
 
 The compile pass itself fixed roughly forty defects that a read-only review cannot
 catch. The classes, so the shape of the work is visible without re-reading the diff:
@@ -144,11 +145,11 @@ corrects what this README previously guessed. Read it as: *which side was wrong*
 
 Outstanding work, in order: install `wasm-bindgen-cli` at the locked version
 (`cargo install wasm-bindgen-cli --locked --version 0.2.130`) so `yarn wasm:glue`,
-`yarn build:wasm` and `yarn smoke:wasm` can run — the wasm artifact itself builds and
-validates; settle the 17 pre-existing `nexus-core` lints that
-`cargo clippy -- -D warnings` denies (or move `yarn clippy` back to the levels the
-workspace lints actually configure), since that is the step `yarn verify` stops on; and
-take §14's latency numbers by running the hub, which nobody has done yet.
+`yarn build:wasm` and `yarn smoke:wasm` can run — the wasm crate compiles for the target
+and the artifact itself builds; only the glue step and the Node smoke on top of it are
+missing a tool; and take §14's latency numbers by running the hub, which nobody has done
+yet. The `clippy -D warnings` step that used to sit between those two is green and no
+longer blocks `yarn verify`.
 
 No performance claim is made anywhere in this README that has not been measured by
 a human running the binary; §14's 30–60 ms is the task's own budget, restated, and
@@ -173,6 +174,25 @@ curl -N localhost:8085/v1/chat/completions \
   -d '{"model":"qwen38","messages":[{"role":"user","content":"hi"}],"stream":true}'
 ```
 
+### Routes
+
+Everything the hub listens for, as registered in `crates/nexus-server/src/main.rs:114-145`.
+The frame vocabulary and the body shapes are the specification's §7
+(`documents/specifications/hub-specification.md`).
+
+| Route | Who | Notes |
+| --- | --- | --- |
+| `GET /v1/worker` (WS) | supplier | The one dial-out socket: `Hello`/`Ready`/`Claim`/`Frame`/`Done`/`Resume` in, `Welcome`/`Assigned`/`Ack`/`Cancel`/`Reject`/`ResumeNack`/`Bye` out. Pool token. |
+| **`GET /v1/consumer` (WS)** | consumer | **New.** NEX-3's face: `submit`/`attach`/`detach`/`cancel` as JSON text messages, and `accepted`/`rejected` then tagged `meta`/`delta`/`event`/`log`/`artifact`/`finish`/`error`/`gap`/`replay` plus exactly one `end {job, reason}` per task out — several tasks multiplexed on one socket. The API key is checked **before** the upgrade: a bad key is a plain `401` with `www-authenticate: Bearer realm="nexus"`, never a socket that opens and then closes. |
+| `POST /v1/chat/completions`, `POST /v1/completions` | consumer | OpenAI-shaped; the SSE response body **is** the stream, on the connection it was posted on. Unchanged, and no `detach` field: the response body is the subscription. |
+| `POST /v1/jobs` | consumer | **Changed, breaking.** `202` + `Location`. The body must now carry `"detach": true`; absent or `false` is `400 detach_required` (`consumer.rs:514-522`), because this route answers and hangs up, so it cannot honour the coupled contract. |
+| **`GET /v1/jobs`** | consumer | **New.** Lists the jobs this hub currently holds a live relay for, filtered to the calling tenant. |
+| **`GET /v1/jobs/{id}`** | consumer | **New.** One job's status, tenant-checked (a foreign job is `404`). |
+| `GET /v1/jobs/{id}/events` (SSE), `GET /v1/jobs/{id}/result` | consumer | Follow a detached job's stream with `Last-Event-ID` replay; fetch its result (`?from=&to=` ranges). |
+| `DELETE /v1/jobs/{id}` | consumer | Explicit cancel; the record keeps its normal terminal retention, unlike a lost connection. |
+| `GET /v1/models`, `GET /healthz`, `GET /metrics` | consumer / ops | Model list, health, Prometheus exposition. The last two are open on purpose: a load balancer has no API key. |
+| `GET /v1/payloads/{id}`, `GET\|PUT /v1/artifacts/{id}` | supplier / both | Bulk payload fetch, and artifact upload/download with query-parameter ranges and a measured digest. |
+
 ### Configuration
 
 Load order: built-in defaults → `NEXUS_CONFIG_JSON` (replaces everything) → individual
@@ -187,13 +207,15 @@ an empty pool-token set, an empty API-key set, or an empty attestation allowlist
 | `NEXUS_API_KEYS` | — | `secret=tenant` pairs; a bare secret maps to `default`. The tenant must also exist in the config's `tenants` map (only `default` ships in the built-in defaults): `validate()` refuses a key that names an undeclared tenant, so a multi-tenant deployment supplies `NEXUS_CONFIG_JSON`. |
 | `NEXUS_MODEL_SHAS` | — | Attestation allowlist. Seed it from `SHARD_TABLE` in `services/molab/molab-strata-runtime.py:94-99`. |
 | `NEXUS_ALLOW_ANONYMOUS` | `0` | Local smoke only. |
-| `NEXUS_ARTIFACT_ROOT` | `Temp/nexus/artifacts` | Artifact spill directory (repo-root `Temp/`, per root `AGENTS.md`). |
+| `NEXUS_ARTIFACT_ROOT` | `Temp/nexus/artifacts` | Artifact spill directory (repo-root `Temp/`, per root `AGENTS.md`). **Set it to the empty string for memory-only mode**: the hub starts and creates no directory, and a kind whose result must be an artifact is refused at admission with `400 artifact_unavailable` instead of half-running (spec §8.2). |
 | `NEXUS_QUEUE_DEPTH` | `128` | Beyond it: `429`, never an unbounded wait. |
 | `NEXUS_INLINE_PAYLOAD_CAP_BYTES` | `8 MiB` | Above it the prompt travels by `payload_ref`. |
 | `NEXUS_LEASE_MS` / `NEXUS_HEARTBEAT_MS` | `60000` / `20000` | `validate()` requires lease ≥ 2× heartbeat. |
 | `NEXUS_RESUME_GRACE_MS` | `1500` | `0` = strict "expire immediately" (see *Open decisions*). |
 | `NEXUS_NO_WORKER_GRACE_MS` | `2000` | Pre-body grace; then `503 + Retry-After`. |
 | `NEXUS_JOB_HARD_CAP_MS` | `1800000` | Per-job deadline. |
+| `NEXUS_DETACHED_ORPHAN_TTL_MS` | `300000` | **New.** How long a detached (`"detach": true`) job that **nobody has ever watched and nobody has claimed** is kept before it is forgotten with its queue entry, tenant slot and idempotency key. Must be `> 0` — a zero would delete a detached job the instant it was submitted. A job already running is not covered by it; `job_hard_cap_ms` and the lease rules are. |
+| `NEXUS_IDEMPOTENCY_MAX_ENTRIES` / `NEXUS_IDEMPOTENCY_TTL_MS` | `4096` / `600000` | Bounds of the idempotency mirror (both hub-side and actor-side); the TTL must be `> 0` or a duplicate submission would re-run work that is already in flight. Entries also go the moment the job they name is forgotten. |
 | `NEXUS_MAX_CONTINUATIONS` | `0` | Resume-by-continuation (§7.4) is **opt-in**: `0` leaves a mid-stream death terminal, `1` re-runs it once on another worker. |
 | `NEXUS_CONTINUATION_ALLOW_OPAQUE` | `0` | With continuation on, an attempt whose relayed output was **not** reconstructible assistant text (tool-call chunks, or frames interleaved with `event`/`log`/`artifact_chunk`) is still terminal. Set `1` only for a pool whose workers restart cleanly from an arbitrary prefix. |
 | `NEXUS_FLUSH_INTERVAL_MS` / `NEXUS_FLUSH_BYTES` | `75` / `1536` | Outbound SSE batching window (task §7.2). |
@@ -231,9 +253,15 @@ the shared frame codec.
 
 ## Module boundaries (task §13) and how promises are kept
 
-* **`protocol`** — frame vocabulary (`Hello/Ready/Claim/Frame/Done/Cancel/Resume`,
-  `Welcome/Assigned/Ack/Reject/ResumeNack/Bye`), integer version negotiation
-  (mismatch = clean reject + close), the JSON-lines codec with per-direction size caps,
+* **`protocol`** — frame vocabulary, both directions: supplier
+  (`Hello/Ready/Claim/Frame/Done/Cancel/Resume` in,
+  `Welcome/Assigned/Ack/Reject/ResumeNack/Bye` out) and consumer
+  (`ConsumerFrame::Submit/Attach/Detach/Cancel` in, `HubConsumerFrame`'s
+  `Accepted/Rejected/meta/delta/event/log/artifact/finish/error/gap/replay/End` out, with
+  `EndReason` naming why a stream closed), integer version negotiation
+  (mismatch = clean reject + close), the wire codec — JSON lines for the worker direction,
+  one JSON object per WebSocket text message for the consumer direction — with
+  per-direction size caps (`decode_consumer_frame`, `protocol.rs:954`),
   and semantic validation of untrusted input (id alphabet, capacity ≥ 1, artifact
   frames must carry a manifest).
 * **`actor` (`pool_actor`)** — the only mutator. Claim semantics are defined as
@@ -282,7 +310,12 @@ the shared frame codec.
 7. **Multi-consumer fan-out** — in scope, read-only: several consumers may attach to the
    same job (each gets the live stream, joiners get a replay), but `n>1` sampling (one
    submission executed N times) is **deferred**: it would need a fan-out/selection policy
-   the task does not specify.
+   the task does not specify. Two joins no longer race each other: a joiner **borrows** the
+   relay that belongs to the job rather than owning one, so its request ending must not
+   prune the map entry — removing it while the original submission's pump is still attached
+   would move the fan-out to a fresh relay under a live stream and silence the first
+   consumer's deltas (`prune_relay`, `consumer.rs:374-385`, honoured at `:451`; pinned by
+   `a_non_streaming_retry_on_a_key_assembles_the_running_answer`).
 8. **Worker client location** — in-repo reference is `crates/nexus-worker-example` (Rust,
    because this package keeps application logic in Rust). A per-host client beside the
    engine it fronts (`services/molab/`-style, one Python cell) is the deployment shape for
@@ -378,6 +411,11 @@ Two documented deviations from a literal reading of the task:
   never written to disk. Deltas live in a bounded ring per job. Artifacts go to disk
   streamed, TTL `artifact_ttl_ms` (600 s), digest and size measured by the hub — a worker's
   declared digest that disagrees with the measurement is surfaced in band, not trusted.
+  A deployment with no scratch disk sets `NEXUS_ARTIFACT_ROOT=""` and runs memory-only: no
+  directory is created and a kind that would have to write is refused at admission with
+  `400 artifact_unavailable` (spec §8.2). The idempotency tables are the only other
+  keyed state on the hub — 4 096 entries / 600 s, and dropped the moment the job they name
+  is forgotten, so an entry is a dedupe pointer rather than a cached answer.
 * **Path safety**: job/artifact ids are restricted to `[A-Za-z0-9._-]{1,64}` with no
   leading/trailing dot, and artifact paths are built through `artifact_path_checked`, so a
   `../` cannot escape the root.
@@ -390,12 +428,14 @@ Two documented deviations from a literal reading of the task:
 Two words carry precise meaning in this table:
 
 * **core** — `crates/nexus-core/tests/acceptance.rs` asserts the actor's decision
-  with injected time. That file has been **run and is green** (42/42), so "core" now
+  with injected time. That file has been **run and is green** (46/46), so "core" now
   means "a test states the exact expected value *and that value was observed*";
 * **runtime** — the behaviour needs the native handlers (`crates/nexus-server`)
-  and a live socket. Since the review pass these are asserted by
-  `crates/nexus-server/src/runtime_e2e.rs` (real listener, real worker WebSocket,
-  real SSE bytes) — **also run and green** (12/12, including the six `io::tests`).
+  and a live socket. These are asserted by
+  `crates/nexus-server/src/runtime_e2e.rs` (real listener, real worker WebSocket, real
+  SSE bytes and real consumer-WebSocket frames) — **also run and green**, as is the rest
+  of the bin's **31**: 19 `runtime_e2e`, 7 `io::tests` against real files, 5
+  `state::tests`.
 
 | # | Requirement | Status | Where |
 | --- | --- | --- | --- |
@@ -405,7 +445,7 @@ Two words carry precise meaning in this table:
 | 4 | Worker killed after bytes: in-band error, one finish, no duplicate deltas | **core** | `t04_worker_killed_after_output_terminates_in_band_with_one_finish` |
 | 5 | Consumer disconnect → worker receives `Cancel`, slot freed on ack | **core**; at runtime the decision existed but nothing ever sent `Detach`, so the chat surface could not satisfy this at all. Fixed: both pumps send `Detach` when the body ends, and `runtime_e2e::consumer_disconnect_reaches_the_worker_as_cancel` drives it over a real socket. Ownership is now the **subscription's** flag, not the wire format: `JobRecord::cancel_on_consumer_gone` (copied from the submission) decides in `on_detach`, so a poll-later job survives its `GET /v1/jobs/{id}/events` watcher hanging up | `t05_consumer_disconnect_cancels_the_worker_immediately`, `an_async_job_survives_its_events_watcher_disconnecting` + runtime e2e |
 | 6 | Zero ready workers at submit: `503 + Retry-After` before any body bytes | **core**; **runtime asserted** (a connected-but-loading worker, real 503, JSON content type, `Retry-After` present) | `t06_no_ready_worker_answers_503_with_retry_after_before_any_body`, `t06b`, `t06c` + `runtime_e2e::loading_worker_answers_503_with_retry_after_before_any_body` |
-| 7 | Duplicate idempotency key while in flight: one execution, second client joins/replays | **core**; the runtime's join path previously **dropped** the replay (the dispatcher's private replay queue was only wired to `/v1/jobs/{id}/events`, never to the OpenAI surface), so the second chat client saw only later deltas. Fixed in `submit`, which installs the queue before the actor is told | `t07_duplicate_idempotency_key_attaches_and_replays_never_reruns` |
+| 7 | Duplicate idempotency key while in flight: one execution, second client joins/replays | **core** and **runtime**. The key is now resolved **before** any id is minted: both consumer faces look it up in the hub's own mirror (`Hub::idempotency`, `state.rs:237-259`, read by `idempotency_target` `:473`) and, on a hit, **follow the job that already exists** — `join_existing_job` (`consumer.rs:1251`) on HTTP, `handle_attach` (`consumer_ws.rs:533`) on the socket — rather than submitting a second execution and hoping the actor's duplicate branch reaches them. What this row used to claim ("fixed in `submit`, which installs the queue before the actor is told") described a mechanism that did not hold at runtime: the actor replays under the **original** job id, which is not the id a fresh submission would have registered its own relay and verdict gate under, so the second chat client saw only the later deltas and its retry could time out as `503 hub_unavailable` while the original's replay was being dropped. Deciding on the face removes the id mismatch instead of racing it; the mirror is bounded and TTL'd, and is pruned the moment the actor forgets the job (`state.rs:1065-1082`), so it is a dedupe table and not a result cache (spec §8.1.6) | `t07_duplicate_idempotency_key_attaches_and_replays_never_reruns`, plus `a_retry_on_an_idempotency_key_replays_the_original_completion` (`runtime_e2e.rs:1783`), `a_retry_on_an_idempotency_key_gets_the_task_that_already_exists` (`:1903`), `a_resubmitted_key_on_the_consumer_socket_follows_the_original_task` (`:1996`) and `a_non_streaming_retry_on_a_key_assembles_the_running_answer` (`:2120`) |
 | 8 | Reconnecting worker resumes from the last acked `seq`, no re-run, no duplicate deltas | **core** | `t08_reconnecting_worker_resumes_from_the_acked_seq_without_duplicates`, `resume_for_a_moved_or_finished_lease_is_nacked` |
 | 9 | Consumer reconnect with `Last-Event-ID`: replay with no gap | **core**; runtime: the job API had the plumbing, the chat surface had none (a chat reconnect always allocates a new job, so `Last-Event-ID` was ignored) — the join case is now covered by row 7's fix, an in-place chat resume is still not implemented | `t09_consumer_reconnect_with_last_event_id_replays_without_a_gap` |
 | 10 | Unsatisfiable capability → immediate `400` | **core** | `t10_unsatisfiable_capability_is_an_immediate_400`, `t06c` |
@@ -413,7 +453,7 @@ Two words carry precise meaning in this table:
 | 12 | Declared capacity respected (4 and 1 slot) | **core**, **WASM-asserted** (same actor, Node host) | `t12_declared_capacity_is_respected_per_worker`, `t12b_a_one_slot_worker_takes_exactly_one_job` |
 | 13 | Off-allowlist SHA cannot join | **core**, **WASM-asserted** (+ version and capability-floor rejects) | `t13_attestation_outside_the_allowlist_cannot_join_the_pool`, `t13b`, `t13c` |
 | 14 | Tool-call/reasoning deltas and `usage` survive verbatim | **core**; **runtime asserted** for byte-for-byte relay over real SSE (one chunk in, the same chunk out, one `[DONE]`) | `t14_tool_call_reasoning_and_usage_survive_the_relay_verbatim` + `runtime_e2e::worker_relay_reaches_the_consumer_verbatim_over_sse` |
-| 15 | Tens-of-MB artifact: RSS flat, resumable download with valid sha256 | **partly core**: chunk accounting, measured-digest verification, size mismatch and foreign-writer refusal. **Runtime**: the download is a **streamed** range — seek + bounded 64 KiB reads through a 4-deep channel, never a whole-object buffer — with `416` for unsatisfiable ranges, an on-disk length check before the status is committed, and a whole-object digest verification that aborts the body on mismatch. Chunk-cap enforcement and attempt-scoped parts came from the review pass. Asserted by `io::tests` (6 tests, real files under the repo-root `Temp/nexus-tests/` scratch directory, body drained chunk by chunk); **RSS itself has never been measured** | `t15_artifact_upload_is_measured_not_trusted_and_survives_a_resume` + `io::tests::full_object_read_streams_bounded_chunks_and_verifies_the_digest`, `partial_range_streams_only_the_requested_slice`, `unsatisfiable_ranges_answer_416_before_any_byte_is_committed`, `a_recorded_size_beyond_the_stored_object_is_refused`, `a_digest_mismatch_aborts_the_body` |
+| 15 | Tens-of-MB artifact: RSS flat, resumable download with valid sha256 | **partly core**: chunk accounting, measured-digest verification, size mismatch and foreign-writer refusal. **Runtime**: the download is a **streamed** range — seek + bounded 64 KiB reads through a 4-deep channel, never a whole-object buffer — with `416` for unsatisfiable ranges, an on-disk length check before the status is committed, and a whole-object digest verification that aborts the body on mismatch. Chunk-cap enforcement and attempt-scoped parts came from the review pass. Asserted by `io::tests` (7 tests, real files under the repo-root `Temp/nexus-tests/` scratch directory, body drained chunk by chunk; the ingest half pins the append-only staging file, the streaming digest and the publish-by-rename); **RSS itself has never been measured** | `t15_artifact_upload_is_measured_not_trusted_and_survives_a_resume` + `io::tests::full_object_read_streams_bounded_chunks_and_verifies_the_digest`, `partial_range_streams_only_the_requested_slice`, `unsatisfiable_ranges_answer_416_before_any_byte_is_committed`, `a_recorded_size_beyond_the_stored_object_is_refused`, `a_digest_mismatch_aborts_the_body` |
 | 16 | Above-cap payload travels by `payload_ref` and is fetched | **core** (ref descriptor, in-memory bytes, owner/attempt/token/TTL authorization, release on terminal). The review pass fixed the byte accounting: `PayloadBook::register` double-counted every re-dispatch, which both inflated the spill budget and made the entry cap reject an ordinary renewal | `t16_large_payload_travels_by_reference_and_is_fetchable_by_its_owner`, `prompt_retention_lapses_by_ttl_and_terminal_retention_bounds_the_job_map` |
 | 17 | `stream: false` returns the same content as streamed | **core** (assembly equals concatenation); runtime: the aggregate path used to subscribe *after* the verdict, so early deltas could be missed — fixed by subscribing before `Submit` | `t17_non_streaming_response_carries_the_same_content_as_the_stream` |
 | 18 | Hub restart: clean retryable failure; work resumes with workers reconnecting | **core** for the actor contract. The review pass added the in-band retryable `Error` relay on `Shutdown` and on queue/dispatch timeout: a `Terminal` effect is invisible to the SSE pumps, so before that a draining hub left every open stream hanging | `t18_hub_shutdown_fails_clients_retryably_and_a_fresh_hub_resumes` |
@@ -426,12 +466,15 @@ reporting, keepalive pings, session affinity (and its invalidation on worker dea
 resume-by-continuation on/off **and its refusal of opaque tool-call output**, detached
 jobs surviving an events-watcher disconnect, and TTL/retention sweeps.
 
-The review passes also added the runtime and I/O coverage the package shipped without:
-`nexus-server`'s `runtime_e2e` module (4 tests: real listener, real worker socket, real
-SSE), `io.rs`'s download module (6 tests: chunked streaming, exact slices, `416`,
-length/digest refusal), and `state.rs`'s two unit tests (label merging, the stalled-
-connection report). Every one of them is written against the real types and **none has
-been executed**.
+The review passes also added the runtime and I/O coverage the package shipped without, and
+all of it has been executed since: `nexus-server`'s `runtime_e2e` module (**19** tests —
+real listener, real worker socket, real SSE, and now real consumer-WebSocket traffic for
+the NEX-3 face and §16.7), `io.rs`'s download-and-ingest module (**7** tests: chunked
+streaming, exact slices, `416`, length/digest refusal, and staged ingest finalising by
+rename), and `state.rs`'s **5** unit tests (label merging, the stalled-connection report,
+the `JobForgotten` pruning of `job_index` and the relays, the idempotency mirror's bound
+and expiry, and the routing index holding only the jobs the actor still knows).
+Every one of them is written against the real types, and **163/163 pass** on this host.
 
 ## Commands
 
@@ -454,24 +497,21 @@ child process cargo spawns, which is the root `AGENTS.md` scratch rule.
 
 **Blocking, and not fixable from here:**
 
-* **the Node glue cannot be generated on this host.** The wasm module itself builds
-  (`yarn wasm` → `.rust/target/wasm32-unknown-unknown/release/nexus_wasm.wasm`,
-  984,056 bytes, accepted by Node's `WebAssembly.compile` with the repo's
-  `+simd128` rustflags), but `wasm-bindgen`/`wasm-bindgen-cli` are not installed,
-  so `yarn wasm:glue` — and with it `yarn smoke:wasm` — cannot run. `scripts/build-wasm.mjs`
-  now fails with the exact version `Cargo.lock` pins:
-  `cargo install wasm-bindgen-cli --locked --version 0.2.130`. Installing it is a
-  host change, which this pass was scoped not to make.
-* **`yarn verify` stops before the tests.** `yarn clippy` is `cargo clippy --workspace
-  --all-targets -- -D warnings`, and 17 pre-existing `nexus-core` findings are denied by
-  that flag, so the script chain aborts even though the configured lint levels
-  (`unwrap_used`/`expect_used` = `warn`, which is what `cargo clippy --workspace
-  --all-targets` uses) pass with exit 0. Either the findings get cleaned up or the
-  script drops `-D warnings`; neither is a behaviour change, and neither was done here
-  because it would touch ~17 unrelated lines while the tests were the thing in flight.
-* **the suite is green on this host, and only on this host.** 128/128 with the pinned
-  `1.99.1` MSVC toolchain; the wasm smoke test and §14's latency budgets remain
-  unmeasured, so nothing in this README claims them.
+* **the Node glue cannot be generated on this host.** `wasm-bindgen`/`wasm-bindgen-cli`
+  are still not installed, so `yarn wasm:glue` — and with it `yarn smoke:wasm` — cannot
+  run, `pkg/` has never existed here, and the smoke test's assertion blocks remain
+  unexecuted. `scripts/build-wasm.mjs` fails with the exact version `Cargo.lock` pins:
+  `cargo install wasm-bindgen-cli --locked --version 0.2.130`. What this host does verify
+  is that the crate compiles for the target (`cargo check -p nexus-wasm --target
+  wasm32-unknown-unknown` → ok). The `.wasm` artifact itself, its 984 056-byte size and
+  its `WebAssembly.compile` validation are the **2026-11-03** result: the release wasm was
+  not rebuilt here during the remediation pass, and nothing in this README claims it was.
+  Installing the CLI is a host change, which this pass was scoped not to make.
+* **the suite is green on this host, and on a clean copy of it.** **163/163** with the
+  pinned `1.99.1` toolchain, reproduced from a pristine copy with a fresh target directory
+  and `--locked` — so it is no longer a single-host, single-incremental-build result. The
+  wasm smoke test and §14's latency budgets remain unmeasured, so nothing in this README
+  claims them.
 
 **Resolved since the first draft of this package:**
 
@@ -482,6 +522,67 @@ child process cargo spawns, which is the root `AGENTS.md` scratch rule.
   `wasm-bindgen 0.2.130`, `sha2 0.10.9`, `serde 1.0.229`.
 * `cargo check --workspace --all-targets` and a release build now pass; the sources
   have been through `rustfmt`.
+* **`yarn verify` no longer stops before the tests.** It used to abort on `yarn clippy`,
+  because 17 pre-existing `nexus-core` findings were denied by `-D warnings`. All 17 are
+  settled: `cargo clippy --workspace --all-targets -- -D warnings` is exit 0 with **zero**
+  findings, so the chain reaches `yarn test`.
+
+**Resolved by the conformance pass (2026-11-10), item by item against the specification's
+§9.1** (`documents/specifications/hub-specification.md`):
+
+* **NEX-3 — the consumer WebSocket face exists.** `GET /v1/consumer`
+  (`crates/nexus-server/src/consumer_ws.rs`, 1 005 lines) carries post *and* stream on one
+  socket: `submit`/`attach`/`detach`/`cancel` in, `accepted`/`rejected` first, then
+  `job`-tagged `meta`/`delta`/`event`/`log`/`artifact`/`finish`/`error`/`gap`/`replay`, and
+  exactly one `end {job, reason}` per task with `EndReason {finished, errored, lagged,
+  detached, closed}`. Several tasks multiplex on one connection, the verdict can never be
+  preceded by an event byte (one writer owns every write), and the API key is checked
+  **before** the upgrade (`401` + `www-authenticate: Bearer realm="nexus"`). The SSE
+  surface is unchanged for OpenAI clients, and both faces share one admission path, so the
+  same task is refused the same way (`a_refusal_reaches_the_consumer_before_any_event_bytes`,
+  `one_consumer_socket_carries_two_tasks_and_answers_both_in_order`,
+  `the_consumer_socket_refuses_an_unauthenticated_upgrade`).
+* **orphan ⇒ delete, not orphan ⇒ retain** (NEX-6.3). A record that was still *running*
+  when its last consumer left is cancelled **and dropped in the same mailbox step**:
+  `forget_job` (`actor.rs:1382`) removes the record, the replay ring, the lease, the
+  payload reference and the idempotency entry, so a later same-key request executes fresh
+  instead of attaching to a dead stranger's answer. Only an already-**terminal** record is
+  still retained, which is exactly the reason NEX-7.2 allows (`dropping_a_consumer_socket_cancels_and_deletes_its_task`).
+* **hub-side mirror pruning.** `Effect::JobForgotten` now removes the routing entry, the
+  relay and the idempotency row (`state.rs:1065-1082`). That also closed a slow leak this
+  README did not used to mention: `job_index` was otherwise one entry per submission for
+  the life of the process (`job_index_and_relays_are_pruned_when_the_actor_forgets_a_job`,
+  `the_routing_index_holds_only_the_jobs_the_actor_still_knows`).
+* **detached is now an explicit request field** (NEX-6.6), not a side effect of which route
+  was used: `submit{detach}` defaults to `false` on the socket, `POST /v1/jobs` requires
+  `"detach": true` (`400 detach_required` otherwise), and a detached job nobody ever
+  watched and nobody claimed is forgotten after `NEXUS_DETACHED_ORPHAN_TTL_MS`
+  (`a_task_posted_without_a_consumer_is_deleted_when_its_window_closes`,
+  `the_async_job_route_requires_detach_to_be_stated`).
+* **disconnection is noticed by the connection, not by the first failed write** (NEX-6.1):
+  the socket face breaks on FIN/broken frame, and the SSE pump races the event source
+  against `tx.closed()` (`consumer.rs:1358`) — `an_idle_sse_hangup_cancels_the_worker_without_a_failed_write`
+  is the case that used to sit on a GPU slot until the TCP stack gave up.
+* **`ArtifactBook` is bounded by count as well as bytes**: `MAX_ARTIFACT_ENTRIES = 128`
+  (`store.rs:394`), deliberately `queue_depth`'s number, with evictions drained through the
+  TTL sweep's deletion path rather than a second effect. Bytes alone were the wrong bound:
+  a thousand 1 KiB uploads sit far below the byte budget while still growing the map, the
+  directory count and the downloadable set without limit.
+* **artifact ingest is bounded and atomic**: one append-only staging file per attempt,
+  O(chunk) memory, a digest the hub measures as it goes, and a **rename** to publish
+  (`io.rs:759`, `:809`, `:918`) — no second copy at completion, no half-written object for
+  a downloader to find. `staged_ingest_appends_then_finalizes_by_rename` pins it at the
+  file level.
+* **flush/replay coherence and zero-TTL config are startup errors, not runtime surprises**:
+  `Limits::validate` (`limits.rs:213`) refuses `flush_bytes > replay_bytes` (a full flush
+  batch would otherwise be evictable from the ring before it was relayed) and refuses a
+  zero `payload_ttl_ms`, `job_retention_ms`, `idempotency_ttl_ms`, `artifact_ttl_ms` or
+  `detached_orphan_ttl_ms`, each with the consequence in the message
+  (`limits.rs:351`, `:377`).
+* **memory-only mode exists** for deployments with no scratch disk: an empty
+  `NEXUS_ARTIFACT_ROOT` makes a kind that must write an artifact a clean
+  `400 artifact_unavailable` at admission instead of a failure after the response body has
+  opened (`memory_only_mode_refuses_a_kind_that_writes_an_artifact_and_admits_the_rest`).
 
 **Real limitations of the current implementation:**
 
@@ -524,6 +625,25 @@ child process cargo spawns, which is the root `AGENTS.md` scratch rule.
   verifies the reassembled bytes itself; and the bound is by construction — RSS during a
   download has still never been measured. Writes are chunked with the cap enforced
   before the disk is touched.
+* **`nexus_idempotent_attach_total` counts less than it used to, deliberately.** A
+  same-key retry the hub can answer from its own mirror never reaches the actor, so the
+  actor's counter does not move for it; what it counts now is the duplicates **the actor
+  itself replays** — a key the hub's mirror has already dropped or expired on, or a race
+  the mirror lost. The hub cannot compensate: `PoolGauges::from_actor` (`state.rs:213`)
+  rebuilds the mirrored registry from the actor on every dispatch, so a hub-side increment
+  would be erased a tick later (`consumer.rs:200-206`, `consumer_ws.rs:427-432`). Read the
+  series as "actor-side joins", not "duplicate submissions observed"; the hub-answered
+  retries are visible as the absence of a second `nexus_jobs_submitted_total` instead.
+* **the artifact ingest layout changed, and the README's old wording did not.** The
+  per-attempt *part files* are gone. One attempt now appends to a single staging file,
+  `{object}.parts/a{attempt:04}/staging.bin` (`io.rs:759`), while a running SHA-256 covers
+  exactly the bytes it has appended (`io::stage_chunk`, `io.rs:809`), and completion
+  publishes by **rename** (`io.rs:918`) — no second copy at completion, and no half-written
+  object for a downloader to meet. Chunk accounting still lives in the actor's
+  `ArtifactBook`; what changed is that an abandoned upload leaves one disposable file
+  instead of a directory of part files, and the TTL sweep's single `io::delete_artifact`
+  (`io.rs:944-951`) removes the finished object **and** the `{path}.parts` directory under
+  it in one call — which is why staging lives *inside* that directory.
 * **ranges are query parameters, not the `Range:` header.** `GET /v1/artifacts/{id}` and
   `GET /v1/jobs/{id}/result` read `?from=&to=` (exclusive end) while *answering* with
   `Accept-Ranges` / `Content-Range` as a proper ranged endpoint would; a client that sends
@@ -533,7 +653,7 @@ child process cargo spawns, which is the root `AGENTS.md` scratch rule.
 * the `/metrics` exposition carries `# TYPE` but no `# HELP` lines, and the actor
   registers no metric help strings.
 * **an output frame's `content_type` overwrites the job's payload `content_type`**
-  (`relay_into`, `actor.rs:2341`): `JobRecord::content_type` is documented as the
+  (`relay_into`, the assignment at `actor.rs:3429`): `JobRecord::content_type` is documented as the
   *payload's* type and is sent to the next attempt as such, so a worker that labels its
   deltas changes what a re-queued attempt is told the prompt was. Left as found — the
   fix needs a separate output-type field, which no test in the suite pins today.
@@ -575,9 +695,19 @@ Correctness against the task:
 * **an idempotent join lost its replay** on the OpenAI surface: the actor returns
   `Accepted { attached: true, replayed }` and the dispatcher pushed it into a private
   queue that only `/v1/jobs/{id}/events` had subscribed to (§16.7's second client
-  silently got a truncated stream). `submit` now installs the queue and subscribes to
-  the fan-out **before** the actor is told, which also closes a lost-first-frames race
-  in the same place (§16.14/§17);
+  silently got a truncated stream). The fix that actually holds is **upstream of the
+  queue**: the consumer faces resolve the idempotency key against the hub's own mirror
+  (`Hub::idempotency`, `state.rs:237-259`) **before minting an id**, and on a hit follow
+  the job the hub already routed — `join_existing_job` (`consumer.rs:1251`) on HTTP,
+  `handle_attach` (`consumer_ws.rs:533`) on the socket — so the replay is delivered on the
+  relay that joiner registered under, and there is no second execution to reconcile. (What
+  this bullet used to credit — `submit` installing the queue before the actor is told — was
+  the wrong mechanism: the actor replays under the *original* id, which is not the id a
+  fresh submission registers its relay and verdict gate under, so the retry could still
+  time out as `503 hub_unavailable` while the original's replay was dropped.) Subscribing
+  to the fan-out before the actor is told still stands, and still closes the
+  lost-first-frames race in the same place (§16.14/§17). Pinned by the four idempotency
+  retries in `runtime_e2e.rs` named in §16 row 7;
 * **terminal transitions could hang a stream**: `Shutdown`, queue-timeout and
   dispatch-failure emitted `Terminal`/`Reject` only, and the pumps end on a terminal
   *event*, so a draining or timing-out hub left consumers attached to a stream that
@@ -634,7 +764,8 @@ Correctness against the task:
 A follow-up pass took the six correctness items that the first pass had found but left
 open. Same rules: only this package, nothing compiled, and at the time every claim below
 was from reading code and tests that had never been executed. The verification pass above
-has since executed them: the claims held (the suite is 128/128 on this host), with the
+has since executed them: the claims held (the suite was 128/128 at that pass and is
+**163/163** now), with the
 fourteen exceptions itemised in *Fixed in this pass* — three of which were this document
 being confidently wrong, notably the `sha2` diagnosis for the streamed artifact digest.
 
@@ -657,7 +788,7 @@ being confidently wrong, notably the `sha2` diagnosis for the streamed artifact 
    aborts the body on a digest mismatch; a partial read cannot be digest-checked without
    reading the whole object, so `x-nexus-sha256` stays the *object* digest — documented
    in the function. Tenant checks were already on both readers (`io::get_artifact`,
-   `consumer::job_result`). Six tests in `io::tests` drive real files and read the body
+   `consumer::job_result`). Seven tests in `io::tests` drive real files and read the body
    frame by frame, so "streamed" is asserted by chunk sizes, not by trust.
 3. **Opaque output can no longer be auto-continued** (`model::JobRecord::output_opaque`,
    set in `relay_into`; consulted in `resolve_lost_job`). `max_continuations` was already
@@ -686,9 +817,10 @@ being confidently wrong, notably the `sha2` diagnosis for the streamed artifact 
    Test: `state::tests::a_stalled_worker_queue_is_reported_instead_of_parking_the_actor_loop`
    (no actor task, so the mailbox read cannot race).
 6. **The runtime tests are actually in the build, and the spill they write is not
-   litter.** `main.rs:3-4` holds `#[cfg(test)] mod runtime_e2e;`, which is the only way a
-   binary-only crate gets `cargo test -p nexus-server` coverage; the module is 4 tests
-   over a real listener. Each test now gets its own artifact root under the **repo-root**
+   litter.** `main.rs:8-9` hold `#[cfg(test)] mod runtime_e2e;`, which is the only way a
+   binary-only crate gets `cargo test -p nexus-server` coverage; the module is 19 tests
+   over a real listener (4 at that pass; the conformance pass added the consumer-WebSocket,
+   orphan-deletion, detach, idempotency-retry and route-contract cases). Each test gets its own artifact root under the **repo-root**
    scratch directory (`Temp/nexus-tests/e2e-<test>`, via `io::test_scratch`, resolved from
    `CARGO_MANIFEST_DIR` so it does not depend on cargo's working directory), cleared before
    the run and after it (`TestHub::drop`), so parallel tests cannot collide on per-attempt

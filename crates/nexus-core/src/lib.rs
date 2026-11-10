@@ -129,15 +129,20 @@ pub(crate) mod util {
     /// Lowercase hex encoding, hand-rolled so the core needs no `hex` crate
     /// (the wasm build must stay dependency-light).
     pub fn to_hex(bytes: &[u8]) -> String {
+        // The table is ASCII by construction, and the code point of an ASCII byte
+        // *is* that character, so pushing its entries straight into a `String`
+        // needs no UTF-8 validation pass. That is what removes the `expect` the
+        // `Vec<u8>` + `String::from_utf8` shape required — `expect_used` is a
+        // workspace lint (`Cargo.toml [workspace.lints.clippy]`) and this function
+        // runs on the shipped path, and `from_utf8_unchecked` is out because the
+        // crate forbids `unsafe`.
         const TABLE: &[u8; 16] = b"0123456789abcdef";
-        let mut out: Vec<u8> = Vec::with_capacity(bytes.len() * 2);
+        let mut out = String::with_capacity(bytes.len() * 2);
         for b in bytes {
-            out.push(TABLE[usize::from(b >> 4)]);
-            out.push(TABLE[usize::from(b & 0x0f)]);
+            out.push(char::from(TABLE[usize::from(b >> 4)]));
+            out.push(char::from(TABLE[usize::from(b & 0x0f)]));
         }
-        // The table above is ASCII by construction, so a UTF-8 failure here is a
-        // bug in this function, not a runtime condition.
-        String::from_utf8(out).expect("hex table is ascii")
+        out
     }
 
     /// FNV-1a 64-bit. Used for rendezvous (highest-random-score) hashing in

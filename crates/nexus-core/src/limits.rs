@@ -104,6 +104,20 @@ pub struct Limits {
     pub artifact_chunk_bytes: usize,
     /// How long a terminal job record (and its replay ring) stays queryable.
     pub job_retention_ms: u64,
+    /// How long a **detached** submission (`cancel_on_consumer_gone == false`) may
+    /// stay unclaimed with no consumer attached at all, before the actor deletes the
+    /// record and its idempotency entry rather than keeping a task nobody asked for.
+    ///
+    /// This is the second half of spec NEX-6.6's permitted exception (§9.1 item 3):
+    /// "cap its lifetime while it has no subscriber". A detached job is already an
+    /// exception to NEX-6.1's "no consumer, no task", so it needs its own bound;
+    /// `job_retention_ms` only covers records that reached a terminal state, and the
+    /// queue/claim deadlines only cover jobs someone is still waiting on.
+    ///
+    /// Only an **unclaimed** (`Pending`/`Queued`) detached job is swept by this clock:
+    /// GPU work a worker has already committed to is bounded by `job_hard_cap_ms`, not
+    /// by a subscriber count (see `PoolActor::on_tick` step 9).
+    pub detached_orphan_ttl_ms: u64,
 }
 
 impl Default for Limits {
@@ -159,6 +173,12 @@ impl Default for Limits {
             max_artifact_bytes: 512 << 20,
             artifact_chunk_bytes: 4 << 20,
             job_retention_ms: 300_000,
+            // Same order of magnitude as terminal retention: a detached job nobody
+            // watches and nobody claims is forgotten after 5 minutes, which is long
+            // enough for a worker to come up and claim it on a cold pool, and short
+            // enough that a client that never comes back cannot leave the hub holding
+            // a queue entry forever (NEX-6.6 / §9.1 item 3).
+            detached_orphan_ttl_ms: 300_000,
         }
     }
 }
@@ -207,6 +227,18 @@ impl Limits {
         if self.replay_frames == 0 || self.replay_bytes < 1024 {
             problems.push("replay ring must hold at least 1 frame and 1 KiB".to_string());
         }
+        // NEX-5.3 / NEX-7.2 cross-check. A flush batch is drained out of the replay
+        // ring (`relay_into` re-reads `replay.since(last_flushed_seq)`), so a window
+        // larger than the whole ring can never be emitted in one piece: the oldest
+        // deltas are evicted before the gate ever opens, stranding bytes behind a seq
+        // the consumer never saw. Ring bytes are therefore an upper bound on the
+        // batch the actor promises to relay.
+        if self.flush_bytes > self.replay_bytes {
+            problems.push(format!(
+                "flush_bytes ({}) must not exceed replay_bytes ({}) or a full flush batch can be evicted from the ring before it is relayed",
+                self.flush_bytes, self.replay_bytes
+            ));
+        }
         if self.inline_payload_cap_bytes > self.worker_line_cap_bytes * 32 {
             problems.push(format!(
                 "inline_payload_cap_bytes ({}) is absurdly large next to worker_line_cap_bytes ({}); use payload_ref or raise the line cap deliberately",
@@ -225,6 +257,45 @@ impl Limits {
         }
         if self.claim_deadline_ms <= self.no_worker_grace_ms {
             problems.push("claim_deadline_ms must exceed no_worker_grace_ms".to_string());
+        }
+
+        // NEX-7.2 says every retained byte needs a stated reason; the corollary is that
+        // a TTL is only a bound if it is non-zero. `expires = now + ttl` is *saturating*,
+        // and every sweep fires on `expiry <= now`, so `ttl = 0` is not "no retention" —
+        // it is "expired before anything could read it", which silently deletes a
+        // behaviour the rest of the design depends on. Each message names the thing that
+        // breaks, in the same style as the lease/heartbeat trap above.
+        let zero_ttl_problems: [(&str, u64, &str); 5] = [
+            (
+                "payload_ttl_ms",
+                self.payload_ttl_ms,
+                "a spilled prompt leaves memory before any worker can fetch it",
+            ),
+            (
+                "job_retention_ms",
+                self.job_retention_ms,
+                "a terminal record is dropped before a reconnect, a poll or an idempotent retry can read the answer"
+            ),
+            (
+                "idempotency_ttl_ms",
+                self.idempotency_ttl_ms,
+                "a duplicate submission re-runs work that is already in flight"
+            ),
+            (
+                "artifact_ttl_ms",
+                self.artifact_ttl_ms,
+                "an artifact is deleted before its consumer can download it"
+            ),
+            (
+                "detached_orphan_ttl_ms",
+                self.detached_orphan_ttl_ms,
+                "an unclaimed detached job is deleted the moment it is submitted (§9.1 item 3)"
+            ),
+        ];
+        for (name, value, consequence) in zero_ttl_problems {
+            if value == 0 {
+                problems.push(format!("{name} must be > 0, or {consequence}"));
+            }
         }
         problems
     }
@@ -250,20 +321,105 @@ mod tests {
             !l.continuation_allows_opaque_output,
             "opaque (tool-call / non-delta) output is never auto-continued by default (§7.4)"
         );
+        // NEX-6.6's cap on a detached job with no subscriber: 5 minutes, the same
+        // order as terminal retention, and non-zero so `validate()` accepts it.
+        assert_eq!(l.detached_orphan_ttl_ms, 300_000);
     }
 
     #[test]
     fn validate_catches_the_lease_heartbeat_trap() {
-        let mut l = Limits::default();
-        l.heartbeat_ms = 30_000;
-        l.lease_ms = 45_000; // < 2x heartbeat
+        // Struct-update instead of `default()` then assignment: the two fields this
+        // fixture changes are the whole point of the test.
+        let l = Limits {
+            heartbeat_ms: 30_000,
+            lease_ms: 45_000, // < 2x heartbeat
+            ..Limits::default()
+        };
         assert_eq!(
             l.validate(),
-            vec![format!(
+            vec![
                 "lease_ms (45000) must be at least 2x heartbeat_ms (30000) or leases expire between heartbeats"
-            )]
+                    .to_string()
+            ]
         );
         assert!(Limits::default().validate().is_empty());
+    }
+
+    /// NEX-5.3 / NEX-7.2: a flush window bigger than the ring that has to hold it is a
+    /// stranding bug waiting to happen, so it is a startup error, not a runtime surprise.
+    #[test]
+    fn validate_rejects_a_flush_window_larger_than_the_replay_ring() {
+        let l = Limits {
+            flush_bytes: 4_096,
+            replay_bytes: 2_048,
+            ..Limits::default()
+        };
+        assert_eq!(
+            l.validate(),
+            vec![
+                "flush_bytes (4096) must not exceed replay_bytes (2048) or a full flush batch can be evicted from the ring before it is relayed"
+                    .to_string()
+            ]
+        );
+        // The boundary is allowed: a batch exactly as large as the ring is still
+        // drainable in one piece.
+        let equal = Limits {
+            flush_bytes: 2_048,
+            replay_bytes: 2_048,
+            ..Limits::default()
+        };
+        assert!(equal.validate().is_empty(), "{:?}", equal.validate());
+    }
+
+    /// NEX-7.2: every retention TTL is a bound, and `now + 0` is already expired, so a
+    /// zero anywhere in this list silently removes a behaviour instead of bounding it.
+    #[test]
+    fn validate_rejects_zero_retention_ttls() {
+        let cases: [(&str, Limits, &str); 5] = [
+            (
+                "payload_ttl_ms",
+                Limits {
+                    payload_ttl_ms: 0,
+                    ..Limits::default()
+                },
+                "payload_ttl_ms must be > 0, or a spilled prompt leaves memory before any worker can fetch it",
+            ),
+            (
+                "job_retention_ms",
+                Limits {
+                    job_retention_ms: 0,
+                    ..Limits::default()
+                },
+                "job_retention_ms must be > 0, or a terminal record is dropped before a reconnect, a poll or an idempotent retry can read the answer",
+            ),
+            (
+                "idempotency_ttl_ms",
+                Limits {
+                    idempotency_ttl_ms: 0,
+                    ..Limits::default()
+                },
+                "idempotency_ttl_ms must be > 0, or a duplicate submission re-runs work that is already in flight",
+            ),
+            (
+                "artifact_ttl_ms",
+                Limits {
+                    artifact_ttl_ms: 0,
+                    ..Limits::default()
+                },
+                "artifact_ttl_ms must be > 0, or an artifact is deleted before its consumer can download it",
+            ),
+            (
+                "detached_orphan_ttl_ms",
+                Limits {
+                    detached_orphan_ttl_ms: 0,
+                    ..Limits::default()
+                },
+                "detached_orphan_ttl_ms must be > 0, or an unclaimed detached job is deleted the moment it is submitted (§9.1 item 3)",
+            ),
+        ];
+        for (field, limits, expected) in cases {
+            assert_eq!(limits.validate(), vec![expected.to_string()], "{field} = 0");
+        }
     }
 
     #[test]

@@ -414,7 +414,11 @@ impl NexusBroker {
         let caps = self.actor()?.limits().worker_caps();
         let frame = nexus_core::protocol::decode_worker_frame(line, &caps)
             .map_err(|e| JsError::new(&e.to_string()))?;
-        Ok(serde_json::to_string(&frame).map_err(|e| JsError::new(&e.to_string()))?)
+        // Returned directly: the `?` inside an enclosing `Ok(..)` was the whole
+        // conversion, so the wrapper only made clippy (`needless_question_mark`)
+        // and the reader do the same work twice. Behavior is identical — the
+        // `JsError` still carries the codec message.
+        serde_json::to_string(&frame).map_err(|e| JsError::new(&e.to_string()))
     }
 
     /// Encode a hub→worker frame, enforcing the outbound line cap.
@@ -451,7 +455,8 @@ impl NexusBroker {
             session_hint,
             cfg.tenant_priority(&nexus_core::TenantId::new_unchecked(tenant)),
         );
-        Ok(serde_json::to_string(&sub).map_err(|e| JsError::new(&e.to_string()))?)
+        // Same shape as `decode_worker_line`: one `map_err`, no `Ok(..?)` wrapper.
+        serde_json::to_string(&sub).map_err(|e| JsError::new(&e.to_string()))
     }
 
     // ------------------------------------------------------------------ plumbing
