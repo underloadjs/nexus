@@ -1,39 +1,43 @@
-# Deploys the Nexus Monitor frontend (frontend/) to this repository's GitHub
-# Pages site.
+# Deploys the Nexus Monitor (this repository's root app) to GitHub Pages.
+#
+# WHAT THIS REPO IS: the read-only observability console for a nexus hub — a
+# static Vite + React app that polls the hub's GET /v1/observe and GET /metrics
+# APIs. The Rust hub those APIs are served by is a separate package now
+# (noobscript `services/nexus`, `@services/nexus`), so there is no cargo build
+# in this workflow and no Rust path filter to skip: the only buildable thing
+# tracked here is the site.
 #
 # WHY THE WORKFLOW LIVES HERE (not in the noobscript monorepo root):
 # this directory is its own git repository (origin underloadjs/nexus). Inside
 # the monorepo it is an embedded repo, so the root repo never sees anything
-# under it and a root-level workflow could neither trigger on frontend changes
-# nor upload an artifact built from files that are not in its checkout. The
-# package therefore ships its own workflow, exactly like the sibling
-# standalone mirrors do: packages/underload/bench/.github/workflows/deploy-pages.yml,
+# under it and a root-level workflow could neither trigger on these files nor
+# upload an artifact built from them. The package therefore ships its own
+# workflow, exactly like the sibling standalone mirrors do:
+# packages/underload/bench/.github/workflows/deploy-pages.yml,
 # packages/underload/dashboard/.github/workflows/deploy-pages.yml,
 # packages/underload/harness/.github/workflows/ci.yml and every
 # distribution/* package. GitHub runs it once this repo is pushed on its own.
 #
-# Every path below is RELATIVE TO THIS REPO, so the frontend lives at
-# `frontend/`, not at `packages/underload/nexus/frontend/`.
+# Every path below is RELATIVE TO THIS REPO, and the app sits AT THE ROOT of it
+# (index.html, src/, vite.config.ts) — same layout as those siblings, and no
+# working-directory is needed on any step.
 #
 # ARTIFACT FLOW (why configure-pages/upload/deploy-pages instead of a gh-pages
 # branch push), carried over from distribution/story-generator
 # (.github/workflows/deploy.yml), which documents the failure this replaces:
 # pushing dist/ onto a `gh-pages` branch relies on Pages' "Deploy from a
 # branch" job, which silently stopped triggering there (gh-pages commits landed
-# green while the live site kept serving an older bundle). The official
-# artifact flow — configure-pages reads/applies the Pages settings,
-# upload-pages-artifact packages the build output as the `github-pages`
-# artifact, deploy-pages publishes that artifact — depends on no branch at all.
+# green while the live site kept serving an older bundle). The official artifact
+# flow — configure-pages reads/applies the Pages settings, upload-pages-artifact
+# packages the build output as the `github-pages` artifact, deploy-pages
+# publishes that artifact — depends on no branch at all.
 # Note the split: upload-pages-artifact runs in `build`, the job that produced
 # dist/, and `deploy` only runs deploy-pages@v4, which downloads that artifact
 # by itself; the deploy job has no checkout, so it has no dist/ of its own.
 #
 # ONE-TIME REPO SETTING (required once, not per deploy):
 #   Settings → Pages → Build and deployment → Source: "GitHub Actions"
-# Documented again in frontend/README.md.
-#
-# PATHS FILTER: the workflow only needs to run when the site or the workflow
-# itself changes; Rust/crates/docs pushes are skipped (cargo CI is separate).
+# Documented again in README.md.
 #
 # YARN 1, PINNED, THROUGH A GLOBAL NPM INSTALL — same reasoning as
 # packages/underload/dashboard/.github/workflows/deploy-pages.yml, restated
@@ -53,11 +57,16 @@
 #     one exact version. It only touches npm's GLOBAL tree, so it stays clear of
 #     the arborist peer-graph failure above.
 #
-# LOCKFILE: unlike those siblings, frontend/yarn.lock IS committed, so the
-# install below is `--frozen-lockfile` (byte-reproducible CI installs). actions/
-# setup-node's `cache:` is intentionally NOT set: it hashes a lockfile at the
-# repository root, and this repo keeps its lockfile in frontend/, so caching
-# would need a cache-dependency-path for a few hundred MB of dev deps.
+# LOCKFILE: yarn.lock IS committed here, so the install below is
+# `--frozen-lockfile` (byte-reproducible CI installs). It is the standalone
+# lockfile of this repo: inside the noobscript monorepo the same manifest is a
+# workspace member, and a root install hoists these dependencies instead
+# (README "Two install contexts, one manifest"). actions/setup-node's `cache:`
+# is intentionally NOT set (packages/underload/dashboard leaves it off too;
+# bench turns it on) — a cold install of this dev-dep tree is a few minutes once
+# per deploy, and an unset cache is one fewer key to keep valid. Turn it on if
+# the wait ever matters: the lockfile is at this repo's root, so `cache: yarn`
+# resolves the same way it does in bench.
 
 name: Deploy Nexus Monitor to GitHub Pages
 
@@ -65,7 +74,12 @@ on:
     push:
         branches: [main]
         paths:
-            - frontend/**
+            - src/**
+            - index.html
+            - package.json
+            - yarn.lock
+            - tsconfig.json
+            - vite.config.ts
             - .github/workflows/deploy-pages.yml
     workflow_dispatch:
 
@@ -110,23 +124,19 @@ jobs:
             - name: Setup Yarn 1 (pinned)
               run: npm install --global yarn@1.22.22
 
-            # All frontend steps run in frontend/; there is no workspace root in
-            # this repo, so yarn treats it as a standalone project (its own
-            # frontend/yarn.lock + frontend/node_modules).
+            # No workspace root in this repo, so yarn treats the checkout root as
+            # the project itself (its own yarn.lock + node_modules).
             - name: Install dependencies
-              working-directory: frontend
               # --frozen-lockfile: fails instead of silently resolving a new
-              # tree when frontend/package.json and the committed lockfile drift.
+              # tree when package.json and the committed lockfile drift.
               run: yarn install --frozen-lockfile
 
             # Gate the site before publishing it: program + config typecheck,
             # then the vitest suite (node environment, no jsdom needed).
             - name: Typecheck
-              working-directory: frontend
               run: yarn typecheck
 
             - name: Test
-              working-directory: frontend
               run: yarn test
 
             # Pages serves this repo at https://<owner>.github.io/<repo-name>/
@@ -134,19 +144,18 @@ jobs:
             # subpath — a default '/' base would 404 all assets. The repo name is
             # used rather than a literal so a rename/fork keeps working.
             - name: Build
-              working-directory: frontend
               run: yarn build --base=/${{ github.event.repository.name }}/
 
             - name: Configure Pages
               uses: actions/configure-pages@v5
 
-            # Uploads from THIS job (the one that just built frontend/dist);
+            # Uploads from THIS job (the one that just built dist/);
             # deploy-pages in `deploy` consumes this as the `github-pages`
             # artifact. See the artifact-flow note in the header.
             - name: Upload Pages artifact
               uses: actions/upload-pages-artifact@v3
               with:
-                  path: frontend/dist
+                  path: dist
 
     deploy:
         needs: build

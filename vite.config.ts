@@ -21,16 +21,18 @@ import react from '@vitejs/plugin-react';
 export default defineConfig({
     plugins: [react()],
     server: {
-        // Fixed dev port so `yarn dev` (run from this directory, the only
-        // install context this package has — see README "Run it locally")
-        // always lands in one place (8200 is bench, 8000 the distribution
-        // apps; 8300 is unclaimed among the dashboard frontends).
+        // Fixed dev port so `yarn dev` — run here in a standalone checkout, or
+        // as `yarn workspace @underload/nexus dev` from the noobscript
+        // monorepo root, the two install contexts this package has (see README
+        // "Two install contexts, one manifest") — always lands in one place
+        // (8200 is bench, 8000 the distribution apps; 8300 is unclaimed among
+        // the dashboard frontends).
         port: 8300,
         host: true
     },
     build: {
         // Default outDir/dist; the Pages workflow uploads this exact path
-        // (frontend/dist, relative to the nexus repo root) as the artifact.
+        // (`dist`, relative to the repo root) as the artifact.
         outDir: 'dist',
         emptyOutDir: true
     }

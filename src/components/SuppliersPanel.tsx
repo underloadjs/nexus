@@ -6,7 +6,7 @@
 //
 // The `kv free` column keeps the hub's null/0 split: `—` means the worker
 // never declared a KV budget, `0` means it reported one and has spent it all
-// (see `crates/nexus-server/src/observe.rs`,
+// (see `crates/nexus-server/src/observe.rs` in `@services/nexus`,
 // `worker_row_reports_a_kv_budget_of_null_rather_than_zero`).
 import { Fragment, useState } from 'react';
 import type { EngineState, NormalizedSnapshot, WorkerLink } from '../api/nexus-client';
@@ -52,7 +52,7 @@ export function SuppliersPanel({ snapshot, nowMs }: SuppliersPanelProps) {
             {snapshot.workers.length === 0 ? (
                 <EmptyState
                     message="No suppliers connected."
-                    hint="Start a worker (cargo run -p nexus-worker-example) — it dials the hub and shows up here."
+                    hint="Start a worker (cargo run -p nexus-worker-example, in @services/nexus) — it dials the hub and shows up here."
                 />
             ) : (
                 <div className="table-scroll">

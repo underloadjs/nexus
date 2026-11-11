@@ -176,7 +176,7 @@ describe('SuppliersPanel', () => {
     it('renders a missing KV budget as an em dash and a spent one as 0', () => {
         // The hub keeps null and 0 apart on purpose: null = the worker never
         // declared a KV budget, 0 = it declared one and has spent it all
-        // (crates/nexus-server/src/observe.rs,
+        // (@services/nexus: crates/nexus-server/src/observe.rs,
         // `worker_row_reports_a_kv_budget_of_null_rather_than_zero`). A `|| 0`
         // coercion here would report every unreported worker as exhausted.
         const budgetRow = (id: string, freeKvTokens: unknown) => ({
