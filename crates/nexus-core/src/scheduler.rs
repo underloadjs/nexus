@@ -94,8 +94,10 @@ pub fn prefers_dedicated(job: &JobRecord) -> bool {
             .is_some_and(|v| v >= LONG_CONTEXT_TOKENS)
 }
 
-/// Hard filters: live + ready + in this pool + capability match + capacity +
-/// KV budget + tier policy + "prefer a different worker" on requeue.
+/// Hard filters: live + ready + in this pool + model match + capacity +
+/// tier policy + "prefer a different worker" on requeue. Routing is by model
+/// alone: the payload is the consumer's, and whatever the engine cannot serve
+/// it answers itself (the hub relays that error).
 ///
 /// `queue_depth` implements §11's "ephemeral workers are burst capacity": an
 /// ephemeral worker is only used when there is work waiting or when it is the
@@ -118,20 +120,12 @@ pub fn eligible(
         .values()
         .filter(|w| w.pools.contains(pool))
         .filter(|w| w.dispatchable())
-        // Capability re-check. Submit already pre-checked it (§8 "do not discover
-        // it via a 60-second timeout"), but a worker can leave between submit and
-        // dispatch, so the actor must not dispatch into an unsatisfiable pool.
-        .filter(|w| job.requires.satisfied_by(&w.requires))
+        // Model-only routing: the supplier registered its model, the consumer
+        // requested it, and the payload is proxied verbatim - what the engine
+        // cannot serve it answers itself, and the hub relays that error.
+        .filter(|w| job.requires.serves_model(&w.requires))
         // Declared capacity (acceptance test 12).
         .filter(|w| w.available_slots() > 0)
-        // KV budget (task §8): only enforced when the worker reports it, because
-        // an engine that cannot report free KV must not be excluded outright.
-        .filter(
-            |w| match (job.requires.kv_estimate_tokens, w.free_kv_tokens) {
-                (Some(need), Some(free)) => free >= need,
-                _ => true,
-            },
-        )
         .map(|w| Candidate {
             // The candidate identity is part of the ranking payload: `without_failed`
             // below filters on it, and the actor dispatches to it by name.
@@ -281,7 +275,7 @@ mod tests {
     }
 
     #[test]
-    fn kv_budget_excludes_a_worker_without_room() {
+    fn kv_budget_is_advertisement_not_a_gate() {
         let mut j = job();
         j.requires.kv_estimate_tokens = Some(300_000);
         let workers = BTreeMap::from([
@@ -294,9 +288,12 @@ mod tests {
                 w("w-wide", WorkerTier::Dedicated, 1, Some(400_000), true),
             ),
         ]);
+        // Routing is model-only: the KV estimate is metadata, not a filter. The
+        // choice falls to declared capacity (4 free slots beat 1); a prompt the
+        // engine cannot fit is the ENGINE's error, and the hub relays it.
         assert_eq!(
             pick(&workers, &pool(), &j, 1),
-            Some(WorkerId::new_unchecked("w-wide"))
+            Some(WorkerId::new_unchecked("w-tight"))
         );
 
         // A worker that reports no KV figure is not excluded outright.
@@ -437,14 +434,20 @@ mod tests {
     }
 
     #[test]
-    fn capability_mismatch_at_dispatch_time_is_excluded() {
+    fn capability_requirements_are_not_a_gate() {
         let mut j = job();
         j.requires.capabilities = BTreeSet::from(["vision".to_string()]);
         let workers = BTreeMap::from([(
             WorkerId::new_unchecked("w-tools"),
             w("w-tools", WorkerTier::Dedicated, 4, None, true),
         )]);
-        assert_eq!(pick(&workers, &pool(), &j, 1), None, "worker lacks vision");
+        // Model-only routing: the payload is proxied even when the consumer asks
+        // for capabilities the worker never advertised - an engine that cannot
+        // serve it answers the error itself, and the hub relays it.
+        assert_eq!(
+            pick(&workers, &pool(), &j, 1),
+            Some(WorkerId::new_unchecked("w-tools"))
+        );
     }
 
     #[test]

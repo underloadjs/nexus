@@ -902,7 +902,7 @@ fn t09_consumer_reconnect_with_last_event_id_replays_without_a_gap() {
 }
 
 #[test]
-fn t10_unsatisfiable_capability_is_an_immediate_400() {
+fn t10_a_capability_requiring_body_is_proxied_to_the_model_worker() {
     let mut a = actor();
     warm(&mut a, "w-a", 1, 4, 0);
     let body = json!({"model":"qwen38","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"x"}}]}],"stream":true});
@@ -927,18 +927,62 @@ fn t10_unsatisfiable_capability_is_an_immediate_400() {
             },
         },
     );
-    assert_eq!(
-        rejects(&effects),
-        vec![(400, "capability_unsatisfied".to_string(), None)]
-    );
+    // Routing is model-only: the hub derives "vision" from the payload but does
+    // not gate on it - the request is admitted to the worker that registered the
+    // model, and whatever the engine answers is relayed to the consumer.
+    assert!(rejects(&effects).is_empty());
     assert!(
-        !a.has_job(&JobId::new_unchecked("job-vis")),
-        "a refused request must not occupy a slot"
+        a.has_job(&JobId::new_unchecked("job-vis")),
+        "a proxied request occupies a slot"
     );
+    // The pull model: the job queues for the worker's claim - and the claim gets
+    // it, capability mismatch and all.
     assert_eq!(
-        a.metrics()
-            .get("nexus_jobs_rejected_total{reason=\"capability_unsatisfied\"}"),
-        1
+        a.job(&JobId::new_unchecked("job-vis")).expect("r").phase,
+        JobPhase::Queued
+    );
+    let claim = a.handle(20, claim_msg("w-a", 1, 4));
+    assert_eq!(
+        assigned(&claim),
+        vec![("w-a".to_string(), "job-vis".to_string(), 1u32)]
+    );
+}
+
+#[test]
+fn t10b_auto_is_dispatched_to_whichever_model_is_free() {
+    let mut a = actor();
+    warm(&mut a, "w-a", 1, 4, 0);
+    let body = json!({"model":"auto","messages":[{"role":"user","content":"hi"}],"stream":true});
+    let effects = a.handle(
+        10,
+        ActorMsg::Submit {
+            job: JobId::new_unchecked("job-auto"),
+            consumer: ConsumerId::new_unchecked("c"),
+            submission: Submission {
+                kind: KIND_CHAT.to_string(),
+                pool: pool(),
+                tenant: TenantId::new_unchecked("acme"),
+                requires: nexus_core::adapters::infer_requires("auto", &body),
+                payload: body,
+                content_type: "application/json".to_string(),
+                idempotency_key: "auto-key".to_string(),
+                session_hint: None,
+                priority: Priority::Default,
+                idempotent: true,
+                streaming: true,
+                cancel_on_consumer_gone: true,
+            },
+        },
+    );
+    // `auto` names no model: the job is admitted to the pool and the claim of
+    // whichever worker is free takes it - the supplier rewrites the payload's
+    // model to its own before the engine sees it.
+    assert!(rejects(&effects).is_empty());
+    assert!(a.has_job(&JobId::new_unchecked("job-auto")));
+    let claim = a.handle(20, claim_msg("w-a", 1, 4));
+    assert_eq!(
+        assigned(&claim),
+        vec![("w-a".to_string(), "job-auto".to_string(), 1u32)]
     );
 }
 

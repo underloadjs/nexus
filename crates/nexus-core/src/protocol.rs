@@ -38,6 +38,10 @@ use std::collections::BTreeSet;
 /// because the only incompatibility we negotiate today is the frame vocabulary.
 pub const WIRE_VERSION: u32 = crate::PROTOCOL_VERSION;
 
+/// The wildcard model: a consumer requesting `auto` takes whichever model in
+/// the pool is free - the scheduler's own ranking picks one.
+pub const AUTO_MODEL: &str = "auto";
+
 /// Size caps for one direction of a worker connection (task §9 "frame/payload
 /// size limits on the worker connection").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,6 +108,21 @@ impl Requires {
             }
         }
         self.capabilities.is_subset(&offered.capabilities)
+    }
+
+    /// Model-only matching - the routing contract. A supplier registers its
+    /// model, a consumer requests that model, and the payload travels as-is:
+    /// what the engine cannot serve it answers itself, and the hub relays that
+    /// error to the consumer. Capabilities and context floors stay as
+    /// advertisement metadata but gate nothing.
+    #[must_use]
+    pub fn serves_model(&self, offered: &Requires) -> bool {
+        match &self.model {
+            // `auto` is the wildcard: whichever model in the pool is free.
+            Some(model) if model == AUTO_MODEL => true,
+            Some(model) => offered.model.as_deref() == Some(model.as_str()),
+            None => true,
+        }
     }
 
     /// Union used when a worker joins several pools with different offers.
@@ -1654,6 +1673,27 @@ mod tests {
             value.clone(),
         )
         .unwrap_or_else(|err| panic!("{} is a ConsumerEvent: {err}", value["type"]))
+    }
+
+    #[test]
+    fn auto_is_the_whichever_model_is_free_wildcard() {
+        let auto = Requires {
+            model: Some(AUTO_MODEL.to_string()),
+            ..Default::default()
+        };
+        let basalt = Requires {
+            model: Some("local/basalt".to_string()),
+            ..Default::default()
+        };
+        let strata = Requires {
+            model: Some("local/strata".to_string()),
+            ..Default::default()
+        };
+        assert!(auto.serves_model(&basalt));
+        assert!(auto.serves_model(&strata));
+        // A concrete model keeps matching only its own name.
+        assert!(basalt.serves_model(&basalt));
+        assert!(!basalt.serves_model(&strata));
     }
 
     #[test]

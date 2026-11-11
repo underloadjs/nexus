@@ -720,14 +720,15 @@ impl PoolActor {
             .collect()
     }
 
-    /// Whether any connected worker could ever satisfy `requires` (the
-    /// capability pre-check of §8; drives the immediate `400`).
+    /// Whether any connected worker serves `requires`' model - the only
+    /// routing question the hub asks. The payload is the consumer's: the hub
+    /// proxies it verbatim and relays whatever the supplier answers, in band.
     #[must_use]
     pub fn can_satisfy(&self, requires: &Requires) -> bool {
         self.workers.values().any(|w| {
             w.link == LinkState::Live
                 && w.pools.contains(&self.pool)
-                && requires.satisfied_by(&w.requires)
+                && requires.serves_model(&w.requires)
         })
     }
 
@@ -2123,12 +2124,8 @@ impl PoolActor {
             .find(|job| {
                 self.jobs.get(job).is_some_and(|record| {
                     (record.phase == JobPhase::Queued || record.phase == JobPhase::Pending)
-                        && record.requires.satisfied_by(&w.requires)
+                        && record.requires.serves_model(&w.requires)
                         && self.affinity_allows(worker, record)
-                        && match (record.requires.kv_estimate_tokens, w.free_kv_tokens) {
-                            (Some(need), Some(free)) => free >= need,
-                            _ => true,
-                        }
                 })
             })
     }
@@ -3626,26 +3623,13 @@ fn frame_kind_name(kind: FrameKind) -> &'static str {
     }
 }
 
-/// Explain an unsatisfiable capability request precisely enough that a client can
-/// fix it (the payload of §8's immediate 400).
+/// Explain a refused submission: the model nobody serves. Routing is by model
+/// alone - the payload is proxied verbatim, and whatever the supplier answers
+/// (including its errors) is relayed to the consumer.
 fn unsatisfiable_reason(requires: &Requires) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(model) = &requires.model {
-        parts.push(format!("model {model:?}"));
-    }
-    if let Some(min) = requires.min_context_tokens {
-        parts.push(format!("{min} tokens of context"));
-    }
-    if !requires.capabilities.is_empty() {
-        parts.push(format!(
-            "capabilities {:?}",
-            requires.capabilities.iter().collect::<Vec<_>>()
-        ));
-    }
-    if parts.is_empty() {
-        "no worker is connected to this pool".to_string()
-    } else {
-        format!("no connected worker satisfies {}", parts.join(", "))
+    match &requires.model {
+        Some(model) => format!("no connected worker serves model {model:?}"),
+        None => "no worker is connected to this pool".to_string(),
     }
 }
 
