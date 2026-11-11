@@ -50,6 +50,7 @@ import {
     INTERRUPT_DELETE_TIMEOUT_MS,
     isCliEntryPoint,
     main,
+    needsPreviewToken,
     PACKAGE_ROOT,
     parseArgs,
     resolveMode,
@@ -438,6 +439,28 @@ describe('start-daytona: the machine-readable line', () => {
         expect(buildSummary({ mode: 'fresh', endpoint: 'https://e', hubUrl: 'https://hub', hubToken: '', sandboxId: 'sbx-1234', hubPort: 9000 })).toBe('{"mode":"fresh","endpoint":"https://e","hubUrl":"https://hub","sandboxId":"sbx-1234","hubPort":9000}');
     });
 
+    it('drops the token keys for a PUBLIC sandbox even though Daytona hands a token back', () => {
+        // Daytona's PortPreviewUrl.token is a REQUIRED string (api-client
+        // port-preview-url.d.ts:22-24) and public sandboxes get one too — measured on a
+        // real create (Temp/daytona-sandbox/last-sandbox.json: public:true + a token).
+        // Presence is NOT the "send the header" signal, so a bare public hub must not
+        // publish token fields an operator would then paste into a curl that needs none.
+        const line = buildSummary({ mode: 'fresh', endpoint: 'https://e', token: 'dtn_preview_token', hubUrl: 'https://hub', hubToken: 'hub_preview_token', sandboxId: 'sbx-1234', name: 'nexus-1', public: true, hubPort: 8085 });
+        expect(line).toBe('{"mode":"fresh","endpoint":"https://e","hubUrl":"https://hub","sandboxId":"sbx-1234","name":"nexus-1","public":true,"hubPort":8085}');
+        expect(line).not.toContain('dtn_preview_token');
+        expect(line).not.toContain('hub_preview_token');
+    });
+
+    it('keeps the operator token when visibility is unknown (reuse mode has no handle)', () => {
+        // public is absent here, so the conservative reading wins: an extra valid header
+        // is harmless, a missing one on a private endpoint is a 401.
+        expect(needsPreviewToken(undefined, 't')).toBe(true);
+        expect(needsPreviewToken(false, 't')).toBe(true);
+        expect(needsPreviewToken(true, 't')).toBe(false);
+        expect(needsPreviewToken(true, undefined)).toBe(false);
+        expect(needsPreviewToken(false, '')).toBe(false);
+    });
+
     it('keeps hubUrl present but null in reuse mode (a consumer must not read it as a URL)', () => {
         expect(buildSummary({ mode: 'reuse', endpoint: 'https://e', token: 't', hubUrl: null, hubPort: 8085 })).toBe('{"mode":"reuse","endpoint":"https://e","token":"t","hubUrl":null,"hubPort":8085}');
     });
@@ -476,13 +499,24 @@ describe('start-daytona: fresh mode', () => {
     });
 
     it('a public sandbox prints an unauthenticated hub URL and drops the token fields', async () => {
-        const handle = makeHandle({ token: '', public: true });
-        handle.sandbox.getPreviewLink = vi.fn(async (port: number) => ({ url: `https://proxy.example/hub-${port}`, token: '' }));
+        // NOT token: '' — a public sandbox gets a preview token from Daytona too (see the
+        // buildSummary test above), so this fake carries one to pin the real shape.
+        const handle = makeHandle({ public: true });
         const { deps, lines } = makeDeps(handle, 0);
         expect(await runStartDaytona(flagsOf([]), deps)).toBe(0);
         expect(lines[3]).toBe('[nexus:start]   hub URL (clients connect here) [public, no token]: https://proxy.example/hub-8085');
+        expect(lines[4]).toBe('[nexus:start]   management endpoint (POST/status/logs) [no token]: https://proxy.example/runner-7777');
         expect(lines[5]).toBe('[nexus:start]   sandbox sbx-1234 — bills until sandbox.delete() (no --ttl fence was set)');
         expect(lines[6]).toBe('{"mode":"fresh","endpoint":"https://proxy.example/runner-7777","hubUrl":"https://proxy.example/hub-8085","sandboxId":"sbx-1234","name":"nexus-1","public":true,"hubPort":8085}');
+    });
+
+    it('--private is still authenticated — the token shows up in the labels and the line', async () => {
+        const handle = makeHandle({ public: false });
+        const { deps, lines } = makeDeps(handle, 0);
+        expect(await runStartDaytona(flagsOf(['--private']), deps)).toBe(0);
+        expect(lines[3]).toBe('[nexus:start]   hub URL (clients connect here) [x-daytona-preview-token required]: https://proxy.example/hub-8085');
+        expect(lines[4]).toBe('[nexus:start]   management endpoint (POST/status/logs) [x-daytona-preview-token]: https://proxy.example/runner-7777');
+        expect(lines[6]).toBe('{"mode":"fresh","endpoint":"https://proxy.example/runner-7777","token":"dtn_preview_token","hubUrl":"https://proxy.example/hub-8085","hubToken":"hub_token","sandboxId":"sbx-1234","name":"nexus-1","public":false,"hubPort":8085}');
     });
 
     it('forwards createSandbox progress through the prefixed sink (a quiet library needs a loud host)', async () => {

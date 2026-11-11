@@ -71,10 +71,18 @@
 //  MACHINE-READABLE OUTPUT: after a successful fresh/reuse start, the LAST line
 //  of stdout is exactly ONE single-line JSON object (nothing else is on that line;
 //  the example below is wrapped only to fit):
-//      {"mode":"fresh","endpoint":"https://…","token":"…","hubUrl":"https://…",
-//       "hubToken":"…","sandboxId":"…","name":"…","public":true,"hubPort":8085}
+//      {"mode":"fresh","endpoint":"https://…","hubUrl":"https://…",
+//       "sandboxId":"…","name":"…","public":true,"hubPort":8085}
+//      (a PRIVATE run inserts "token":"…" and "hubToken":"…" in that same order)
 //  `token` (management preview token) and `hubToken` (hub preview token) are
-//  omitted when empty — public sandbox, no header needed. In REUSE mode the same
+//  emitted ONLY when the sandbox is PRIVATE (needsPreviewToken). Daytona hands a
+//  token back for EVERY preview link — PortPreviewUrl.token is a required string in
+//  its API (api-client src/models/port-preview-url.d.ts:22-24) and a public sandbox
+//  gets one too — so presence proves nothing; visibility is the whole rule, exactly
+//  how @services/daytona reads it (its curlFor drops the header when public,
+//  setup-sandbox.test.ts:606-621). On a PUBLIC sandbox (the default) both fields are
+//  absent: the hub URL is bare, and a consumer that sent the token would be sending
+//  a credential the proxy never asked for. In REUSE mode the same
 //  line carries `"hubUrl":null` (the hub preview link needs the sandbox's SDK
 //  handle, which only a fresh create has) and no `sandboxId`/`name`/`public`.
 //  Automation chains off `hubUrl` (client-facing) and, for a later
@@ -503,11 +511,32 @@ export const buildPlan = (flags: StartDaytonaFlags, env: Record<string, string |
 };
 
 /**
- * The machine-readable line. Key order is insertion order, and empty tokens are
- * dropped so a consumer's `token`/`hubToken` check means "needs a header" rather
- * than "present but empty". In reuse mode `sandboxId`/`name`/`public` are absent
- * (that sandbox was never ours) and `hubUrl` is explicitly `null` (no handle to
- * mint a per-port preview link with) — a consumer must handle `null`, which is
+ * THE rule for "does this preview URL need the x-daytona-preview-token header":
+ * the sandbox's VISIBILITY, never whether a token string came back.
+ *
+ * WHY THIS EXISTS: Daytona's PortPreviewUrl declares `token` as a REQUIRED string
+ * (api-client src/models/port-preview-url.d.ts:22-24) and populates it for PUBLIC
+ * sandboxes too — recorded verbatim on a public sandbox this repo created
+ * (Temp/daytona-sandbox/last-sandbox.json: `"public": true` next to a non-empty
+ * `"token"`). Inferring "required" from presence therefore labelled every PUBLIC
+ * hub URL "[x-daytona-preview-token required]" and sent consumers to attach a
+ * credential the proxy never asked for. @services/daytona never makes that
+ * inference: it reads sandbox.public and drops the header when public
+ * (setup-sandbox.ts:1601-1616, and its curlFor test pins a NON-EMPTY token + public
+ * producing NO header — setup-sandbox.test.ts:606-621). `public === undefined`
+ * means the caller cannot see visibility — REUSE mode, where the token is whatever
+ * the operator typed — so the token is kept there (conservative: an extra valid
+ * header is harmless, a missing one is a 401).
+ */
+export const needsPreviewToken = (publicFlag: boolean | undefined, token: string | undefined): boolean => publicFlag !== true && Boolean(token);
+
+/**
+ * The machine-readable line. Key order is insertion order, and a token key is
+ * emitted ONLY when needsPreviewToken says the header is actually required, so a
+ * consumer's `token`/`hubToken` check means "send this header" rather than "Daytona
+ * happened to hand back a string". In reuse mode `sandboxId`/`name`/`public` are
+ * absent (that sandbox was never ours) and `hubUrl` is explicitly `null` (no handle
+ * to mint a per-port preview link with) — a consumer must handle `null`, which is
  * why the key is kept instead of omitted.
  */
 export const buildSummary = (input: {
@@ -525,9 +554,9 @@ export const buildSummary = (input: {
     JSON.stringify({
         mode: input.mode,
         endpoint: input.endpoint,
-        ...(input.token ? { token: input.token } : {}),
+        ...(needsPreviewToken(input.public, input.token) ? { token: input.token } : {}),
         hubUrl: input.hubUrl,
-        ...(input.hubToken ? { hubToken: input.hubToken } : {}),
+        ...(needsPreviewToken(input.public, input.hubToken) ? { hubToken: input.hubToken } : {}),
         ...(input.sandboxId ? { sandboxId: input.sandboxId } : {}),
         ...(input.name ? { name: input.name } : {}),
         ...(input.public === undefined ? {} : { public: input.public }),
@@ -837,8 +866,12 @@ export const runStartDaytona = async (flags: StartDaytonaFlags, deps: StartDayto
         // The hub's preview link is authenticated with the SAME header Daytona uses for
         // every preview URL (setup-sandbox.ts `PREVIEW_TOKEN_HEADER`, deploy-daytona.mjs:225)
         // — naming a header that does not exist sends operators on a wild goose chase.
-        log(`${PREFIX}   hub URL (clients connect here)${hubToken ? ' [x-daytona-preview-token required]' : ' [public, no token]'}: ${hubUrl}`);
-        log(`${PREFIX}   management endpoint (POST/status/logs)${created.token ? ' [x-daytona-preview-token]' : ' [no token]'}: ${created.endpoint}`);
+        // Whether that header is NEEDED is visibility, not token presence (needsPreviewToken):
+        // a public sandbox — this script's default — is handed a token by Daytona as well,
+        // and calling its URL "[x-daytona-preview-token required]" told the operator the
+        // hub was authenticated when a bare GET to it works fine.
+        log(`${PREFIX}   hub URL (clients connect here)${needsPreviewToken(created.public, hubToken) ? ' [x-daytona-preview-token required]' : ' [public, no token]'}: ${hubUrl}`);
+        log(`${PREFIX}   management endpoint (POST/status/logs)${needsPreviewToken(created.public, created.token) ? ' [x-daytona-preview-token]' : ' [no token]'}: ${created.endpoint}`);
         log(`${PREFIX}   sandbox ${created.sandboxId} — bills until sandbox.delete()${flags.ttl === undefined ? ' (no --ttl fence was set)' : ` or its ${flags.ttl}-minute TTL fires`}`);
         if (!flags.wait) log(`${PREFIX}   (--no-wait: the deploy was accepted, the hub may still be booting — probe the hub URL)`);
         // LAST line, single-line JSON — the machine-readable contract in the header.
