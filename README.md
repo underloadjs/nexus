@@ -163,6 +163,9 @@ consumer sockets, SSE, artifacts, `/v1/observe`, `/metrics`), `crates/nexus-wasm
 `crates/nexus-worker-example`, the wasm build scripts, the Daytona deployment
 scripts and `documents/specifications/hub-specification.md`. All of that is now
 **[`@services/nexus`](../../../services/nexus)**, and nothing here compiles Rust.
+(`crates/nexus-wasm` and the wasm build scripts were retired in that package on
+2026-11-14 — it ships one native binary and nothing imports it as a library — so what
+moved here is the spine, the server, the worker example and the deploy scripts.)
 The observation contract this UI reads is `nexus-hub-observe/v1`, defined and
 accepted-tested in that package (`crates/nexus-server/src/observe.rs`); change it
 there and the monitor keeps rendering unknown fields, but a protocol-id change
