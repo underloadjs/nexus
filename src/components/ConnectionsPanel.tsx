@@ -1,5 +1,5 @@
 // Connections panel: the three-column topology graph
-// (consumers → jobs → supplier workers), drawn as plain SVG.
+// (supplier workers → jobs → consumers), drawn as plain SVG.
 //
 // No graphing library: the picture is exactly three columns of boxes with
 // cubic edges, and a static bundle benefits from shipping zero chart bytes.
@@ -7,12 +7,14 @@
 // ../../graph/build-graph.ts (pure, unit-tested).
 import { useMemo } from 'react';
 import type { NormalizedSnapshot } from '../api/nexus-client';
-import { buildGraphModel, MAX_NODES_PER_COLUMN, type GraphEdge, type GraphNode } from '../graph/build-graph';
+import { buildGraphModel, MAX_NODES_PER_COLUMN, type GraphColumn, type GraphEdge, type GraphNode } from '../graph/build-graph';
 import { EmptyState, Panel, StateChip } from './ui';
 
-// Fixed geometry: one column per side, job column in the middle. The 56 px
-// gutters between columns are where the bezier edges live.
-const COLUMN_X: Record<'consumer' | 'job' | 'worker', number> = { consumer: 12, job: 236, worker: 460 };
+// Fixed geometry, read left to right in the order an operator scans the hub:
+// supply (workers) → work (jobs) → demand (consumers). The 56 px gutters
+// between columns are where the bezier edges live. `buildGraphModel` emits
+// every edge in this same direction, so `from.x` is always left of `to.x`.
+const COLUMN_X: Record<GraphColumn, number> = { worker: 12, job: 236, consumer: 460 };
 const NODE_WIDTH = 168;
 const NODE_HEIGHT = 34;
 const ROW_GAP = 46;
@@ -20,7 +22,7 @@ const ROW_GAP = 46;
 const TOP_PADDING = 30;
 // Total drawing width: last column + node width + the same 12 px margin as
 // the left edge.
-const GRAPH_WIDTH = COLUMN_X.worker + NODE_WIDTH + 12;
+const GRAPH_WIDTH = COLUMN_X.consumer + NODE_WIDTH + 12;
 
 export interface ConnectionsPanelProps {
     snapshot: NormalizedSnapshot;
@@ -47,10 +49,11 @@ export function ConnectionsPanel({ snapshot }: ConnectionsPanelProps) {
     const model = useMemo(() => buildGraphModel(snapshot), [snapshot]);
 
     // y position per node id, computed per column so rows never overlap even
-    // when the columns have different sizes.
+    // when the columns have different sizes. Column order matches COLUMN_X:
+    // suppliers, jobs, consumers.
     const positions = useMemo(() => {
         const map = new Map<string, { x: number; y: number }>();
-        const columns: GraphNode[][] = [model.consumers, model.jobs, model.workers];
+        const columns: GraphNode[][] = [model.workers, model.jobs, model.consumers];
         for (const column of columns) {
             column.forEach((node, index) => {
                 map.set(node.id, { x: COLUMN_X[node.column], y: TOP_PADDING + index * ROW_GAP });
@@ -66,9 +69,9 @@ export function ConnectionsPanel({ snapshot }: ConnectionsPanelProps) {
     // remain identifiable even when one of them is empty (an idle hub has
     // jobs but maybe no consumers, and a bare gap would be ambiguous).
     const captions: Array<{ x: number; text: string; count: number; total: number }> = [
-        { x: COLUMN_X.consumer + NODE_WIDTH / 2, text: 'consumers', count: model.consumers.length, total: snapshot.consumerConnections.length },
+        { x: COLUMN_X.worker + NODE_WIDTH / 2, text: 'suppliers', count: model.workers.length, total: snapshot.workers.length },
         { x: COLUMN_X.job + NODE_WIDTH / 2, text: 'jobs', count: model.jobs.length, total: snapshot.jobs.length },
-        { x: COLUMN_X.worker + NODE_WIDTH / 2, text: 'suppliers', count: model.workers.length, total: snapshot.workers.length }
+        { x: COLUMN_X.consumer + NODE_WIDTH / 2, text: 'consumers', count: model.consumers.length, total: snapshot.consumerConnections.length }
     ];
 
     return (
@@ -78,7 +81,7 @@ export function ConnectionsPanel({ snapshot }: ConnectionsPanelProps) {
             hint={
                 model.aggregatedConsumers
                     ? 'Consumer side aggregated per tenant from jobs[].consumers (this hub reports no live connection objects).'
-                    : 'Edges: consumer → attached job, job → leased supplier.'
+                    : 'Edges: supplier → leased job, job → attached consumer.'
             }
             actions={
                 <span className="legend">
@@ -100,7 +103,7 @@ export function ConnectionsPanel({ snapshot }: ConnectionsPanelProps) {
                         screens instead of clipping, which is why there is no
                         responsive JS here. */}
                     <svg className="graph" viewBox={`0 0 ${GRAPH_WIDTH} ${height}`} width={GRAPH_WIDTH} height={height} role="img">
-                        <title>nexus topology: consumers, jobs and supplier workers</title>
+                        <title>nexus topology: supplier workers, jobs and consumers</title>
                         {captions.map((caption) => (
                             <text key={caption.text} className="graph-caption" x={caption.x} y={14}>
                                 {`${caption.text} (${caption.count}${caption.count < caption.total ? ` of ${caption.total}` : ''})`}
@@ -127,27 +130,7 @@ export function ConnectionsPanel({ snapshot }: ConnectionsPanelProps) {
                             );
                         })}
 
-                        {/* Aggregated fan-out counts ride on the tenant edges
-                            (a single edge can stand for N consumers). */}
-                        {model.edges
-                            .filter((edge) => edge.count !== undefined)
-                            .map((edge, index) => {
-                                const from = positions.get(edge.from);
-                                const to = positions.get(edge.to);
-                                if (!from || !to) return null;
-                                return (
-                                    <text
-                                        key={`count-${edge.from}->${edge.to}#${index}`}
-                                        className="graph-edge-count"
-                                        x={(from.x + NODE_WIDTH + to.x) / 2}
-                                        y={(from.y + to.y) / 2 + NODE_HEIGHT / 2 - 4}
-                                    >
-                                        {`×${edge.count}`}
-                                    </text>
-                                );
-                            })}
-
-                        {[...model.consumers, ...model.jobs, ...model.workers].map((node) => {
+                        {[...model.workers, ...model.jobs, ...model.consumers].map((node) => {
                             const position = positions.get(node.id);
                             if (!position) return null;
                             return (
@@ -170,7 +153,7 @@ export function ConnectionsPanel({ snapshot }: ConnectionsPanelProps) {
                     </svg>
                     {Math.max(model.consumers.length, model.jobs.length, model.workers.length) >= MAX_NODES_PER_COLUMN ? (
                         <p className="graph-note">
-                            Columns are capped at {MAX_NODES_PER_COLUMN} nodes for readability — the tables below list every row.
+                            Columns are capped at {MAX_NODES_PER_COLUMN} nodes for readability — the supplier/consumer tables beside this graph list every row.
                         </p>
                     ) : null}
                 </div>

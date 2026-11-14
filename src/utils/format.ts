@@ -29,19 +29,6 @@ export function formatAge(fromMs: number | null | undefined, nowMs: number): str
     return `${Math.floor(age / HOUR_MS)}h ${pad(Math.floor((age % HOUR_MS) / MINUTE_MS))}m ago`;
 }
 
-// Countdown text for lease deadlines. A negative remainder renders the
-// overrun (e.g. "-3s"): the hub may not have reclaimed the lease yet, and
-// that difference is exactly what an operator wants to see.
-export function formatRemaining(untilMs: number | null, nowMs: number): string {
-    if (typeof untilMs !== 'number' || !Number.isFinite(untilMs)) return '—';
-    const remaining = untilMs - nowMs;
-    const sign = remaining < 0 ? '-' : '';
-    const abs = Math.abs(remaining);
-    if (abs < JUST_NOW_MS) return `${sign}0s`;
-    if (abs < MINUTE_MS) return `${sign}${Math.floor(abs / 1000)}s`;
-    return `${sign}${Math.floor(abs / MINUTE_MS)}m`;
-}
-
 // Compact labels for the graph and tables: long ids (w-9f3c…, job-71ab…)
 // stay recognisable when abbreviated as `w-9f3c…7d2`.
 export function shortId(id: string, prefix = 6, suffix = 3): string {
@@ -56,7 +43,8 @@ export function formatCounter(value: number): string {
     return Number.isFinite(value) ? value.toLocaleString('en-US') : String(value);
 }
 
-// Absolute clock time for created/deadline tooltips.
+// Absolute clock time (Overview's "hub clock" sub line next to the browser's
+// own age), so browser/hub drift is visible at a glance.
 export function formatClockTime(ms: number): string {
     return new Date(ms).toLocaleTimeString('en-US', { hour12: false });
 }

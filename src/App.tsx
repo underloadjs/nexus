@@ -5,14 +5,12 @@
 // says is gone).
 import { useCallback, useState } from 'react';
 import { Banners } from './components/Banners';
-import { ConnectBar } from './components/ConnectBar';
 import { ConnectScreen } from './components/ConnectScreen';
 import { ConnectionsPanel } from './components/ConnectionsPanel';
 import { ConsumersPanel } from './components/ConsumersPanel';
-import { JobsPanel } from './components/JobsPanel';
 import { MetricsPanel } from './components/MetricsPanel';
 import { OverviewPanel } from './components/OverviewPanel';
-import { PoolsPanel } from './components/PoolsPanel';
+import { StatusBar } from './components/StatusBar';
 import { SuppliersPanel } from './components/SuppliersPanel';
 import { useNexusPoll } from './hooks/use-nexus-poll';
 import { useNowTick } from './hooks/use-now-tick';
@@ -20,7 +18,9 @@ import { getPageProtocol, isMixedContentBlocked, loadStoredUrl, saveStoredUrl } 
 
 export function App() {
     // null = the connect screen. Kept in state (not derived from storage) so
-    // "Disconnect" is immediate and storage remains only a convenience.
+    // the page always starts on the connect screen: reloading is the one way to
+    // re-attach to a hub or point at a different one, and the input below is
+    // pre-seeded from storage (`storedUrl`).
     const [baseUrl, setBaseUrl] = useState<string | null>(null);
     // Seed for the connect input, read once: localStorage access can throw,
     // which loadStoredUrl already swallows.
@@ -34,14 +34,10 @@ export function App() {
         setBaseUrl(url);
     }, []);
 
-    const disconnect = useCallback(() => setBaseUrl(null), []);
-
-    // Pausing is a view control: the snapshot stays on screen, frozen.
-    const togglePaused = useCallback(() => poll.setPaused(!poll.paused), [poll]);
-
-    // Chip/banner status. Error wins over paused: if the hub died while a
-    // poll was in flight, "paused · 3s ago" would hide the real problem.
-    const status = baseUrl === null ? 'pending' : poll.error !== null ? 'error' : poll.paused ? 'paused' : poll.snapshot !== null ? 'live' : 'pending';
+    // Chip/banner status. The poll loop has no pause control, so this is the
+    // whole state set: error while a poll fails (even with a snapshot on
+    // screen), live once a snapshot exists, pending before the first response.
+    const status = baseUrl === null ? 'pending' : poll.error !== null ? 'error' : poll.snapshot !== null ? 'live' : 'pending';
 
     const mixedContent = baseUrl !== null && isMixedContentBlocked(baseUrl, getPageProtocol());
 
@@ -70,17 +66,11 @@ export function App() {
                         polling <span className="mono">{baseUrl}</span> · read-only
                     </span>
                 </div>
-                {/* `key` remounts the bar on every URL change so its local
-                    draft input re-seeds from the connected hub (no
-                    props-state sync effect needed). */}
-                <ConnectBar
-                    key={baseUrl}
-                    baseUrl={baseUrl}
-                    onReconnect={connect}
-                    onDisconnect={disconnect}
-                    paused={poll.paused}
-                    onTogglePaused={togglePaused}
-                    onRefresh={poll.refresh}
+                {/* Read-only status chip. The hub URL itself is fixed for this
+                    page load and already shown by `brand-meta`; changing it is
+                    a reload, not a header control. No `key` needed any more —
+                    the bar keeps no local draft state. */}
+                <StatusBar
                     status={status}
                     lastSuccessMs={poll.lastSuccessMs}
                     nowMs={nowMs}
@@ -115,16 +105,22 @@ export function App() {
                 </div>
             ) : (
                 <main className="grid">
+                    {/* Overview leads with the headline numbers, then a
+                        two-column row: supplier/consumer tables on the LEFT,
+                        the Connections graph (exactly half the width) on the
+                        RIGHT. Pools and the active-jobs table were removed:
+                        per-pool gauges are still in /metrics (Metrics panel)
+                        and the job/lease state is already drawn by the graph. */}
                     <div className="span-all">
                         <OverviewPanel snapshot={poll.snapshot} metrics={poll.metrics} nowMs={nowMs} />
                     </div>
-                    <PoolsPanel snapshot={poll.snapshot} />
-                    <JobsPanel snapshot={poll.snapshot} nowMs={nowMs} />
-                    <div className="span-all">
+                    <div className="span-all connections-row">
+                        <div className="panel-stack">
+                            <SuppliersPanel snapshot={poll.snapshot} nowMs={nowMs} />
+                            <ConsumersPanel snapshot={poll.snapshot} nowMs={nowMs} />
+                        </div>
                         <ConnectionsPanel snapshot={poll.snapshot} />
                     </div>
-                    <SuppliersPanel snapshot={poll.snapshot} nowMs={nowMs} />
-                    <ConsumersPanel snapshot={poll.snapshot} nowMs={nowMs} />
                     <div className="span-all">
                         <MetricsPanel metrics={poll.metrics} metricsError={poll.metricsError} />
                     </div>

@@ -25,13 +25,18 @@ different origin.
 
 | Panel | Source | Content |
 | --- | --- | --- |
-| Overview | `/v1/observe` + `/metrics` | readiness (capacity signal, ready/loading workers, queue depth, mailbox pending, warm models), active jobs split by leased/queued, consumer connections, unresponsive pools, snapshot age (with the hub's own clock), and the cumulative accepted/rejected/terminal job counters |
-| Pools | `/v1/observe` | one card per pool: queue depth next to ready/loading/connected workers, leases and mailbox pending; pools the hub flags as unresponsive are badged, and flagged ids with no stats entry are listed under the cards |
-| Jobs (active) | `/v1/observe` | every active job: pool, tenant, phase, consumer count, the worker holding the lease, lease epoch/attempt, remaining deadline, age |
-| Connections | `/v1/observe` | three-column SVG graph: consumers → jobs → suppliers. Edges come from `consumer_connections[].attached_jobs` and `jobs[].lease.worker`; live vs. orphaned suppliers and leased vs. queued jobs are drawn differently |
-| Suppliers (workers) | `/v1/observe` | per worker: pools, link, engine, epoch, free/capacity slots, free KV tokens, in-flight jobs, outstanding claims, last-seen age, and expandable raw telemetry JSON |
+| Overview | `/v1/observe` + `/metrics` | readiness (capacity signal, queue depth, mailbox pending, warm models), consumer connections, unresponsive pools, snapshot age (with the hub's own clock), and the cumulative accepted/rejected/terminal job counters |
+| Connections | `/v1/observe` | half-width three-column SVG graph: supplier workers → jobs → consumers. Edges come from `jobs[].lease.worker` (supplier → leased job) and `consumer_connections[].attached_jobs` (job → attached consumer); live vs. orphaned suppliers and leased vs. queued jobs are drawn differently. The Suppliers and Consumers tables sit to its left |
+| Suppliers (workers) | `/v1/observe` | per worker: pools, free/capacity slots, outstanding claims, last-seen age, and expandable raw telemetry JSON (in-flight job ids + engine telemetry). Link and engine state are not columns: each row's status edge encodes them (green live+ready, amber live+loading, red orphaned or degraded) and the raw words stay in the row's tooltip |
 | Consumers | `/v1/observe` | live consumer connections (tenant, attached jobs, connected-for) plus the per-job consumer counts the scheduler reports |
 | Metrics | `/metrics` | Prometheus text parsed in the browser: latency averages from the `_sum`/`_count` summary pairs (`nexus_dispatch_latency_ms`, `nexus_ttft_ms`, `nexus_job_duration_ms`), then every series with its labels |
+
+Overview spans the top, the supplier and consumer tables stack in the left half
+of the next row with the Connections graph filling the right half, and Metrics
+spans the bottom.
+There is no separate per-pool card grid or active-jobs table: `/metrics` carries
+the per-pool gauges, and the graph already shows every active job with its lease
+(queued jobs have no incoming supplier edge).
 
 The page never writes to the hub — there is no button that can mutate it.
 
@@ -77,8 +82,10 @@ resolving into the hoisted root install; in a standalone checkout (CI, or a plai
    as `http://`; trailing slashes are trimmed. The last URL is remembered in
    your browser (localStorage).
 3. Polling starts immediately (1 s interval, exponential backoff while the hub
-   is unreachable). **Pause** freezes the current snapshot, **Refresh now**
-   forces one poll, **Disconnect** returns to the connect screen.
+   is unreachable) and runs until the page is closed — there is no pause,
+   refresh or disconnect control. The header chip is read-only: `live · Ns ago`,
+   `connecting…`, or `unreachable (N×)`. To point the monitor at another hub,
+   reload the page; the connect screen is pre-filled with the remembered URL.
 
 ### Requirements on the hub side
 

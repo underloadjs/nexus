@@ -111,6 +111,25 @@ code,
     grid-column: 1 / -1;
 }
 
+/* Connections row: the supplier/consumer stack takes the left half, the graph
+   the right half. `span-all` still applies (the row itself spans the dashboard
+   grid); this is a two-column grid *inside* that span. */
+.connections-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: var(--gap);
+    align-items: start;
+}
+
+.panel-stack {
+    display: flex;
+    flex-direction: column;
+    gap: var(--gap);
+    /* Without this a wide table inside the stack would push the grid track
+       past its 1fr share instead of scrolling/truncating. */
+    min-width: 0;
+}
+
 /* ── Connect screen ───────────────────────────────────────────────────── */
 
 .connect-screen {
@@ -161,11 +180,6 @@ code,
     color: var(--muted);
 }
 
-.field-label-inline {
-    display: inline;
-    margin: 0;
-}
-
 .url-input {
     width: 100%;
     padding: 10px 12px;
@@ -182,21 +196,10 @@ code,
     border-color: var(--accent);
 }
 
-.url-input-compact {
-    width: 320px;
-    max-width: 46vw;
-    padding: 7px 10px;
-}
-
 .field-error {
     margin: 0;
     color: var(--bad);
     font-size: 12px;
-}
-
-.field-error-inline {
-    display: inline-block;
-    margin-left: 4px;
 }
 
 .field-warn {
@@ -232,10 +235,6 @@ code,
     font-weight: 600;
 }
 
-.btn-ghost {
-    background: transparent;
-}
-
 .btn-mini {
     padding: 3px 8px;
     font-size: 11px;
@@ -252,22 +251,12 @@ code,
     font-size: 12px;
 }
 
-/* ── Connected header bar ─────────────────────────────────────────────── */
+/* ── Connected header status (read-only) ──────────────────────────────── */
 
-.connect-bar {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-    align-items: flex-end;
-}
-
-.connect-form {
-    display: flex;
-    gap: 8px;
-    align-items: center;
-}
-
-.bar-controls {
+/* Only the poll chip lives here now. The hub URL form, Reconnect, Disconnect,
+   Pause and Refresh now were removed: the hub URL is fixed for the page load
+   and pointing at another hub is a reload (see components/StatusBar.tsx). */
+.status-bar {
     display: flex;
     gap: 8px;
     align-items: center;
@@ -311,10 +300,6 @@ code,
 .chip.tone-info {
     border-color: rgba(96, 165, 250, 0.5);
     color: var(--info);
-}
-
-.tone-warn-text {
-    color: var(--warn);
 }
 
 .legend {
@@ -531,64 +516,6 @@ code,
     word-break: break-all;
 }
 
-/* ── Pool cards ───────────────────────────────────────────────────────── */
-
-.pool-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-    gap: 10px;
-}
-
-.pool-card {
-    padding: 10px 12px;
-    background: var(--panel-2);
-    border: 1px solid var(--line);
-    border-radius: 8px;
-}
-
-.pool-flagged {
-    border-color: rgba(248, 113, 113, 0.55);
-    background: rgba(248, 113, 113, 0.06);
-}
-
-.pool-head {
-    display: flex;
-    gap: 8px;
-    align-items: center;
-    justify-content: space-between;
-    margin-bottom: 8px;
-}
-
-.pool-id {
-    font-size: 12px;
-    word-break: break-all;
-}
-
-.pool-stats {
-    display: grid;
-    grid-template-columns: repeat(3, 1fr);
-    gap: 6px;
-    margin: 0;
-}
-
-.pool-stats div {
-    display: flex;
-    flex-direction: column;
-}
-
-.pool-stats dt {
-    color: var(--muted);
-    font-size: 10px;
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-}
-
-.pool-stats dd {
-    margin: 0;
-    font-family: var(--font-mono);
-    font-size: 16px;
-}
-
 /* ── Tables ───────────────────────────────────────────────────────────── */
 
 .table-scroll {
@@ -645,6 +572,34 @@ code,
 
 .row-expanded td {
     background: rgba(34, 211, 238, 0.06);
+}
+
+/* Supplier row status edge (SuppliersPanel.tsx `rowTone`): the link/engine
+   columns were removed and their two axes folded into one coloured stripe on
+   the row's leading edge. A real `border-left` is used rather than the earlier
+   inset box-shadow: the shadow ended at the cell's own border-box while the
+   row rule was painted on the shared collapsed grid, so the corner never met
+   (a detached green line under the last row and a notch at the top). A left
+   border is part of that grid, so it runs edge to edge and cannot double up
+   with a neighbour's border.
+   The transparent base keeps the first column aligned for every row, whether
+   or not it carries a tone ('neutral' = an enum value this build does not
+   know, see `rowTone`). */
+.suppliers-table th:first-child,
+.suppliers-table td:first-child {
+    border-left: 3px solid transparent;
+}
+
+.suppliers-table tbody tr.row-tone-ok td:first-child {
+    border-left-color: var(--ok);
+}
+
+.suppliers-table tbody tr.row-tone-warn td:first-child {
+    border-left-color: var(--warn);
+}
+
+.suppliers-table tbody tr.row-tone-bad td:first-child {
+    border-left-color: var(--bad);
 }
 
 .row-detail td {
@@ -734,12 +689,6 @@ code,
     font-size: 12px;
 }
 
-.graph-edge-count {
-    fill: var(--muted);
-    font-size: 10px;
-    text-anchor: middle;
-}
-
 .node-box {
     fill: var(--panel-2);
     stroke: var(--line-strong);
@@ -810,14 +759,13 @@ code,
         flex-direction: column;
     }
 
-    .connect-bar {
+    .status-bar {
         align-items: stretch;
     }
 
-    .url-input-compact {
-        max-width: none;
-        width: 100%;
-        flex: 1;
+    /* The graph and the supplier/consumer stack become one column. */
+    .connections-row {
+        grid-template-columns: 1fr;
     }
 
     .detail-grid {

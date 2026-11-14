@@ -1,12 +1,18 @@
-// Graph model for the Connections panel: a three-column consumer → job →
-// supplier topology derived from ONE observe snapshot.
+// Graph model for the Connections panel: a three-column supplier → job →
+// consumer topology derived from ONE observe snapshot.
+//
+// Column order is the operator's reading order, left to right: who serves
+// (supplier workers), what is being served (jobs), who is waiting on it
+// (consumers). Edges are therefore always stored in DRAWING direction — from
+// the left column to the right column — so the SVG renderer can assume
+// `from.x < to.x` for every edge.
 //
 // Pure + dependency-free (node-environment unit-testable) — the SVG
 // component only draws what this returns.
 import type { NormalizedJob, NormalizedSnapshot, NormalizedWorker } from '../api/nexus-client';
 import { shortId } from '../utils/format';
 
-export type GraphColumn = 'consumer' | 'job' | 'worker';
+export type GraphColumn = 'worker' | 'job' | 'consumer';
 
 export interface GraphNode {
     id: string;
@@ -23,11 +29,16 @@ export interface GraphNode {
 }
 
 export interface GraphEdge {
+    // `attached`: job → consumer watching it. `lease`: worker → job it holds.
+    // `tenant`: job → aggregated per-tenant consumer node (fallback when the
+    // hub reports no live connections).
     kind: 'attached' | 'lease' | 'tenant';
+    // Both endpoints, in drawing direction: `from` is always the column further
+    // left (worker → job → consumer). No fan-out count is carried any more —
+    // the fan-out is drawn as one line per connection, and per-node totals are
+    // already in each node's sub/title text.
     from: string;
     to: string;
-    // Aggregated tenant edges carry the fan-out count (drawn on the edge).
-    count?: number;
 }
 
 export interface GraphModel {
@@ -110,21 +121,22 @@ export function buildGraphModel(snapshot: NormalizedSnapshot): GraphModel {
 
     const connections = snapshot.consumerConnections;
     if (connections.length > 0) {
-        // Live consumer connections: one node each, edges to their attached
-        // jobs (the exact who-talks-to-whom the hub reports).
+        // Live consumer connections: one node each, edges from the attached
+        // job (left/middle column) to the consumer (right column).
         consumers = take(connections).map((connection) =>
             consumerNode(connection.id, connection.tenant, shortId(connection.id, 8, 3), `${connection.id} · ${connection.tenant}`)
         );
         for (const connection of connections) {
             for (const jobId of connection.attachedJobs) {
-                if (jobIds.has(jobId)) edges.push({ kind: 'attached', from: connection.id, to: jobId });
+                if (jobIds.has(jobId)) edges.push({ kind: 'attached', from: jobId, to: connection.id });
             }
         }
     } else {
         // Fallback aggregation: the hub reported no connection objects (older
         // build, or consumers that never opened the stream), but each job
         // carries `tenant` + `consumers`. Group by tenant so the shape of the
-        // traffic is still visible, and label edges with the fan-out.
+        // traffic is still visible; the tenant node's title keeps the fan-out
+        // count, one line per job is drawn rather than a ×N label.
         aggregatedConsumers = snapshot.jobs.length > 0;
         const byTenant = new Map<string, { count: number; jobs: string[] }>();
         for (const job of snapshot.jobs) {
@@ -143,17 +155,17 @@ export function buildGraphModel(snapshot: NormalizedSnapshot): GraphModel {
             );
         for (const [tenant, entry] of byTenant) {
             for (const jobId of entry.jobs) {
-                if (jobIds.has(jobId)) edges.push({ kind: 'tenant', from: `tenant:${tenant}`, to: jobId, count: entry.count });
+                if (jobIds.has(jobId)) edges.push({ kind: 'tenant', from: jobId, to: `tenant:${tenant}` });
             }
         }
     }
 
-    // Lease edges: job → the worker currently holding it. Queued jobs simply
-    // have no outgoing edge, which is exactly the "waiting for capacity"
-    // signal in the picture.
+    // Lease edges: the worker holding the lease → the job it runs, i.e. left
+    // column to middle column. Queued jobs simply have no incoming edge, which
+    // is exactly the "waiting for capacity" signal in the picture.
     for (const job of snapshot.jobs) {
         const workerId = job.lease?.worker;
-        if (workerId && workerIds.has(workerId)) edges.push({ kind: 'lease', from: job.id, to: workerId });
+        if (workerId && workerIds.has(workerId)) edges.push({ kind: 'lease', from: workerId, to: job.id });
     }
 
     // Final safety net: a column may have been truncated by

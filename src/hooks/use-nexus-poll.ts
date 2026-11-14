@@ -11,8 +11,13 @@
 //      rendered — otherwise a slow poll could overwrite newer data),
 //   2. exponential backoff while the hub is unreachable (a dead hub must not
 //      become a request-per-second hammer),
-//   3. full teardown on disconnect/pause (abort + clear timer, no orphans).
-import { useCallback, useEffect, useState } from 'react';
+//   3. full teardown when the hub URL goes away (abort + clear timer, no
+//      orphans).
+//
+// There is deliberately no pause and no manual refresh: the monitor has no
+// controls that stop or accelerate the loop, so the schedule is the only
+// driver (see StatusBar.tsx for the read-only indicator it feeds).
+import { useEffect, useState } from 'react';
 import { fetchMetricsText, fetchObserve, type NormalizedSnapshot } from '../api/nexus-client';
 import { parsePrometheusText, type MetricFamily } from '../api/prometheus';
 
@@ -44,13 +49,6 @@ export interface PollState {
     hasCompletedFirstAttempt: boolean;
 }
 
-export interface PollController extends PollState {
-    paused: boolean;
-    setPaused: (paused: boolean) => void;
-    // Immediate out-of-band poll (restarts the schedule from `interval`).
-    refresh: () => void;
-}
-
 // Exponential backoff: interval, 2×, 4× … clamped. Attempt 1 (the first
 // failure) already waits `interval`, so a momentary blip is invisible.
 export function backoffDelayMs(failureCount: number, intervalMs: number): number {
@@ -58,9 +56,9 @@ export function backoffDelayMs(failureCount: number, intervalMs: number): number
     return Math.min(intervalMs * growth, MAX_BACKOFF_MS);
 }
 
-// Hook state machine. `baseUrl` null means "disconnected": the effect tears
+// Hook state machine. `baseUrl` null means "no hub attached": the effect tears
 // everything down and the state resets to the connect screen's expectations.
-export function useNexusPoll(baseUrl: string | null, intervalMs: number = DEFAULT_POLL_INTERVAL_MS): PollController {
+export function useNexusPoll(baseUrl: string | null, intervalMs: number = DEFAULT_POLL_INTERVAL_MS): PollState {
     const [state, setState] = useState<PollState>({
         snapshot: null,
         protocolWarning: undefined,
@@ -72,18 +70,11 @@ export function useNexusPoll(baseUrl: string | null, intervalMs: number = DEFAUL
         nextAttemptMs: null,
         hasCompletedFirstAttempt: false
     });
-    const [paused, setPaused] = useState(false);
-
-    // Manual refresh bumps a token that re-runs the effect (immediate poll +
-    // fresh schedule). Cheap, and it reuses the abort/cleanup path instead of
-    // duplicating it.
-    const [refreshToken, setRefreshToken] = useState(0);
-    const refresh = useCallback(() => setRefreshToken((token) => token + 1), []);
 
     useEffect(() => {
         if (!baseUrl) {
-            // Disconnected (or never connected): wipe the slate so the next
-            // connect starts from a clean "connecting…" state.
+            // No hub attached: wipe the slate so the next connect starts from
+            // a clean "connecting…" state.
             setState({
                 snapshot: null,
                 protocolWarning: undefined,
@@ -95,10 +86,8 @@ export function useNexusPoll(baseUrl: string | null, intervalMs: number = DEFAUL
                 nextAttemptMs: null,
                 hasCompletedFirstAttempt: false
             });
-            setPaused(false);
             return;
         }
-        if (paused) return;
 
         let cancelled = false;
         let timer: ReturnType<typeof setTimeout> | undefined;
@@ -158,7 +147,7 @@ export function useNexusPoll(baseUrl: string | null, intervalMs: number = DEFAUL
                 schedule(intervalMs);
             } catch (error) {
                 if (cancelled || controller.signal.aborted) return;
-                // An explicit abort (disconnect/pause/replace) is not an error.
+                // An explicit abort (teardown/replace) is not an error.
                 if ((error as Error | undefined)?.name === 'AbortError') return;
                 failures += 1;
                 setState((prev) => ({
@@ -182,9 +171,9 @@ export function useNexusPoll(baseUrl: string | null, intervalMs: number = DEFAUL
             inFlight?.abort();
         };
         // The effect deliberately does NOT depend on poll state (that would
-        // restart the loop every second); `refreshToken` is the manual-refresh
-        // trigger, and `paused`/`baseUrl` changes rebuild the schedule.
-    }, [baseUrl, intervalMs, paused, refreshToken]);
+        // restart the loop every second); only the hub URL and cadence rebuild
+        // the schedule.
+    }, [baseUrl, intervalMs]);
 
-    return { ...state, paused, setPaused, refresh };
+    return state;
 }

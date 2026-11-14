@@ -4,7 +4,7 @@
 import { describe, expect, it } from 'vitest';
 import { renderToString } from 'react-dom/server';
 import { normalizeObserveSnapshot } from '../api/nexus-client';
-import { MAX_NODES_PER_COLUMN, buildGraphModel } from './build-graph';
+import { MAX_NODES_PER_COLUMN, buildGraphModel, type GraphEdge } from './build-graph';
 import { ConnectionsPanel } from '../components/ConnectionsPanel';
 
 const NOW = 1_762_760_000_000;
@@ -71,14 +71,19 @@ describe('buildGraphModel (live connections)', () => {
         expect(model.consumers.map((node) => node.state)).toEqual(['default', 'tenant-b']);
     });
 
-    it('draws consumer→job and job→worker edges, dropping dangling ids', () => {
+    // Edges are stored in DRAWING direction (build-graph.ts:6-8): the left
+    // column is always `from`, so worker → job → consumer.
+    it('draws job→consumer and worker→job edges in drawing order, dropping dangling ids', () => {
         const model = buildGraphModel(LIVE_TOPOLOGY);
-        // Deterministic order: from, then to, then kind.
+        // Deterministic order: from, then to, then kind — 'job-1' < 'job-2' < 'w-a'.
         expect(model.edges).toEqual([
-            { kind: 'attached', from: 'c-1', to: 'job-1' },
-            { kind: 'attached', from: 'c-2', to: 'job-2' },
-            { kind: 'lease', from: 'job-1', to: 'w-a' }
+            { kind: 'attached', from: 'job-1', to: 'c-1' },
+            { kind: 'attached', from: 'job-2', to: 'c-2' },
+            { kind: 'lease', from: 'w-a', to: 'job-1' }
         ]);
+        // GraphEdge is exactly { kind, from, to } now: the ×N fan-out labels
+        // were removed from the UI, so no edge may smuggle a count back in.
+        expect(model.edges.every((edge) => !('count' in edge))).toBe(true);
     });
 
     it('carries full ids in the tooltip titles and abbreviates labels', () => {
@@ -113,12 +118,13 @@ describe('buildGraphModel (tenant aggregation fallback)', () => {
         // can never collide with a real connection id.
         expect(model.consumers.map((node) => node.id)).toEqual(['tenant:default', 'tenant:tenant-b']);
         expect(model.consumers.map((node) => node.title)).toEqual(['5 consumer(s) across 2 job(s)', '1 consumer(s) across 1 job(s)']);
-        // The fan-out count rides on every edge of that tenant.
+        // One line per job, in drawing direction (job → tenant node); the
+        // fan-out total lives in the tenant node's title, not on the edges.
         expect(model.edges).toEqual([
-            { kind: 'lease', from: 'job-1', to: 'w-a' },
-            { kind: 'tenant', from: 'tenant:default', to: 'job-1', count: 5 },
-            { kind: 'tenant', from: 'tenant:default', to: 'job-2', count: 5 },
-            { kind: 'tenant', from: 'tenant:tenant-b', to: 'job-3', count: 1 }
+            { kind: 'tenant', from: 'job-1', to: 'tenant:default' },
+            { kind: 'tenant', from: 'job-2', to: 'tenant:default' },
+            { kind: 'tenant', from: 'job-3', to: 'tenant:tenant-b' },
+            { kind: 'lease', from: 'w-a', to: 'job-1' }
         ]);
     });
 
@@ -163,10 +169,25 @@ describe('buildGraphModel (caps)', () => {
 
         const drawnWorkers = new Set(model.workers.map((node) => node.id));
         const drawnJobs = new Set(model.jobs.map((node) => node.id));
+        const drawnConsumers = new Set(model.consumers.map((node) => node.id));
         // 30 attached + 30 lease; the five highest indexes lost both edges.
+        // Exact expected list: attached edges sort first because every `from`
+        // is `job-*` (lease `from` is `w-*`, and 'j' < 'w'), and each of the
+        // two groups has unique `from` ids in ascending index order.
+        const expectedEdges: GraphEdge[] = [
+            ...Array.from({ length: MAX_NODES_PER_COLUMN }, (_unused, index) => ({ kind: 'attached', from: `job-${suffix(index)}`, to: `c-${suffix(index)}` }) as GraphEdge),
+            ...Array.from({ length: MAX_NODES_PER_COLUMN }, (_unused, index) => ({ kind: 'lease', from: `w-${suffix(index)}`, to: `job-${suffix(index)}` }) as GraphEdge)
+        ];
+        expect(model.edges).toEqual(expectedEdges);
         expect(model.edges).toHaveLength(MAX_NODES_PER_COLUMN * 2);
-        expect(model.edges.every((edge) => drawnWorkers.has(edge.to) || drawnJobs.has(edge.to))).toBe(true);
-        expect(model.edges.some((edge) => edge.from === 'c-034' || edge.to === 'w-034')).toBe(false);
+        // Every surviving edge points left→right: attached ends at a DRAWN
+        // consumer, lease starts at a drawn worker and ends at a drawn job.
+        expect(model.edges.filter((edge) => edge.kind === 'attached').every((edge) => drawnJobs.has(edge.from) && drawnConsumers.has(edge.to))).toBe(true);
+        expect(model.edges.filter((edge) => edge.kind === 'lease').every((edge) => drawnWorkers.has(edge.from) && drawnJobs.has(edge.to))).toBe(true);
+        // Capped-out rows must not leak in either direction: w-034 can only be
+        // a lease `from`, c-034 only an attached `to`, and neither is drawn.
+        expect(model.edges.some((edge) => edge.from === 'w-034')).toBe(false);
+        expect(model.edges.some((edge) => edge.to === 'c-034')).toBe(false);
     });
 });
 
@@ -174,6 +195,9 @@ describe('ConnectionsPanel (renderToString smoke)', () => {
     it('renders one edge path per visible edge and the legend', () => {
         const html = renderToString(<ConnectionsPanel snapshot={LIVE_TOPOLOGY} />);
         expect(html).toContain('class="graph"');
+        // The non-aggregated hint states the drawing direction the model now
+        // uses (build-graph.ts: GraphEdge.from is always the left column).
+        expect(html).toContain('<p class="panel-hint">Edges: supplier → leased job, job → attached consumer.</p>');
         // The model above has exactly three edges (the dangling job-gone is
         // dropped), so exactly three paths may be drawn.
         expect(html.match(/<path/g)?.length).toBe(3);
@@ -184,6 +208,15 @@ describe('ConnectionsPanel (renderToString smoke)', () => {
         expect(html).toContain('consumers (2)');
         expect(html).toContain('jobs (2)');
         expect(html).toContain('suppliers (2)');
+        // Caption order is the READING order of the columns, left to right:
+        // suppliers (x 12 + 84), jobs (x 236 + 84), consumers (x 460 + 84).
+        // Regex extraction preserves document order, so this pins the exact
+        // three-element sequence — fragments, positions and order at once.
+        expect(html.match(/<text class="graph-caption"[^>]*>[^<]*<\/text>/g)).toEqual([
+            '<text class="graph-caption" x="96" y="14">suppliers (2)</text>',
+            '<text class="graph-caption" x="320" y="14">jobs (2)</text>',
+            '<text class="graph-caption" x="544" y="14">consumers (2)</text>'
+        ]);
     });
 
     it('explains the aggregated fallback in the panel hint', () => {
@@ -194,8 +227,11 @@ describe('ConnectionsPanel (renderToString smoke)', () => {
                 })}
             />
         );
-        expect(html).toContain('Consumer side aggregated per tenant');
-        expect(html).toContain('×2');
+        expect(html).toContain('<p class="panel-hint">Consumer side aggregated per tenant from jobs[].consumers (this hub reports no live connection objects).</p>');
+        // The ×N fan-out labels are gone: the per-tenant total is only in the
+        // tenant node's title, and no edge-count element is rendered at all.
+        expect(html).not.toContain('graph-edge-count');
+        expect(html).not.toContain('×');
     });
 
     it('shows the friendly empty state for a bare hub', () => {

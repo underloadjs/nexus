@@ -28,10 +28,10 @@ export function OverviewPanel({ snapshot, metrics, nowMs }: OverviewPanelProps) 
     const { readiness } = snapshot;
     const signalTone: Tone = SIGNAL_TONES[readiness.capacitySignal] ?? 'neutral';
 
-    // Jobs are reported in two states that matter operationally: leased
-    // (actually executing somewhere) and queued (waiting for capacity).
-    const leased = snapshot.jobs.filter((job) => job.lease !== null).length;
-    const queued = snapshot.jobs.length - leased;
+    // Only the queue-depth card needs a job split now (the active-jobs card
+    // that also used `leased` was removed): a queued job is one the scheduler
+    // has not leased to a worker yet.
+    const queued = snapshot.jobs.filter((job) => job.lease === null).length;
 
     // Cumulative counters; null = the hub does not expose that metric, which
     // the card renders as "n/a" rather than a misleading 0.
@@ -52,11 +52,22 @@ export function OverviewPanel({ snapshot, metrics, nowMs }: OverviewPanelProps) 
                     tone={signalTone}
                     sub={readiness.warmModels.length > 0 ? `${readiness.warmModels.length} warm model(s)` : 'no warm models'}
                 />
-                <StatCard label="Ready workers" value={readiness.readyWorkers} tone={readiness.readyWorkers > 0 ? 'ok' : 'bad'} />
-                <StatCard label="Loading workers" value={readiness.loadingWorkers} tone={readiness.loadingWorkers > 0 ? 'warn' : 'neutral'} />
                 <StatCard label="Queue depth" value={readiness.queueDepth} tone={readiness.queueDepth > 0 ? 'warn' : 'ok'} sub={`${queued} queued job(s) shown`} />
-                <StatCard label="Mailbox pending" value={readiness.mailboxPending} tone={readiness.mailboxPending > 0 ? 'warn' : 'neutral'} />
-                <StatCard label="Active jobs" value={snapshot.jobs.length} sub={`${leased} leased · ${queued} unleased`} />
+                {/*
+                    Mailbox pending is NOT jobs and NOT consumer messages: it is
+                    the depth of each pool actor's bounded (512-slot) tokio mpsc
+                    inbox, summed across pools — the backpressure / wedged-actor
+                    signal, read from outside the actor.
+                    Server side: services/nexus/crates/nexus-server/src/state.rs:1041
+                    (`mailbox_pending`, "Pending messages in the mailbox, the
+                    backpressure signal"), aggregated in `Hub::readiness`
+                    (state.rs:934-946); rationale in observe.rs:165-167.
+                    Wire field: readiness.mailbox_pending → NormalizedReadiness.mailboxPending
+                    (api/nexus-client.ts:170). Sustained non-zero means the pool
+                    actor is behind its incoming message stream; the hard cap is
+                    512 per pool.
+                */}
+                <StatCard label="Mailbox pending" value={readiness.mailboxPending} tone={readiness.mailboxPending > 0 ? 'warn' : 'neutral'} sub="messages queued to pool actors" />
                 <StatCard
                     label="Consumer connections"
                     value={snapshot.consumerConnections.length}

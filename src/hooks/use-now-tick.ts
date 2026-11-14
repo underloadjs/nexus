@@ -1,7 +1,7 @@
 // One shared "now" clock for every relative timestamp in the dashboard.
 //
 // The poll already re-renders once a second while connected, but ages must
-// keep advancing when polling is paused or failing (that is exactly when
+// keep advancing while polling is failing or backed off (that is exactly when
 // "last updated 47s ago" matters most), so the ticker is independent.
 import { useEffect, useState } from 'react';
 

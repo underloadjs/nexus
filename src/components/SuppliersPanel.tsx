@@ -4,17 +4,36 @@
 // is sorted by the hub's own order (no client-side re-sort) so rows stay
 // stable between polls; ids are sorted upstream by the hub.
 //
-// The `kv free` column keeps the hub's null/0 split: `—` means the worker
-// never declared a KV budget, `0` means it reported one and has spent it all
-// (see `crates/nexus-server/src/observe.rs` in `@services/nexus`,
-// `worker_row_reports_a_kv_budget_of_null_rather_than_zero`).
+// The `link` and `engine` columns are deliberately gone: both are two axes of
+// one worker (socket lifecycle vs engine liveness, see `model.rs:79-103` in
+// @services/nexus) and reading two chips per row cost a third of the table
+// width. They are folded into the row's status edge instead — the tone below
+// is the dispatchability question, and the raw words stay in the row's title.
 import { Fragment, useState } from 'react';
-import type { EngineState, NormalizedSnapshot, WorkerLink } from '../api/nexus-client';
-import { formatAge, formatNumber, shortId } from '../utils/format';
-import { EmptyState, Panel, StateChip, type Tone } from './ui';
+import type { NormalizedSnapshot } from '../api/nexus-client';
+import { formatAge, shortId } from '../utils/format';
+import { EmptyState, Panel, type Tone } from './ui';
 
-const LINK_TONES: Record<WorkerLink, Tone> = { live: 'ok', orphaned: 'bad' };
-const ENGINE_TONES: Record<EngineState, Tone> = { ready: 'ok', loading: 'warn', degraded: 'bad' };
+// Status tone of one supplier row, i.e. "would the hub dispatch here?".
+//
+// The mapping is the dispatch gate from @services/nexus (`model.rs:209-222`:
+// `dispatchable()` = link live && engine ready && free slots > 0; `advertised()`
+// = link live only), minus the slot count, which the `slots` column already
+// shows:
+//   live + ready    -> ok    green edge, taking work
+//   live + loading  -> warn  amber edge, socket up, engine still warming
+//   live + degraded -> bad   red edge, socket up, engine regressed
+//   orphaned + any  -> bad   red edge, socket gone (resumable within grace)
+// A value this build does not know (a future hub enum member) falls back to
+// 'neutral' rather than masquerading as a known-bad state — the client's
+// `asEnum` deliberately keeps unknown text verbatim (`nexus-client.ts:150-154`).
+function rowTone(link: string, engine: string): Tone {
+    if (link === 'live' && engine === 'ready') return 'ok';
+    if (link === 'live' && engine === 'loading') return 'warn';
+    const knownLink = link === 'live' || link === 'orphaned';
+    const knownEngine = engine === 'ready' || engine === 'loading' || engine === 'degraded';
+    return knownLink && knownEngine ? 'bad' : 'neutral';
+}
 
 export interface SuppliersPanelProps {
     snapshot: NormalizedSnapshot;
@@ -47,7 +66,7 @@ export function SuppliersPanel({ snapshot, nowMs }: SuppliersPanelProps) {
         <Panel
             title="Suppliers (workers)"
             count={snapshot.workers.length}
-            hint="Capacity on the supply side: link state, engine state, free slots and outstanding claims."
+            hint="Capacity on the supply side: free slots and outstanding claims. The row edge is the worker's state — green ready, amber loading, red orphaned or degraded."
         >
             {snapshot.workers.length === 0 ? (
                 <EmptyState
@@ -56,17 +75,12 @@ export function SuppliersPanel({ snapshot, nowMs }: SuppliersPanelProps) {
                 />
             ) : (
                 <div className="table-scroll">
-                    <table className="table">
+                    <table className="table suppliers-table">
                         <thead>
                             <tr>
                                 <th>worker</th>
                                 <th>pools</th>
-                                <th>link</th>
-                                <th>engine</th>
-                                <th>epoch</th>
                                 <th title="free / capacity execution slots">slots</th>
-                                <th title="free KV cache tokens; — means this worker reports no KV budget">kv free</th>
-                                <th>in flight</th>
                                 <th>claims</th>
                                 <th>last seen</th>
                                 <th aria-label="telemetry" />
@@ -75,10 +89,9 @@ export function SuppliersPanel({ snapshot, nowMs }: SuppliersPanelProps) {
                         <tbody>
                             {snapshot.workers.map((worker) => {
                                 const open = expanded.includes(worker.id);
-                                // Unknown enum values fall back to neutral
-                                // rather than pretending to be a known state.
-                                const linkTone: Tone = LINK_TONES[worker.link] ?? 'neutral';
-                                const engineTone: Tone = ENGINE_TONES[worker.engine] ?? 'neutral';
+                                // One tone per row, derived from both axes —
+                                // see `rowTone` above for the mapping.
+                                const tone: Tone = rowTone(worker.link, worker.engine);
                                 const usedSlots = Math.max(0, worker.capacitySlots - worker.freeSlots);
                                 const slotRatio = worker.capacitySlots > 0 ? usedSlots / worker.capacitySlots : 0;
                                 return (
@@ -86,20 +99,22 @@ export function SuppliersPanel({ snapshot, nowMs }: SuppliersPanelProps) {
                                     // optional telemetry detail row are one
                                     // list item for React.
                                     <Fragment key={worker.id}>
-                                        <tr key={worker.id} className={open ? 'row-expanded' : undefined}>
+                                        <tr
+                                            key={worker.id}
+                                            // The edge colour is the removed
+                                            // link/engine columns; the title
+                                            // keeps the raw words reachable
+                                            // (same convention as the graph
+                                            // node title, build-graph.ts:94-96).
+                                            className={`row-tone-${tone}${open ? ' row-expanded' : ''}`}
+                                            title={`${worker.link || 'unknown'} · ${worker.engine || 'unknown'}`}
+                                        >
                                             <td className="mono" title={worker.id}>
                                                 {shortId(worker.id, 10, 4)}
                                             </td>
                                             <td className="cell-pools" title={worker.pools.join(', ')}>
                                                 {worker.pools.length > 0 ? worker.pools.join(', ') : '—'}
                                             </td>
-                                            <td>
-                                                <StateChip label={worker.link || 'unknown'} tone={linkTone} />
-                                            </td>
-                                            <td>
-                                                <StateChip label={worker.engine || 'unknown'} tone={engineTone} />
-                                            </td>
-                                            <td>{worker.epoch}</td>
                                             <td className="cell-slots">
                                                 {/* Slot usage bar — the one genuinely
                                                     dynamic width in the app, so it is an
@@ -111,8 +126,6 @@ export function SuppliersPanel({ snapshot, nowMs }: SuppliersPanelProps) {
                                                     {worker.freeSlots}/{worker.capacitySlots}
                                                 </span>
                                             </td>
-                                            <td>{formatNumber(worker.freeKvTokens)}</td>
-                                            <td title={worker.inFlight.join('\n')}>{worker.inFlight.length}</td>
                                             <td>{worker.outstandingClaims}</td>
                                             <td>{formatAge(worker.lastSeenMs, nowMs)}</td>
                                             <td>
@@ -128,7 +141,7 @@ export function SuppliersPanel({ snapshot, nowMs }: SuppliersPanelProps) {
                                         </tr>
                                         {open ? (
                                             <tr key={`${worker.id}:telemetry`} className="row-detail">
-                                                <td colSpan={11}>
+                                                <td colSpan={6}>
                                                     <div className="detail-grid">
                                                         <div>
                                                             <h4>in-flight jobs</h4>

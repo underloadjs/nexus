@@ -3,7 +3,7 @@
 // renders. All node-environment (no jsdom), so the storage helpers are
 // exercised in their "no window" form.
 import { describe, expect, it } from 'vitest';
-import { formatAge, formatCounter, formatNumber, formatRemaining, shortId } from './format';
+import { formatAge, formatCounter, formatNumber, shortId } from './format';
 import {
     DEFAULT_HUB_URL,
     STORAGE_KEY_URL,
@@ -95,16 +95,6 @@ describe('formatAge', () => {
         expect(formatAge(Number.NaN, NOW)).toBe('—');
         // Browser clock behind the hub: clamp, do not show "-5s ago".
         expect(formatAge(NOW + 5000, NOW)).toBe('just now');
-    });
-});
-
-describe('formatRemaining', () => {
-    it('shows the countdown, the overrun sign, and a dash when unknown', () => {
-        expect(formatRemaining(NOW + 5000, NOW)).toBe('5s');
-        expect(formatRemaining(NOW, NOW)).toBe('0s');
-        expect(formatRemaining(NOW - 3000, NOW)).toBe('-3s');
-        expect(formatRemaining(NOW - 90_000, NOW)).toBe('-1m');
-        expect(formatRemaining(null, NOW)).toBe('—');
     });
 });
 
