@@ -58,7 +58,7 @@ export function OverviewPanel({ snapshot, metrics, nowMs }: OverviewPanelProps) 
                     the depth of each pool actor's bounded (512-slot) tokio mpsc
                     inbox, summed across pools — the backpressure / wedged-actor
                     signal, read from outside the actor.
-                    Server side: services/nexus/crates/nexus-server/src/state.rs:1041
+                    Server side: packages/typecrate/nexus/crates/nexus-server/src/state.rs:1041
                     (`mailbox_pending`, "Pending messages in the mailbox, the
                     backpressure signal"), aggregated in `Hub::readiness`
                     (state.rs:934-946); rationale in observe.rs:165-167.

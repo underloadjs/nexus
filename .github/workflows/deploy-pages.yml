@@ -3,7 +3,7 @@
 # WHAT THIS REPO IS: the read-only observability console for a nexus hub — a
 # static Vite + React app that polls the hub's GET /v1/observe and GET /metrics
 # APIs. The Rust hub those APIs are served by is a separate package now
-# (noobscript `services/nexus`, `@services/nexus`), so there is no cargo build
+# (noobscript `packages/typecrate/nexus`, `@typecrate/nexus`), so there is no cargo build
 # in this workflow and no Rust path filter to skip: the only buildable thing
 # tracked here is the site.
 #

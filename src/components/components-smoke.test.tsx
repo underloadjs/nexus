@@ -291,7 +291,7 @@ describe('SuppliersPanel', () => {
     it('keeps the KV null/0 split in the client while rendering no KV column at all', () => {
         // The hub keeps null and 0 apart on purpose: null = the worker never
         // declared a KV budget, 0 = it declared one and has spent it all
-        // (@services/nexus: crates/nexus-server/src/observe.rs,
+        // (@typecrate/nexus: crates/nexus-server/src/observe.rs,
         // `worker_row_reports_a_kv_budget_of_null_rather_than_zero`). The
         // `kv free` column is gone, so the split now lives only in the client
         // (asNullableNumber, nexus-client.ts:199) — a `|| 0` coercion there

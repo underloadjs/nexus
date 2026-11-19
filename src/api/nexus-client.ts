@@ -57,7 +57,7 @@ export interface NormalizedWorker {
     freeSlots: number;
     // null when the hub reports no KV budget at all — deliberately NOT 0, which
     // means "budget reported and fully spent" (the hub's observe.rs in
-    // @services/nexus,
+    // @typecrate/nexus,
     // `worker_row_reports_a_kv_budget_of_null_rather_than_zero`). Rendered '—'.
     freeKvTokens: number | null;
     inFlight: string[];

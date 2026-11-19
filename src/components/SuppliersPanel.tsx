@@ -6,7 +6,7 @@
 //
 // The `link` and `engine` columns are deliberately gone: both are two axes of
 // one worker (socket lifecycle vs engine liveness, see `model.rs:79-103` in
-// @services/nexus) and reading two chips per row cost a third of the table
+// @typecrate/nexus) and reading two chips per row cost a third of the table
 // width. They are folded into the row's status edge instead — the tone below
 // is the dispatchability question, and the raw words stay in the row's title.
 import { Fragment, useState } from 'react';
@@ -16,7 +16,7 @@ import { EmptyState, Panel, type Tone } from './ui';
 
 // Status tone of one supplier row, i.e. "would the hub dispatch here?".
 //
-// The mapping is the dispatch gate from @services/nexus (`model.rs:209-222`:
+// The mapping is the dispatch gate from @typecrate/nexus (`model.rs:209-222`:
 // `dispatchable()` = link live && engine ready && free slots > 0; `advertised()`
 // = link live only), minus the slot count, which the `slots` column already
 // shows:
@@ -71,7 +71,7 @@ export function SuppliersPanel({ snapshot, nowMs }: SuppliersPanelProps) {
             {snapshot.workers.length === 0 ? (
                 <EmptyState
                     message="No suppliers connected."
-                    hint="Start a worker (cargo run -p nexus-worker-example, in @services/nexus) — it dials the hub and shows up here."
+                    hint="Start a worker (cargo run -p nexus-worker-example, in @typecrate/nexus) — it dials the hub and shows up here."
                 />
             ) : (
                 <div className="table-scroll">

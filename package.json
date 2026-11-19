@@ -3,7 +3,7 @@
     "version": "0.1.0",
     "private": true,
     "description": "Nexus Monitor — read-only observability console for a nexus hub: a static Vite + React dashboard that polls the hub's GET /v1/observe snapshot and GET /metrics Prometheus endpoint straight from the browser.",
-    "#server": "The hub itself (the Rust axum + tokio server that SERVES /v1/observe and /metrics) is no longer in this package — it moved to `@services/nexus` (noobscript `services/nexus`). This package, and the underloadjs/nexus repo it mirrors, ship only the monitoring UI that reads those APIs.",
+    "#server": "The hub itself (the Rust axum + tokio server that SERVES /v1/observe and /metrics) is no longer in this package — it moved to `@typecrate/nexus` (noobscript `packages/typecrate/nexus`). This package, and the underloadjs/nexus repo it mirrors, ship only the monitoring UI that reads those APIs.",
     "type": "module",
     "#install": "Standalone project with its own committed yarn.lock, like the other standalone mirrors (packages/underload/bench, packages/underload/dashboard): the GitHub Pages workflow checks out this repo and installs here. Inside the noobscript monorepo this same manifest is a workspace member (`packages/underload/*` in the root workspaces), where a root install hoists these deps — see README 'Run it locally'.",
     "scripts": {

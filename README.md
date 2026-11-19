@@ -6,8 +6,8 @@ hub URL, and the browser talks to the hub itself — this package holds no serve
 code and never mutates one.
 
 The hub is the Rust (axum + tokio) broker that used to live in this package. It
-is no longer developed here: it moved to **[`@services/nexus`](../../../services/nexus)**
-(`services/nexus` in the noobscript monorepo), which owns the two open APIs this
+is no longer developed here: it moved to **[`@typecrate/nexus`](../../typecrate/nexus)**
+(`packages/typecrate/nexus` in the noobscript monorepo), which owns the two open APIs this
 UI is built entirely on:
 
 | API | What the monitor takes from it |
@@ -16,8 +16,8 @@ UI is built entirely on:
 | `GET /metrics` | the Prometheus exposition: latency summaries and every counter/gauge family, parsed in the browser |
 
 Both are implemented and tested on the server side in
-`services/nexus/crates/nexus-server/src/observe.rs`, with the CORS policy in
-`services/nexus/crates/nexus-server/src/main.rs` (`observe_cors`) — the only
+`packages/typecrate/nexus/crates/nexus-server/src/observe.rs`, with the CORS policy in
+`packages/typecrate/nexus/crates/nexus-server/src/main.rs` (`observe_cors`) — the only
 routes on the hub that depend on CORS, because this page is served from a
 different origin.
 
@@ -76,7 +76,7 @@ resolving into the hoisted root install; in a standalone checkout (CI, or a plai
    with `NEXUS_LISTEN`) from the server package:
    ```bash
    # from the noobscript monorepo root
-   yarn workspace @services/nexus start    # cargo run -p nexus-server --bin nexus-hub
+   yarn workspace @typecrate/nexus start    # cargo run -p nexus-server --bin nexus-hub
    ```
 2. Paste that URL into the monitor. A bare `host:port` is accepted and treated
    as `http://`; trailing slashes are trimmed. The last URL is remembered in
@@ -93,7 +93,7 @@ resolving into the hoisted root install; in a standalone checkout (CI, or a plai
   `nexus-hub-observe/v1`) and `GET /metrics`. An older hub answers **404**, and
   the monitor says so instead of showing empty panels.
 - Both endpoints are open (no auth) and must carry CORS headers for the origin
-  this page is served from; `@services/nexus` does that. A CORS failure and a
+  this page is served from; `@typecrate/nexus` does that. A CORS failure and a
   network failure look identical to the browser, so the error banner lists both.
 - Unknown fields in the payload are ignored and missing optional fields are
   treated as unknown (`—`), so a newer hub keeps rendering; a payload whose
@@ -169,7 +169,7 @@ protocol, relay, store), `crates/nexus-server` (axum + tokio runtime, worker and
 consumer sockets, SSE, artifacts, `/v1/observe`, `/metrics`), `crates/nexus-wasm`,
 `crates/nexus-worker-example`, the wasm build scripts, the Daytona deployment
 scripts and `documents/specifications/hub-specification.md`. All of that is now
-**[`@services/nexus`](../../../services/nexus)**, and nothing here compiles Rust.
+**[`@typecrate/nexus`](../../typecrate/nexus)**, and nothing here compiles Rust.
 (`crates/nexus-wasm` and the wasm build scripts were retired in that package on
 2026-11-14 — it ships one native binary and nothing imports it as a library — so what
 moved here is the spine, the server, the worker example and the deploy scripts.)
