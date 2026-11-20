@@ -5,6 +5,7 @@
 import { describe, expect, it } from 'vitest';
 import { formatAge, formatCounter, formatNumber, shortId } from './format';
 import {
+    DEFAULT_APP_PATH,
     DEFAULT_HUB_URL,
     STORAGE_KEY_URL,
     getPageProtocol,
@@ -77,6 +78,50 @@ describe('trimTrailingSlashes', () => {
         expect(trimTrailingSlashes('http://h:1//')).toBe('http://h:1');
         expect(trimTrailingSlashes('http://h:1/path/')).toBe('http://h:1/path');
         expect(trimTrailingSlashes('http://h:1')).toBe('http://h:1');
+    });
+});
+
+// v2 sandbox deployment (`services/daytona/sandbox-specs.md` §4.1-4.2): one
+// public preview origin for the runner, every app under `/app/<name>/`, and
+// nexus under `/app/nexus/`. The monitor's only legal input is the MOUNTED
+// base; the tests below pin both halves of that contract — the mount survives
+// normalization, and a bare origin is never guessed into an app path.
+describe('sandbox mount normalization', () => {
+    const SANDBOX_ORIGIN = 'https://7777-abc123.daytonaproxy01.net';
+    const SANDBOX_BASE = `${SANDBOX_ORIGIN}/app/nexus/`;
+
+    it('keeps the /app/nexus/ mount and trims only the trailing slashes', () => {
+        expect(normalizeUserUrl(SANDBOX_BASE)).toEqual({ ok: true, url: `${SANDBOX_ORIGIN}/app/nexus` });
+        // R-4.12's 308 only matters for a bare app root; appending `/v1/observe`
+        // to the no-slash form is already a valid app route, so both pastes
+        // normalize to the same base.
+        expect(normalizeUserUrl(`${SANDBOX_ORIGIN}/app/nexus`)).toEqual({ ok: true, url: `${SANDBOX_ORIGIN}/app/nexus` });
+        // Address-bar paste: repeated slashes collapse to the mount, not away
+        // from it.
+        expect(normalizeUserUrl(`${SANDBOX_ORIGIN}/app/nexus///`)).toEqual({ ok: true, url: `${SANDBOX_ORIGIN}/app/nexus` });
+        // Surrounding whitespace is ignored; the mount is not.
+        expect(normalizeUserUrl(`  ${SANDBOX_BASE}  `)).toEqual({ ok: true, url: `${SANDBOX_ORIGIN}/app/nexus` });
+    });
+
+    it('treats a scheme-less sandbox host as http, which the UI warns about', () => {
+        // No https inference for preview origins: the bare host/path becomes
+        // http:// and the mixed-content rule then blocks it on an https page.
+        // The connect screen therefore shows the `https://` form explicitly.
+        expect(normalizeUserUrl('7777-abc123.daytonaproxy01.net/app/nexus/')).toEqual({
+            ok: true,
+            url: 'http://7777-abc123.daytonaproxy01.net/app/nexus'
+        });
+        expect(isMixedContentBlocked('http://7777-abc123.daytonaproxy01.net/app/nexus', 'https:')).toBe(true);
+    });
+
+    it('never turns a bare preview origin into an app path', () => {
+        // A bare preview origin is the sandbox CONTROL PLANE, not the hub
+        // (§4.2/§4.4). Guessing `/app/nexus/` would be wrong for every other
+        // app name and would hide the operator's mistake, so the normalizer
+        // leaves the input alone and the connect-screen copy explains it.
+        expect(normalizeUserUrl(SANDBOX_ORIGIN)).toEqual({ ok: true, url: SANDBOX_ORIGIN });
+        // The shared copy literal the ConnectScreen interpolates.
+        expect(DEFAULT_APP_PATH).toBe('/app/nexus/');
     });
 });
 

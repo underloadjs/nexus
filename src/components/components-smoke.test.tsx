@@ -11,7 +11,7 @@ import { MetricsPanel } from './MetricsPanel';
 import { OverviewPanel } from './OverviewPanel';
 import { StatusBar } from './StatusBar';
 import { SuppliersPanel } from './SuppliersPanel';
-import { DEFAULT_HUB_URL } from '../utils/hub-url';
+import { DEFAULT_APP_PATH, DEFAULT_HUB_URL } from '../utils/hub-url';
 
 const NOW = 1_762_760_000_000;
 const snapshotOf = (payload: unknown) => normalizeObserveSnapshot(payload, NOW);
@@ -56,6 +56,34 @@ describe('ConnectScreen', () => {
 
         const prefilled = renderToString(<ConnectScreen initialUrl="https://hub.example" onConnect={() => undefined} />);
         expect(prefilled).toContain('value="https://hub.example"');
+    });
+
+    it('distinguishes the public /app/nexus/ base from the internal listen address', () => {
+        const html = renderToString(<ConnectScreen initialUrl="" onConnect={() => undefined} />);
+
+        // The example line keeps the local default next to the sandbox form;
+        // the placeholder stays the hub's own listen address.
+        expect(html).toContain(`Examples — local hub: <code>${DEFAULT_HUB_URL}</code>; Daytona sandbox:`);
+        expect(html).toContain(`placeholder="${DEFAULT_HUB_URL}"`);
+
+        // v2 sandbox form (`services/daytona/sandbox-specs.md` §4.1-4.2): the
+        // public preview origin plus the mount. JSX text escapes the
+        // `<sandbox-id>` placeholder, so the exact SSR string is pinned.
+        expect(html).toContain('https://7777-&lt;sandbox-id&gt;.daytonaproxy01.net/app/nexus/');
+
+        // Endpoints are named under the mount, not at the preview root.
+        expect(html).toContain('<code>/app/nexus/v1/observe</code>');
+        expect(html).toContain('<code>/app/nexus/metrics</code>');
+
+        // The internal bind is called out as internal and not previewed.
+        expect(html).toContain('<code>NEXUS_LISTEN=127.0.0.1:&lt;internal-port&gt;</code>');
+        expect(html).toContain('internal and not publicly previewed');
+
+        // The control plane is distinguished from the hub, and the page
+        // promises not to guess/append the mount.
+        expect(html).toContain('<em>control plane</em>');
+        expect(html).toContain('does not guess or append');
+        expect(html).toContain(`<code>${DEFAULT_APP_PATH}</code> to what you paste`);
     });
 });
 

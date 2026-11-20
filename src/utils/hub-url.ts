@@ -13,6 +13,20 @@ export const STORAGE_KEY_URL = 'nexus-monitor.url.v1';
 // contract constant next to the endpoint paths.
 export const DEFAULT_HUB_URL = 'http://127.0.0.1:8085';
 
+// v2 sandbox deployments (the noobscript monorepo's `services/daytona` runner)
+// publish the hub on the runner's single public origin under `/app/<name>/`;
+// for the nexus app that is
+// `https://7777-<sandbox-id>.daytonaproxy01.net/app/nexus/`
+// (`services/daytona/sandbox-specs.md` §4.1-4.2, R-8.6 for NEXUS_LISTEN).
+//
+// This is a MOUNT PATH, not something this monitor appends: a bare preview
+// origin is the sandbox CONTROL PLANE, and `/v1/observe` at its root is a
+// control 404 (R-4.4), so the operator must paste the mounted base. Exported
+// so the ConnectScreen copy and the focused tests share one literal; the
+// endpoint builders (api/nexus-client.ts) only trim trailing slashes, which is
+// what preserves the mount exactly once.
+export const DEFAULT_APP_PATH = '/app/nexus/';
+
 // Trim repeated trailing slashes: users paste `http://127.0.0.1:8085/` from
 // the address bar and every request builder appends `/v1/observe` directly.
 export function trimTrailingSlashes(url: string): string {

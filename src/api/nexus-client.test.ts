@@ -254,6 +254,34 @@ describe('url builders', () => {
         expect(observeUrl('https://hub.example/nexus///')).toBe('https://hub.example/nexus/v1/observe');
         expect(metricsUrl('http://127.0.0.1:8085//')).toBe('http://127.0.0.1:8085/metrics');
     });
+
+    it('preserves the /app/nexus/ sandbox mount exactly once', () => {
+        // v2 sandbox deployment (`services/daytona/sandbox-specs.md` §4.1-4.2):
+        // the browser base is
+        // `https://7777-<sandbox-id>.daytonaproxy01.net/app/nexus/`; the runner
+        // strips the mount before forwarding to the hub's own root (§3, §8.5).
+        // The client must therefore append the endpoint path to the mounted
+        // base and never duplicate (or drop) the mount.
+        const sandboxOrigin = 'https://7777-abc123.daytonaproxy01.net';
+        const sandboxBase = `${sandboxOrigin}/app/nexus/`;
+
+        expect(observeUrl(sandboxBase)).toBe(`${sandboxOrigin}/app/nexus/v1/observe`);
+        expect(metricsUrl(sandboxBase)).toBe(`${sandboxOrigin}/app/nexus/metrics`);
+
+        // No-slash and repeated-slash pastes yield the identical request URL.
+        expect(observeUrl(`${sandboxOrigin}/app/nexus`)).toBe(`${sandboxOrigin}/app/nexus/v1/observe`);
+        expect(observeUrl(`${sandboxOrigin}/app/nexus//`)).toBe(`${sandboxOrigin}/app/nexus/v1/observe`);
+        expect(metricsUrl(`${sandboxOrigin}/app/nexus///`)).toBe(`${sandboxOrigin}/app/nexus/metrics`);
+
+        // The mount appears once, before the endpoint path — never inside it.
+        expect(observeUrl(sandboxBase).match(/\/app\/nexus\//g)?.length).toBe(1);
+        expect(metricsUrl(sandboxBase).match(/\/app\/nexus\//g)?.length).toBe(1);
+
+        // A bare preview origin is the control plane, not the hub: the client
+        // must not guess the mount. `/v1/observe` at that root is a control
+        // 404, which is the correct, diagnosable outcome.
+        expect(observeUrl(sandboxOrigin)).toBe(`${sandboxOrigin}/v1/observe`);
+    });
 });
 
 // Transport tests: replace global fetch with a stub. The point is the exact
@@ -288,6 +316,26 @@ describe('fetchObserve', () => {
         const { fetchedAtMs, ...snapshot } = result.snapshot;
         expect(typeof fetchedAtMs).toBe('number');
         expect(snapshot).toEqual({ ...CONTRACT_SNAPSHOT, fetchedAtMs: undefined });
+    });
+
+    it('polls the mounted /app/nexus/ endpoint through the sandbox gateway', async () => {
+        // The browser never talks to the loopback `NEXUS_LISTEN` address or to
+        // the bare preview origin; it goes through the runner's mounted app
+        // subtree. This is the request the sandbox deployment must serve.
+        let requested = '';
+        globalThis.fetch = (async (input: RequestInfo | URL) => {
+            requested = String(input);
+            return new Response(JSON.stringify({ protocol: 'nexus-hub-observe/v1' }), {
+                status: 200,
+                headers: { 'content-type': 'application/json' }
+            });
+        }) as unknown as typeof fetch;
+
+        const result = await fetchObserve('https://7777-abc123.daytonaproxy01.net/app/nexus/');
+
+        expect(requested).toBe('https://7777-abc123.daytonaproxy01.net/app/nexus/v1/observe');
+        expect(result.snapshot.protocol).toBe('nexus-hub-observe/v1');
+        expect(result.protocolWarning).toBeUndefined();
     });
 
     it('turns a 404 into the "older hub" diagnosis', async () => {
@@ -335,6 +383,21 @@ describe('fetchMetricsText', () => {
     it('returns the exposition body verbatim', async () => {
         globalThis.fetch = (async () => new Response('# TYPE x gauge\nx 1\n', { status: 200 })) as unknown as typeof fetch;
         expect(await fetchMetricsText('http://127.0.0.1:8085')).toBe('# TYPE x gauge\nx 1\n');
+    });
+
+    it('fetches /metrics under the sandbox mount, not at the preview root', async () => {
+        // The control plane's `/metrics` is the sandbox runtime's own JSON
+        // snapshot (§7.15), not the hub's Prometheus exposition — a bare-origin
+        // paste would hit the wrong route entirely, so the mounted request URL
+        // is pinned exactly.
+        let requested = '';
+        globalThis.fetch = (async (input: RequestInfo | URL) => {
+            requested = String(input);
+            return new Response('x 1\n', { status: 200 });
+        }) as unknown as typeof fetch;
+
+        expect(await fetchMetricsText('https://7777-abc123.daytonaproxy01.net/app/nexus/')).toBe('x 1\n');
+        expect(requested).toBe('https://7777-abc123.daytonaproxy01.net/app/nexus/metrics');
     });
 
     it('maps a 503 to the "hub not ready" hint', async () => {

@@ -78,14 +78,52 @@ resolving into the hoisted root install; in a standalone checkout (CI, or a plai
    # from the noobscript monorepo root
    yarn workspace @typecrate/nexus start    # cargo run -p nexus-server --bin nexus-hub
    ```
-2. Paste that URL into the monitor. A bare `host:port` is accepted and treated
-   as `http://`; trailing slashes are trimmed. The last URL is remembered in
-   your browser (localStorage).
+2. Paste that URL into the monitor — the local form; the sandbox form is in
+   [Local hub vs. sandbox hub](#local-hub-vs-sandbox-hub-v2). A bare
+   `host:port` is accepted and treated as `http://`; trailing slashes are
+   trimmed. The last URL is remembered in your browser (localStorage).
 3. Polling starts immediately (1 s interval, exponential backoff while the hub
    is unreachable) and runs until the page is closed — there is no pause,
    refresh or disconnect control. The header chip is read-only: `live · Ns ago`,
    `connecting…`, or `unreachable (N×)`. To point the monitor at another hub,
    reload the page; the connect screen is pre-filled with the remembered URL.
+
+### Local hub vs. sandbox hub (v2)
+
+The **Hub URL** field takes the *browser base* the hub is served from, not the
+process's listen address. The v2 sandbox runtime
+(`services/daytona/sandbox-specs.md`) exposes exactly one public origin and
+splits it into a control plane at `/` and one subtree per registered app at
+`/app/<name>/`; the nexus hub is mounted at `/app/nexus/`:
+
+| Where the hub runs | Paste this into the monitor | Endpoints the monitor then calls |
+| --- | --- | --- |
+| Your machine | `http://127.0.0.1:8085` | `http://127.0.0.1:8085/v1/observe`, `http://127.0.0.1:8085/metrics` |
+| Daytona sandbox (v2) | `https://7777-<sandbox-id>.daytonaproxy01.net/app/nexus/` | `https://7777-<sandbox-id>.daytonaproxy01.net/app/nexus/v1/observe`, `…/app/nexus/metrics` |
+
+`NEXUS_LISTEN=127.0.0.1:<internal-port>` is the hub's **internal** loopback
+bind inside the sandbox (the runner injects it for the `nexus` profile — §8.6
+of that spec; the app port comes from the 20000–29999 band by default). It is
+not publicly previewed: from outside the sandbox the only way in is the
+runner's public port 7777 preview origin in the table above.
+
+The bare preview origin (`https://7777-<sandbox-id>.daytonaproxy01.net/`) is
+the sandbox **control plane**, not the hub. `GET /v1/observe` at that root is
+a control `404` (§4.2/§4.4), and control routes are same-origin only — they
+emit no CORS headers. The hub is reachable by a browser only through its
+`/app/nexus/` subtree, which the runner forwards to the hub's own root with the
+mount stripped (§3, §8.5), so the hub keeps serving `/v1/observe` and
+`/metrics` internally and the monitor must poll the mounted paths.
+
+The monitor joins URLs by appending its endpoint paths to exactly what you
+paste — it does **not** guess, rewrite or append `/app/nexus/`, because a bare
+origin is ambiguous (local hub root vs. sandbox control plane). Paste the base
+that actually serves the hub. Both `…/app/nexus` and `…/app/nexus/` normalize
+to the same base (`normalizeUserUrl` trims trailing slashes), and the mount
+appears exactly once in every request URL. A scheme-less paste such as
+`7777-<sandbox-id>.daytonaproxy01.net/app/nexus/` is treated as `http://` and
+then trips the mixed-content banner on an https page, so include `https://` for
+the sandbox form.
 
 ### Requirements on the hub side
 
